@@ -1,0 +1,6 @@
+onnx==1.23.2
+onnxruntime==1.28.0
+numpy
+opencv-python-headless==5.0.0.93
+pyclipper
+shapely

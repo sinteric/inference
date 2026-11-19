@@ -1,0 +1,29 @@
+[package]
+name = "onednn-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bindgen FFI and static link of pinned oneDNN 3.13.4 (dnnl_*)."
+links = "dnnl"
+include = [
+    "src/**",
+    "build.rs",
+    "snt_threadpool.cpp",
+    "wrapper.h",
+    "vendor/**",
+    "README.md",
+]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Rebuild src/bindings.rs from wrapper.h (needs libclang).
+bindgen = ["dep:bindgen"]
+
+[build-dependencies]
+bindgen = { version = "0.71", optional = true }
+
+[dependencies]
+rt-core.workspace = true

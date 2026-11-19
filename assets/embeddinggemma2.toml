@@ -1,0 +1,53 @@
+# Pinned identity for google/embeddinggemma-2 (text tower + tokenizer).
+# Bytes are NOT in git. Fetch with scripts/download_assets.py and verify sha256.
+
+model = "embeddinggemma2"
+source = "huggingface"
+repo = "google/embeddinggemma-2"
+revision = "914f7f89142e33e77833254d9c9b90c3cef7303b"
+license = "Apache-2.0"
+notes = """
+Apache-2.0, ungated. Runtime loads text-tower tensors only (language_model.*);
+vision_tower / audio_tower / embed_vision / embed_audio stay on disk unused.
+The 262144×512 token embedding table is mmapped BF16 and is not copied into
+the packed-weight cache. Hosted CI skips tests that need these files.
+"""
+
+[[files]]
+path = "model.safetensors"
+sha256 = "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
+size = 1488915288
+lfs = true
+license = "Apache-2.0"
+
+[[files]]
+path = "tokenizer.json"
+sha256 = "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4"
+size = 32170510
+lfs = true
+license = "Apache-2.0"
+
+[[files]]
+path = "config.json"
+sha256 = "b8f1e9931b57fbc054acdb445c41765d55b0074c58d145fa82839941ad1b5bb3"
+size = 4455
+
+[[files]]
+path = "config_sentence_transformers.json"
+sha256 = "031e56a498d33c349ab489a21885bcfe25b4fcba841149dc99e1e90d4a7c28f5"
+size = 1565
+
+[[files]]
+path = "tokenizer_config.json"
+sha256 = "17bd5d6e9364ca49a534e1502076593317c298d4a663623091ed45388f004874"
+size = 1599
+
+[[files]]
+path = "1_Pooling/config.json"
+sha256 = "8759bdf7c77efc7df7723f64856a593c8943b71ee38baf2a88771fbaf78438f9"
+size = 90
+
+[[files]]
+path = "2_Normalize/config.json"
+sha256 = "cdb09dfca347a56aa2d691744e38d5ad3c7cbc2834e7181272b9a15328b82524"
+size = 97

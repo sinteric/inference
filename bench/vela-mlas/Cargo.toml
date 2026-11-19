@@ -1,0 +1,49 @@
+[package]
+name = "vela-mlas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Research-only Vela Candle/MLAS comparison drivers"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "vela2-mlas"
+path = "src/bin/vela2_mlas.rs"
+required-features = ["bench-mlas"]
+
+[[bin]]
+name = "vela2-native-text"
+path = "src/bin/vela2_native_text.rs"
+required-features = ["bench-mlas"]
+
+[features]
+default = []
+bench-mlas = [
+    "dep:anyhow",
+    "dep:rt-text",
+    "dep:rt-core",
+    "dep:candle-mlas",
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:bytemuck",
+    "dep:libloading",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:libc",
+]
+
+[dependencies]
+rt-core = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+rt-text = { workspace = true, optional = true }
+candle-mlas = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+libloading = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }

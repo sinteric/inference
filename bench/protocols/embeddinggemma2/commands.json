@@ -1,0 +1,13 @@
+{
+  "eg2-onednn": [
+    "target/release/eg2-onednn",
+    "--model",
+    "{model}",
+    "--library",
+    "{library}",
+    "--threads",
+    "{threads}",
+    "--tile",
+    "256"
+  ]
+}

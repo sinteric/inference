@@ -1,0 +1,106 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CC: gcc
+  CXX: g++
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc
+
+jobs:
+  rust-check:
+    name: fmt clippy asset-free tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - name: apt (libstdc++ for tokenizers/esaxx-rs; cmake for static oneDNN)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc g++ cmake ninja-build
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/sinteric-sdk/onednn-static-tp
+          key: onednn-static-tp-3.13.4-${{ hashFiles('crates/onednn-sys/build.rs', 'assets/sdks.toml') }}
+      - uses: Swatinem/rust-cache@v2
+      - name: static oneDNN prefix
+        run: echo "ONEDNN_STATIC_ROOT=$HOME/.cache/sinteric-sdk/onednn-static-tp" >> "$GITHUB_ENV"
+      # The pinned nightly rustfmt; scripts/fmt.py names it (CLAUDE.md).
+      - name: fmt
+        run: python3 scripts/fmt.py --check
+      - name: clippy (default graph; no Candle)
+        run: |
+          cargo clippy --locked \
+            -p rt-core -p rt-threads -p rt-assets -p rt-image -p rt-qual -p rt-kernels \
+            -p onednn-sys -p rt-backend -p rt-onednn -p rt-runtime -p embeddinggemma2 \
+            -p ppocr --all-targets -- -D warnings
+          # Vela graph + library API: --no-deps so the faithful rt-text port keeps original style.
+          cargo clippy --locked -p vela2-0p3b -p sinteric-inference --all-targets --no-deps -- -D warnings
+      - name: asset-free tests (default members; Candle/MLAS excluded)
+        run: cargo test --locked --lib --bins --tests -- --test-threads=4
+      - name: qualification skip (oracle is private)
+        # Block scalar: an unquoted `run: ... print('...: ...')` is invalid YAML
+        # (colon) and GitHub reports a 0s "workflow file issue" with no checks.
+        run: |
+          python3 -c "print('skip qualification: 227-case oracle fixtures are private / absent')"
+      - name: portable validator unit tests
+        run: python3 -m unittest discover -s bench/tests -v
+
+  native:
+    name: oneDNN C API + noexecstack
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - name: apt
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake ninja-build g++ libomp-dev libgomp1 binutils python3
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/sinteric-sdk
+          key: sdk-capi-${{ hashFiles('assets/sdks.toml', 'native/onednn/*.sh') }}
+      - name: build oneDNN SDK (C API only)
+        run: |
+          chmod +x native/onednn/*.sh
+          native/onednn/build_sdk.sh
+      - name: noexecstack
+        run: |
+          chmod +x scripts/check-noexecstack.sh
+          scripts/check-noexecstack.sh
+      - name: cargo test default graph + C API primitives
+        run: |
+          export ONEDNN_STATIC_ROOT="${ONEDNN_STATIC_ROOT:-$HOME/.cache/sinteric-sdk/onednn-static-tp}"
+          export VELA_TEST_LIBRARY="${VELA_TEST_LIBRARY:-}"
+          for c in "$VELA_TEST_LIBRARY" \
+                   "$HOME/.cache/sinteric-sdk/onednn/lib/libdnnl.so" \
+                   "$HOME/.cache/sinteric-sdk/onednn/lib64/libdnnl.so" \
+                   "$HOME/.cache/sinteric-sdk/onednn/libdnnl.so"; do
+            if [[ -n $c && -f $c ]]; then export VELA_TEST_LIBRARY=$c; break; fi
+          done
+          echo "ONEDNN_STATIC_ROOT=$ONEDNN_STATIC_ROOT"
+          echo "VELA_TEST_LIBRARY=$VELA_TEST_LIBRARY"
+          cargo test --locked --lib --bins --tests -- --test-threads=2
+          cargo test -p rt-onednn --lib -- --test-threads=2
+      - name: cargo build production drivers
+        run: |
+          cargo build -p vela2-0p3b --bin vela2-onednn --example prepared -j4
+          cargo build -p embeddinggemma2 --bin eg2-onednn -j4
+      - name: python primitive tests (libdnnl C API)
+        run: |
+          for c in "$HOME/.cache/sinteric-sdk/onednn/lib/libdnnl.so" \
+                   "$HOME/.cache/sinteric-sdk/onednn/lib64/libdnnl.so" \
+                   "$HOME/.cache/sinteric-sdk/onednn/libdnnl.so"; do
+            if [[ -f $c ]]; then export VELA_TEST_LIBRARY=$c; break; fi
+          done
+          echo "VELA_TEST_LIBRARY=$VELA_TEST_LIBRARY"
+          python3 -m unittest discover -s bench/tests -v

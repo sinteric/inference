@@ -1,0 +1,21 @@
+[package]
+name = "candle-mlas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Explicit CPU FP32 standalone MLAS operations for Candle (ORT 1.30 MlasSgemmThreaded)."
+
+[dependencies]
+anyhow.workspace = true
+candle-core.workspace = true
+libloading.workspace = true
+libc.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+rt-core.workspace = true
+libloading.workspace = true
+
+[[example]]
+name = "linear"
+path = "examples/linear.rs"

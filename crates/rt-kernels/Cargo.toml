@@ -1,0 +1,18 @@
+[package]
+name = "rt-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Portable reference kernels. Native oneDNN/MLAS graphs live in models/vela2-0p3b."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+onednn = []
+mlas = []
+
+[dependencies]
+rt-core.workspace = true
+rt-threads.workspace = true

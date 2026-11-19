@@ -1,0 +1,37 @@
+[package]
+name = "vela2-0p3b"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vela 2.0 0.3B CPU runtime. Production path is Rust + oneDNN C API."
+default-run = "vela2-onednn"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "vela2-onednn"
+path = "src/bin/vela2_onednn.rs"
+
+[[example]]
+name = "prepared"
+path = "examples/prepared.rs"
+
+[features]
+default = []
+onednn = []
+
+[dependencies]
+rt-core.workspace = true
+rt-assets.workspace = true
+rt-text.workspace = true
+rt-threads.workspace = true
+rt-backend.workspace = true
+rt-onednn.workspace = true
+rt-runtime.workspace = true
+rt-kernels.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memmap2.workspace = true
+libc.workspace = true

@@ -1,0 +1,20 @@
+# Portable default for CI and developer machines that are not Turin.
+# Do not put target-cpu=znver5 here: hosted CI cannot assume Zen 5, and a
+# znver5 binary SIGILLs on anything else.
+#
+# Turin:
+#   RUSTFLAGS='-C target-cpu=znver5' cargo build --release -p vela2-0p3b --bin vela2-onednn
+
+# cc-rs (tokenizers/esaxx-rs, native bridges) must use g++. On this image
+# `/usr/bin/c++` is clang looking for gcc-14 headers that are not installed.
+[env]
+CC = "gcc"
+CXX = "g++"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "gcc"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

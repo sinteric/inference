@@ -1,0 +1,7 @@
+# The formatting half of the Rust style base (CLAUDE.md, "Rust style"). The
+# three options below are nightly-only: run `python3 scripts/fmt.py`, which uses
+# the pinned nightly rustfmt, not stable `cargo fmt`. Everything else is
+# rustfmt's default, including `max_width = 100`.
+imports_granularity = "Module"
+hex_literal_case = "Lower"
+format_macro_matchers = true

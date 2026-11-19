@@ -1,0 +1,27 @@
+[package]
+name = "rt-onednn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Safe oneDNN C API wrapper and CPU Hardware implementation."
+
+[lints]
+workspace = true
+
+[features]
+debug-dumps = []
+
+[dependencies]
+onednn-sys.workspace = true
+rt-core.workspace = true
+rt-backend.workspace = true
+rt-kernels.workspace = true
+rt-threads.workspace = true
+libc.workspace = true
+memmap2.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+rt-kernels.workspace = true

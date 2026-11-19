@@ -1,0 +1,64 @@
+# Pinned identity for vllm-sr/Vela-2.0-0.3B.
+# Bytes are NOT in git. Fetch with scripts/download_assets.py and verify sha256.
+
+model = "vela2-0p3b"
+source = "huggingface"
+repo = "vllm-sr/Vela-2.0-0.3B"
+revision = "d6f03aa9baca4f9017fa8f8e9c2764d3bed3f409"
+license = "Apache-2.0"
+notes = """
+Public weights. The frozen qualification fixtures (227-case corpus, 20 API
+cases, oracle outputs) are not distributed with this repo. Hosted CI skips any
+test that needs those files.
+"""
+
+[[files]]
+path = "model.safetensors"
+sha256 = "bd37dd0db177d766bc554eded78ae8493bc248172d0480f6a543b30932a0cc8e"
+size = 1236473252
+lfs = true
+license = "Apache-2.0"
+
+[[files]]
+path = "tokenizer.json"
+sha256 = "e4b670c5ab72158f35de150792133e8c92adb4ba677d26b99d22c77f34c63faf"
+size = 34364665
+lfs = true
+license = "Gemma Terms of Use (see DISTRIBUTION_TERMS.md on the Hub repo)"
+
+[[files]]
+path = "config.json"
+sha256 = "81e08c8f8f2a4a6205f05b67d5682e42fc5249cc11e5231c456929ae0534d675"
+size = 2823
+
+[[files]]
+path = "calibration.json"
+sha256 = "f8557b3922e9bef33e688ece12da20436b5ae868ed7ff1375b346bd26403506a"
+size = 7063
+
+[[files]]
+path = "pii_calibration_fit.json"
+sha256 = "409faa5841c0977f15cb31ced1bb055a58eaedbbbacd220f2ed2f4932075c02e"
+size = 46186
+
+[[files]]
+path = "onnx/model.onnx"
+sha256 = "5096731c509b3462ade7d4e304a457de4722d12c2d833ca4d4ea52f6c11ec66a"
+size = 1237057931
+lfs = true
+license = "Apache-2.0"
+
+[[files]]
+path = "onnx/model_fp16.onnx"
+sha256 = "aaea0639f13b8a316c567a17347b5bf29bdb78b2593c4a9ab90788580d7b353e"
+size = 623099909
+lfs = true
+
+[[files]]
+path = "vela2_inference.py"
+sha256 = "skip"
+size = 60886
+
+# Native SDK pins (not Hub files; fetched by native/*/build_*.sh)
+# oneDNN 3.13.4  commit c531fe1a5cd631b7f60277cdf6675c588cadbc28
+# onnxruntime 1.30.0 commit f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7

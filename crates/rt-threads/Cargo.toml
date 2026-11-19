@@ -1,0 +1,13 @@
+[package]
+name = "rt-threads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Explicit thread budget. Libraries never read OMP_* or available_parallelism."
+
+[lints]
+workspace = true
+
+[dependencies]
+rt-core.workspace = true
+libc.workspace = true

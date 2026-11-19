@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.16)
+project(vela_standalone_dnnl CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+if(NOT ONEDNN_ROOT)
+  message(FATAL_ERROR "ONEDNN_ROOT is required")
+endif()
+find_library(DNNL_LIB dnnl HINTS ${ONEDNN_ROOT}/lib ${ONEDNN_ROOT}/lib64 REQUIRED)
+find_path(DNNL_INC oneapi/dnnl/dnnl.hpp HINTS ${ONEDNN_ROOT}/include REQUIRED)
+add_library(vela_standalone_dnnl SHARED bridge.cpp)
+set_target_properties(vela_standalone_dnnl PROPERTIES OUTPUT_NAME vela_standalone_dnnl)
+target_include_directories(vela_standalone_dnnl PRIVATE ${DNNL_INC})
+target_link_libraries(vela_standalone_dnnl PRIVATE ${DNNL_LIB} gomp pthread)
+# Original recipe: g++ -std=c++17 -O3 -fPIC -shared -fopenmp -Wl,--no-undefined
+# Deviation vs the original experiment: no -march=native in the default CI recipe (portable
+# hosted runners); add -z noexecstack so GNU_STACK is RW.
+target_compile_options(vela_standalone_dnnl PRIVATE -O3 -fPIC -fopenmp)
+target_link_options(vela_standalone_dnnl PRIVATE -fopenmp -Wl,--no-undefined -Wl,-z,noexecstack)
+if(VELA_MARCH_NATIVE)
+  target_compile_options(vela_standalone_dnnl PRIVATE -march=native)
+endif()
+install(TARGETS vela_standalone_dnnl LIBRARY DESTINATION .)

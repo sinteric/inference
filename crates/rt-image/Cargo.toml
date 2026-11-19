@@ -1,0 +1,13 @@
+[package]
+name = "rt-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Decoded-pixel resampling, normalization and geometry for OCR model crates."
+
+[lints]
+workspace = true
+
+[dependencies]
+rt-core.workspace = true
+rt-threads.workspace = true
