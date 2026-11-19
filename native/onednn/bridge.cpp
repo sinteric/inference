@@ -1,4 +1,4 @@
-// RETIRED. Production binds oneDNN's C API from Rust (crates/onednn-sys,
+// RETIRED. The runtime binds oneDNN's C API from Rust (crates/onednn-sys,
 // crates/rt-onednn). This file is kept as the numeric reference for the
 // primitives the C API path must match: strict fpmath/accumulation, user
 // scratchpads, kind-7 GeGLU (GELU_ERF + BINARY_MUL), packed weight reorder.

@@ -36,7 +36,7 @@ pub fn execute_model(model: &Model, input: &Inputs) -> Result<Logits> {
     })
 }
 
-// Adapt experiment errors to the production frontend's typed executor boundary.
+// Adapt experiment errors to the library frontend's typed executor boundary.
 fn execute_text(model: &Model, input: &Inputs) -> rt_core::Result<Logits> {
     execute_model(model, input).map_err(|source| rt_core::Error::Context {
         context: "MLAS experiment".into(),

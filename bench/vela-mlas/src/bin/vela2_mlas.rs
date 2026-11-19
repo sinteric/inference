@@ -47,10 +47,7 @@ fn memory() -> serde_json::Value {
     json!({"rss_bytes":get(&status,"VmRSS:"),"peak_rss_bytes":get(&status,"VmHWM:"),"pss_bytes":get(&smaps,"Pss:"),"private_clean_bytes":get(&smaps,"Private_Clean:"),"private_dirty_bytes":get(&smaps,"Private_Dirty:"),"shared_clean_bytes":get(&smaps,"Shared_Clean:"),"shared_dirty_bytes":get(&smaps,"Shared_Dirty:"),"swap_bytes":get(&smaps,"Swap:")})
 }
 fn main() -> Result<()> {
-    ensure!(
-        cfg!(target_os = "linux"),
-        "model inference is authorized only on the Remote Linux VM"
-    );
+    ensure!(cfg!(target_os = "linux"), "vela2-mlas runs on Linux only");
     let mut model = PathBuf::from("model");
     let mut o = ModelOptions {
         mode: "dense".into(),

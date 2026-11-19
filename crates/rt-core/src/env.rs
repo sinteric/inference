@@ -1,6 +1,6 @@
 //! Explicit, validated process-environment snapshots.
 //!
-//! Only [`EnvOverrides::from_env`] reads production runtime overrides. Take one
+//! Only [`EnvOverrides::from_env`] reads the runtime's environment overrides. Take one
 //! snapshot at application startup and pass it to configuration `with_overrides`
 //! methods. Constructors and model loaders never call it implicitly. Unset
 //! values leave the caller's options unchanged; present values override them.
@@ -78,7 +78,7 @@ pub struct EnvOverrides {
 }
 
 impl EnvOverrides {
-    /// Read every supported production override exactly once into this snapshot.
+    /// Read every supported override exactly once into this snapshot.
     /// Calling again deliberately captures a new snapshot; no global cache exists.
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(|name| std::env::var_os(name))
@@ -178,7 +178,7 @@ fn parse_verbose(value: &str) -> Result<i32> {
         .ok_or_else(|| Error::Config("expected verbosity integer 0..=2".into()))
 }
 
-/// Internal subprocess-test controls. These are not production overrides.
+/// Internal subprocess-test controls. These are not runtime overrides.
 /// `EG2_{IDENT,GEMM}_THREADS` accepts 1..=1024 and the corresponding `_ISA`
 /// accepts `native` or `avx512`. MLAS tests use explicit qualified library paths
 /// and `CANDLE_TEST_PARTITION=rows|auto`. Read only by test harnesses.

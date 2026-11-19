@@ -3,7 +3,7 @@ name = "vela2-0p3b"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Vela 2.0 0.3B CPU runtime. Production path is Rust + oneDNN C API."
+description = "Vela 2.0 0.3B on CPU: a Rust graph over the oneDNN C API."
 default-run = "vela2-onednn"
 
 [lints]

@@ -91,7 +91,7 @@ jobs:
           echo "VELA_TEST_LIBRARY=$VELA_TEST_LIBRARY"
           cargo test --locked --lib --bins --tests -- --test-threads=2
           cargo test -p rt-onednn --lib -- --test-threads=2
-      - name: cargo build production drivers
+      - name: cargo build the drivers
         run: |
           cargo build -p vela2-0p3b --bin vela2-onednn --example prepared -j4
           cargo build -p embeddinggemma2 --bin eg2-onednn -j4

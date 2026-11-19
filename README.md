@@ -1,42 +1,62 @@
 # inference
 
-An inference runtime for a small set of selected models. Each model gets its
-own graph, fusions, and kernels, highly optimized for specific target
-hardware. This is not a general-purpose runtime.
+A Rust library that runs a few selected models, each tuned for specific
+hardware. It is not a general-purpose runtime: every model here has its own
+graph, fusions and kernels, written and measured for the hardware it targets,
+and a model is added only when it is worth that work.
 
-Current models: [`vllm-sr/Vela-2.0-0.3B`](https://huggingface.co/vllm-sr/Vela-2.0-0.3B)
-(FP32 ModernBERT encoder guard) and
-[`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2)
-(BF16 oneDNN matmuls with an FP32 residual stream, or FP32 matmuls; mmap'd
-262k×512 embedding table; opt-in image and audio towers through
-`api::EmbeddingGemma2::embed_parts`; `eg2-onednn` drives the text tower).
-PP-OCR in `models/ppocr` provides the FP32 detector, Korean CTC recognizer and
-UVDoc page unwarper as separate models (`ppocr::{Detector, Recognizer,
-Unwarper}`); page OCR built from them, orientation included, is the caller's.
-The detector and recognizer pass exact text parity with ORT 1.28.0 on the
-100-page Korean document gate; the unwarper's grid matches ORT 1.28.0 to 5e-7.
-Shipped CPU targets today include AMD EPYC Turin (AVX-512 BF16) and Intel
-Emerald Rapids (AMX); the runtime is not limited to one ISA. PP-OCR's
-convolutions also run on AVX2, checked with oneDNN capped to AVX2 rather than
-on an AVX2-only CPU ([library guide](docs/library.md)).
+It is a library and nothing else: an application links it and runs the
+models in its own process. It has no notion of environments, so there is no
+production or development setting and no default for one. The application
+chooses the model, the threads, the ISA cap and the caches through `Runtime`
+and each model's `Config` ([library guide](docs/library.md)).
 
-**Production path: Rust + oneDNN 3.13.4 C API.** Production crates have no
-Candle/MLAS dependency. Comparisons live in the non-default `bench/vela-mlas`
-crate behind its `bench-mlas` feature.
+## Models
 
-| Driver | Origin | Role |
+| Model | What it does | Precision | Crate |
+|---|---|---|---|
+| [`vllm-sr/Vela-2.0-0.3B`](https://huggingface.co/vllm-sr/Vela-2.0-0.3B) | ModernBERT encoder guard | FP32, strict | `models/vela2-0p3b` |
+| [`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2) | Embeddings: the text tower, with opt-in image and audio towers (`api::EmbeddingGemma2::embed_parts`) | BF16 matmuls with an FP32 residual stream, or FP32 | `models/embeddinggemma2` |
+| PP-OCR | A detector, a Korean CTC recognizer and the UVDoc page unwarper, as three models (`ppocr::{Detector, Recognizer, Unwarper}`) | FP32 | `models/ppocr` |
+
+EmbeddingGemma 2's 262k×512 embedding table stays a memory map, so only the
+rows a text reaches become resident. The PP-OCR unwarper's grid matches ONNX
+Runtime 1.28.0 to 5e-7. Page OCR built from the PP-OCR models, orientation
+included, is the caller's.
+
+## Hardware
+
+Each model is tuned per hardware target, and the targets today are x86-64
+CPUs through oneDNN 3.13.4's C API, linked statically:
+
+- AMD EPYC Turin (Zen 5, AVX-512 BF16) and Intel Emerald Rapids (AMX) are the
+  targets the models are tuned and measured on. The benchmarks there showed
+  oneDNN fastest or tied everywhere, at about a third to a fifth of ONNX
+  Runtime's RSS ([`docs/results/`](docs/results)).
+- PP-OCR and EmbeddingGemma 2 (FP32) are also checked at AVX2, with oneDNN
+  capped at AVX2 on an AVX-512 host rather than on an AVX2-only CPU. The
+  [library guide](docs/library.md) says what was measured there and what it
+  costs.
+
+CPUs are the current focus, not a limit. GPUs (AMD, NVIDIA, Intel) are not
+supported yet; when one is needed it gets the same treatment: a few selected
+models, each tuned for that hardware. Vela's and EmbeddingGemma 2's graphs are
+written over the `Hardware` trait in `rt-backend`, whose only implementation
+today is oneDNN's CPU backend in `rt-onednn`; PP-OCR's convolution graphs call
+`rt-onednn` directly.
+
+## Drivers
+
+Each model has a thin command-line driver, used by the gates and benchmarks:
+
+| Driver | Model | Notes |
 |---|---|---|
-| `vela2-onednn` | oneDNN C API (`onednn-sys` + `rt-onednn`) | **prod default** — strict fpmath, kind-7 GeGLU, packed reorder |
-| `eg2-onednn` | same Hardware / oneDNN C API | EmbeddingGemma 2 text tower — BF16 matmul, FP32 stream |
-| `ppocr-onednn` | FP32 oneDNN convolution + SVTR | Flat OCR; decoded pixels in library, PNG + JSONL gate driver |
-| `vela2-mlas` / `vela2-native-text` | `bench/vela-mlas` (`--features bench-mlas`) | comparison only |
+| `vela2-onednn` | Vela 2.0 | Strict fpmath, kind-7 GeGLU, packed reorder |
+| `eg2-onednn` | EmbeddingGemma 2, text tower | BF16 matmul, FP32 stream |
+| `ppocr-onednn` | PP-OCR | Decodes pixels in the library; PNG in, JSONL out, for the OCR gate |
+| `vela2-mlas` / `vela2-native-text` | Vela 2.0 | Comparison only, in `bench/vela-mlas` behind its `bench-mlas` feature |
 
-Frozen gate those experiments published: **227 cases, zero mismatches, atol 1e-4**
-vs FP32 ONNX. Asset-free primitive tests vs the previous oneDNN path are within
-**1e-6** (matmul / GeGLU / LN / softmax).
-
-Benchmarks on OCI E6 Turin and Intel Emerald Rapids showed oneDNN fastest or
-tied everywhere, at about 1/3–1/5 of ORT's RSS. See `docs/results/`.
+No library crate depends on Candle or MLAS; only that comparison crate does.
 
 ## Layout
 
@@ -45,7 +65,7 @@ crates/rt-*          model-independent (core, threads, assets, text, qual, backe
 crates/onednn-sys    bindgen FFI for dnnl_* (oneDNN 3.13.4 C API)
 crates/rt-onednn     safe wrapper + OnednnCpu Hardware impl + packed-weight cache
 crates/rt-runtime    model-agnostic Runtime (process globals) + Model load trait
-crates/sinteric-inference  production library: Runtime + one module per model
+crates/sinteric-inference  the library: Runtime + one module per model
 crates/candle-mlas   research numerical backend (not a default-member)
 bench/vela-mlas      Candle/MLAS comparison library + drivers (not a default-member)
 models/vela2-0p3b    Vela graph over the Hardware trait; `api::Vela2`; vela2-onednn driver
@@ -68,7 +88,7 @@ bench/harness        validate.py / benchmark.py / support.py (any N threads)
 # asset-free (hosted CI path; no Candle, no MLAS)
 cargo test --lib --bins --tests
 
-# oneDNN backend (prod default; statically linked 3.13.4)
+# Vela on oneDNN (statically linked 3.13.4)
 # cmake + g++ required. Cache: ONEDNN_STATIC_ROOT=$HOME/.cache/sinteric-sdk/onednn-static-tp
 cargo build -p vela2-0p3b --bin vela2-onednn --release
 ./target/release/vela2-onednn --model "$SINTERIC_ASSETS" \
@@ -154,10 +174,18 @@ Rust follows the Google Rust Style Guide, with the changes and exclusions in
 rustfmt; CI runs it with `--check`); the compiler is the stable toolchain in
 `rust-toolchain.toml`.
 
-A change is judged by the gates first, then by speed and RSS: Vela within
-atol 1e-4 on the 227 cases, EmbeddingGemma 2 within its cosine gates against
-the PyTorch FP32 fixtures, and PP-OCR text and polygons exact against ONNX
-Runtime 1.28.0 on the 100-page gate. Bit-identical output is not required.
+A change is judged by the gates first, then by speed and RSS. Bit-identical
+output is not required. The gates:
+
+- **Vela:** within atol 1e-4 of the FP32 ONNX reference on 227 cases (zero
+  mismatches today); the corpus is not distributed. Asset-free primitive
+  tests (matmul, GeGLU, LayerNorm, softmax) stay within 1e-6 of the earlier
+  C++ oneDNN bridge.
+- **EmbeddingGemma 2:** its cosine gates against the PyTorch FP32 fixtures.
+- **PP-OCR:** the detector's and recognizer's text and polygons exact against
+  ONNX Runtime 1.28.0 on the 100-page Korean document gate (60 real pages, 40
+  synthetic; not distributed), which they pass today.
+
 What is not done yet, and what was tried and ruled out, is in
 [`docs/open-work.md`](docs/open-work.md).
 

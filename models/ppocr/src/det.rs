@@ -1,4 +1,4 @@
-//! PP-OCRv6 tiny detector and the production DB post-processing settings.
+//! PP-OCRv6 tiny detector and its default DB post-processing settings.
 use crate::net::{self, OcrNet, Tensor};
 use crate::weights::{AssetConfig, Assets, ModelKind};
 use crate::{det_graph, Error, Result};
@@ -401,7 +401,7 @@ mod tests {
         .is_err()); // resized 32x32
     }
     #[test]
-    fn production_db_settings_and_reading_order() {
+    fn default_db_settings_and_reading_order() {
         let w = 64;
         let h = 64;
         let mut prob = vec![0.; w * h];

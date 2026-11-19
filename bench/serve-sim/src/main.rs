@@ -1,4 +1,4 @@
-//! Host-process simulation for the production library.
+//! Host-process simulation for the library.
 //!
 //! `serve-sim serve` is a small axum/tokio web server that loads the models
 //! in-process through the public `sinteric-inference` API, the way an
@@ -23,7 +23,7 @@ mod split;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(about = "Embed the production models in a web server and load it")]
+#[command(about = "Embed the library's models in a web server and load it")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

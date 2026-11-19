@@ -1,12 +1,12 @@
 # Using sinteric-inference as a library
 
-`sinteric-inference` is the production crate for in-process inference. It
-exposes one model-agnostic `Runtime` and one module per model, each with that
-model's own API: `embeddinggemma2` (embeddings), `vela2` (Vela 2.0 0.3B) and
-`ppocr` (PP-OCR detector and Korean recognizer). Each model
-module is behind a cargo feature of the same name (all on by default). The
-crate ships models and the runtime only: pipelines built from them, such as
-page OCR's stage order, score threshold and reading order, belong to the
+`sinteric-inference` is the crate an application links to run these models in
+its own process. It exposes one model-agnostic `Runtime` and one module per
+model, each with that model's own API: `embeddinggemma2` (embeddings), `vela2`
+(Vela 2.0 0.3B) and `ppocr` (PP-OCR detector and Korean recognizer). Each
+model module is behind a cargo feature of the same name (all on by default).
+The crate ships models and the runtime only: pipelines built from them, such
+as page OCR's stage order, score threshold and reading order, belong to the
 caller.
 CLI/bench binaries (`eg2-onednn`, `vela2-onednn`, `ppocr-onednn`) are thin
 wrappers over the same oneDNN
@@ -84,7 +84,7 @@ model would not load from the other's `Runtime`. The `rt-*` crates are this
 repository's internals, not a stable API: a revision bump can change them, and
 the caller's model moves with it.
 
-## Build / deploy
+## Build
 
 `onednn-sys` builds pinned oneDNN from source (`DNNL_LIBRARY_TYPE=STATIC`,
 CPU-only, `ONEDNN_CPU_RUNTIME=THREADPOOL`) unless `ONEDNN_STATIC_ROOT` points
@@ -262,7 +262,7 @@ models; results in its README):
   per line width (`RecConfig.plan_capacity`, 512) and its plans hold about
   435 MiB on the 100-page gate set. And freed heap that glibc keeps in
   per-thread arenas, which grows with the number of threads calling in;
-  `MALLOC_ARENA_MAX=2` in the service environment bounds it at no
+  `MALLOC_ARENA_MAX=2` in the process environment bounds it at no
   measured latency cost (`RuntimeOptions::malloc_arena_max` sets it from
   the library). `Runtime::load` and `unload` return freed heap
   to the OS; `release_free_memory()` does the same on demand.
@@ -399,7 +399,7 @@ cargo run -p sinteric-inference --example vela2 -- \
 
 ## Errors
 
-Every production library boundary re-exports the same non-exhaustive,
+Every library crate's boundary re-exports the same non-exhaustive,
 `thiserror`-based `rt_core::Error` and `Result<T>`. This includes `rt-text`,
 `rt-onednn`, `rt-runtime`, both model crates, and `sinteric-inference`. Library APIs no
 longer return `anyhow::Error`; application binaries may still use anyhow.
@@ -447,7 +447,7 @@ batch 1 × 8192 tokens or batch 16 × 1024 tokens still needs >1.5 GB of
 transient activations with the 512 MiB default). Oversized requests whose
 size arithmetic overflows or whose allocation fails return `SizeOverflow` /
 `Allocation` instead of aborting; use `max_seq_len` / `max_batch` to bound
-request size. The production crate additionally rejects collected embedding
+request size. `sinteric-inference` additionally rejects collected embedding
 text/output buffers (caller-side `Vec`s) larger than `workspace_limit_bytes`
 with `WorkspaceLimit`. This budget excludes packed weights and is not a
 process RSS limit. Concurrent requests retain the existing execute-pool and
@@ -462,7 +462,7 @@ contracts.
 ## Environment overrides
 
 `rt_core::env` is the single runtime environment reader, also exported as
-`sinteric_inference::env`. `EnvOverrides` is re-exported at the production
+`sinteric_inference::env`. `EnvOverrides` is re-exported at the `sinteric-inference`
 crate root. Capture it **once at application startup**, then reuse it. No
 runtime/model constructor, asset lookup, cache lookup, or kernel captures it
 implicitly. No process-global snapshot is cached, and applying a snapshot
@@ -498,7 +498,7 @@ configuration without accessing process environment.
 | `EG2_MANIFEST` | nonempty OS path | Explicit EG2 pin manifest | Preserve EG2 config (embedded pin) |
 | `VELA_MANIFEST` | nonempty OS path | Explicit Vela pin manifest | Preserve Vela config (embedded pin) |
 | `SINTERIC_ASSETS` | nonempty OS path | Exact model directory / asset root; overrides `model_dir` when applied to a model config | Preserve required caller path |
-| `VELA_STANDALONE_PROFILE` | boolean | Standalone Vela CLI profiling; not applied to production model configs | Off |
+| `VELA_STANDALONE_PROFILE` | boolean | Standalone Vela CLI profiling; not applied to library model configs | Off |
 
 Booleans accept `1/0`, `true/false`, `on/off` (case insensitive). Empty or
 malformed values, out-of-range numbers, and non-Unicode scalars return
@@ -540,7 +540,7 @@ next to `model.safetensors`, keyed by oneDNN version, effective ISA and packed
 layout. `cache.file` selects an exact file; otherwise `cache.dir` selects a
 caller-owned directory. The file wins when both are supplied. Use different
 files for different models. Set `config.cache.enabled = false` to disable
-caches in read-only deployments. Cache write failures are best effort:
+caches when the model directory is read-only. Cache write failures are best effort:
 inference can continue from the packed weights in memory. Asset roots and packed caches are
 separate concepts; neither library API invents a home or temporary cache root.
 
@@ -562,7 +562,7 @@ Any failure propagates as a typed load
 error retaining the model directory, and no model handle is returned. Warmup adds work before load returns;
 no warmup runs during default loading.
 
-The production CLI accepts `eg2-onednn --warmup` (once per loaded instance)
+The `eg2-onednn` driver accepts `--warmup` (once per loaded instance)
 and reports the flag in its ready JSON. Lower-level callers may explicitly
 call `embeddinggemma2::Model::warmup()?`. Vela has no load-warmup setting.
 
@@ -730,7 +730,7 @@ assignments. `detect_timed` / `recognize_timed` also return stage timings.
 |---|---|---|
 | `model_dir` | required | That model's directory (`det/`, `rec/` or `uvdoc/` of an imported root) |
 | `workspace_limit_bytes` | `None`: 1 GiB (1,073,741,824 bytes) | Independent of `RuntimeOptions.workspace_limit_bytes`; the backend cap on each planned convolution arena plus native scratch. On a `shared_backend` handle the handle's cap applies and setting this is `Error::Config` |
-| `options` | `DetOptions` / `RecOptions` / `UvdocOptions` defaults | Production settings described below; Exact recognition batching |
+| `options` | `DetOptions` / `RecOptions` / `UvdocOptions` defaults | The settings described below; Exact recognition batching |
 | `memory_budget_bytes` | runtime default | See [Memory budget](#memory-budget); on a `shared_backend` handle set it on the handle |
 | `manifest` | embedded PP-OCR manifest | Optional explicit TOML path |
 | `verify_weights` | `false` | Check the weight payload hash |
@@ -809,7 +809,7 @@ With an explicit `EnvOverrides` verbosity of 2 (`ONEDNN_VERBOSE=2` in the CLI),
 the driver emits oneDNN create/exec records plus `ppocr_profile` stage timings
 and retained workspace/weight bytes. The JSONL result file keeps its existing schema.
 
-The `ppocr` crate's default `cli` feature builds `ppocr-onednn`; production
+The `ppocr` crate's default `cli` feature builds `ppocr-onednn`;
 `sinteric-inference` disables that feature, so its dependency path has no codec.
 The only added external dependency is the optional pure-Rust `png` codec and its
 pure-Rust compression dependencies, used solely by the driver and its tests:

@@ -128,10 +128,7 @@ fn embeddings_json(rows: &[Vec<f32>], mrl: usize) -> Value {
 }
 
 fn main() -> Result<()> {
-    ensure!(
-        cfg!(target_os = "linux"),
-        "authorized inference environment is Remote Linux VM"
-    );
+    ensure!(cfg!(target_os = "linux"), "eg2-onednn runs on Linux only");
     let mut path = "model".to_string();
     let mut threads = None::<usize>;
     let mut tile = None::<usize>;

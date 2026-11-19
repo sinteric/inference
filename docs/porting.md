@@ -7,12 +7,12 @@ must stay identical.
 
 ## Deviations (intentional)
 
-1. **C API, no C++ bridge in production.** Every primitive the bridge built
+1. **C API, no C++ bridge in the library.** Every primitive the bridge built
    (`dnnl_matmul_*`, reorder, layernorm, softmax, eltwise, binary, kind-7
    GeGLU post-ops, user scratchpads, strict fpmath/accumulation, primitive
    cache capacity 0) is expressed with the public C API. `bridge.cpp` is kept
    as a numeric reference and is not linked by `build_sdk.sh`.
-2. **Candle removed from production crates.** `candle-core` / `candle-nn` /
+2. **Candle removed from the library crates.** `candle-core` / `candle-nn` /
    `candle-mlas` are used only by the separate `bench/vela-mlas` research crate
    with `--features bench-mlas`. Both research crates are non-default members.
 3. **Any thread count.** Drivers no longer reject `N ∉ {1,2,4}`. Default
@@ -41,7 +41,7 @@ must stay identical.
    The library path never reads process env; ISA/verbose go through
    `dnnl_set_max_cpu_isa` / `dnnl_set_verbose` before any other oneDNN
    API. EG2 does not force an ISA cap; `--pin-isa AVX512_CORE_BF16` is
-   opt-in (`SessionOptions.max_cpu_isa`). Production embedding uses
+   opt-in (`SessionOptions.max_cpu_isa`). Library callers use
    `crates/sinteric-inference` (`Runtime`, `embeddinggemma2::Config`, `vela2::Config`).
 8. **AMX short-M padding.** Packed BF16 GEMM M is rounded up to 16 rows
    only when `dnnl_get_effective_cpu_isa` includes AMX. Turin (no AMX) and

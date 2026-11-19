@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-/// Errors shared by the production runtime and its library boundaries.
+/// Errors shared by the runtime and its library boundaries.
 ///
 /// Match variants rather than display strings. Context preserves the original
 /// error in [`std::error::Error::source`]. New variants may be added.

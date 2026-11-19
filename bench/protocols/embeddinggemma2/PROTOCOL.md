@@ -2,7 +2,7 @@
 
 Driver: `eg2-onednn` (Rust + oneDNN 3.13.4 C API). Matmuls are BF16×BF16
 with FP32 accumulation. RMSNorm, softmax, RoPE, residual, pooling and L2
-stay in FP32. Production calls `dnnl_set_max_cpu_isa(default)` so oneDNN
+stay in FP32. By default the runtime calls `dnnl_set_max_cpu_isa(default)` so oneDNN
 selects the best ISA (AMX on Emerald Rapids, AVX512_CORE_BF16 on OCI E6
 Turin). Pin only as an explicit opt-in for Zen 5 emulation:
 

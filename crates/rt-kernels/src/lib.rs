@@ -1,6 +1,6 @@
 //! Portable reference kernels.
 //!
-//! Production oneDNN lives in `rt-onednn` (C API). This crate keeps a scalar
+//! The oneDNN backend lives in `rt-onednn` (C API). This crate keeps a scalar
 //! reference GEMM plus the portable LN/softmax/GELU/YaRN helpers used by
 //! asset-free tests.
 
@@ -103,7 +103,7 @@ impl F32Gemm for RefBackend {
 }
 
 /// Named backend constructor. Native kinds return [`rt_core::Error::NativeUnavailable`]
-/// here; the production oneDNN path is `rt-onednn::OnednnCpu`.
+/// here; the oneDNN path is `rt-onednn::OnednnCpu`.
 pub fn backend(kind: BackendKind, budget: &ThreadBudget) -> Result<Box<dyn F32Gemm>> {
     match kind {
         BackendKind::Ref => Ok(Box::new(RefBackend::new(budget))),

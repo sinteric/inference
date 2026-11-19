@@ -133,7 +133,8 @@ pub trait Hardware: Send + Sync {
     }
 
     /// Pack `[n, k]` native BF16 weights into the backend's blocked layout.
-    /// Default upcasts to f32 and calls [`Hardware::pack`] (not for production EG2).
+    /// Default upcasts to f32 and calls [`Hardware::pack`]; `OnednnCpu` overrides it
+    /// with a native BF16 pack.
     fn pack_bf16(&self, n: usize, k: usize, src: &[u16]) -> Result<Self::Packed> {
         rt_core::check_shape!(
             src.len() == rt_core::checked_size("BF16 weights", &[n, k])?,

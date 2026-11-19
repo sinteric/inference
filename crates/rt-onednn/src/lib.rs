@@ -1,6 +1,6 @@
 //! Safe oneDNN 3.13.4 C API wrapper and CPU [`rt_backend::Hardware`].
 //!
-//! The C++ `bridge.cpp` is no longer on the production path: every primitive
+//! The C++ `bridge.cpp` is no longer linked: every primitive
 //! (matmul, reorder, layernorm, softmax, eltwise, binary, kind-7 GeGLU
 //! post-ops) is built with `dnnl_*` from Rust.
 //!
@@ -397,7 +397,7 @@ mod tests {
             .map(|&x| rt_kernels::f32_to_bf16_bits(x))
             .collect();
         // Hosted ubuntu-latest mixes Ice Lake (AVX512_BF16) with Cascade Lake
-        // / AMD (no BF16 kernel). Production EG2 packing uses 512-wide GEMMs
+        // / AMD (no BF16 kernel). EG2's packing uses 512-wide GEMMs
         // on Turin; skip the ISA-sensitive check when pd create is unimplemented.
         let packed_b = match hw.pack_bf16(n, k, &w_bf) {
             Ok(p) => p,

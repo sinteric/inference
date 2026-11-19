@@ -9,7 +9,7 @@ use vela_mlas::mlas::{initialize_blas_with_options, Model};
 fn main() -> Result<()> {
     ensure!(
         cfg!(target_os = "linux"),
-        "inference authorized only on Remote Linux VM"
+        "vela2-native-text runs on Linux only"
     );
     let mut args = std::env::args().skip(1);
     let path = args.next().context("model directory")?;

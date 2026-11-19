@@ -1,6 +1,6 @@
 //! Vela 2.0 0.3B CPU runtime.
 //!
-//! Production path: Rust graph + oneDNN 3.13.4 C API ([`onednn`]).
+//! The model runs as a Rust graph over the oneDNN 3.13.4 C API ([`onednn`]).
 //! Candle/MLAS comparisons live in the separate `bench/vela-mlas` crate.
 //! [`api`] is the public, runtime-loaded surface ([`api::Vela2`]).
 

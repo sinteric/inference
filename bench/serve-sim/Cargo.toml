@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Host-process simulation: an axum server that embeds the production models, plus a load generator."
+description = "Host-process simulation: an axum server that embeds the library's models, plus a load generator."
 
 [lints]
 workspace = true

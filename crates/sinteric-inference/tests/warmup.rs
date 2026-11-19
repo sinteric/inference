@@ -1,4 +1,4 @@
-//! Exercise opt-in warmup through the production API with pinned local assets.
+//! Exercise opt-in warmup through the library API with pinned local assets.
 #[path = "../../rt-assets/tests/support/mod.rs"]
 mod asset_test_support;
 

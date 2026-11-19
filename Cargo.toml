@@ -21,7 +21,7 @@ members = [
     "models/ppocr",
     "crates/sinteric-inference",
 ]
-# Production defaults exclude the research vela-mlas and candle-mlas crates, the
+# The default members exclude the research vela-mlas and candle-mlas crates, the
 # ORT reference bench (bench/ocr-ort, downloads ONNX Runtime at build time) and
 # the host-process simulation (bench/serve-sim, pulls in axum/tokio).
 default-members = [

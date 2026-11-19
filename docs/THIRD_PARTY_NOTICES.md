@@ -4,7 +4,7 @@
 |---|---|---|---|
 | oneDNN | 3.13.4 `c531fe1a5cd631b7f60277cdf6675c588cadbc28` | Apache-2.0 | default GEMM / LN / softmax primitives |
 | ONNX Runtime MLAS | 1.30.0 `f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7` | MIT | comparison GEMM (`MlasSgemmThreaded`) |
-| Candle | 0.11.0 | Apache-2.0 / MIT | research-only `bench/vela-mlas --features bench-mlas`; absent from production crates |
+| Candle | 0.11.0 | Apache-2.0 / MIT | research-only `bench/vela-mlas --features bench-mlas`; absent from the library crates |
 | HuggingFace tokenizers | 0.23 | Apache-2.0 | frontend |
 | Vela 2.0 0.3B | `vllm-sr/Vela-2.0-0.3B@d6f03aa9baca4f9017fa8f8e9c2764d3bed3f409` | Apache-2.0 (tokenizer: Gemma Terms) | weights, `vela2_inference.py` frontend |
 | EmbeddingGemma 2 | `google/embeddinggemma-2@914f7f89142e33e77833254d9c9b90c3cef7303b` | Apache-2.0 | text-tower weights + Gemma tokenizer |

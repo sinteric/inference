@@ -148,7 +148,7 @@ mod tests {
         Model::load(&dir, backend, 64).expect("weights present; oneDNN load");
     }
 
-    /// Production path: whatever ISA oneDNN selects (AMX on EMR, AVX512_BF16 on Turin).
+    /// The default: whatever ISA oneDNN selects (AMX on EMR, AVX512_BF16 on Turin).
     #[test]
     fn parity_vs_pytorch_fixtures() {
         let Some(dir) = skip_assets() else {

@@ -132,7 +132,7 @@ class ValidationTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('VELA_TEST_LIBRARY'),'Set VELA_TEST_LIBRARY=libdnnl.so to run C API identity checks')
 class PrimitiveTests(unittest.TestCase):
     """Numeric parity of matmul/GeGLU/LN/softmax lives in `rt-onednn` (atol 1e-6).
-    This class only checks the production library is the oneDNN C API, not the retired C++ bridge."""
+    This class only checks the library uses the oneDNN C API, not the retired C++ bridge."""
     def test_libdnnl_exports_c_api_3_13_4(self):
         lib=ctypes.CDLL(os.environ['VELA_TEST_LIBRARY'])
         class Version(ctypes.Structure):
