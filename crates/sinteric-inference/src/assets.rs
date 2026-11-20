@@ -63,6 +63,8 @@ impl Manifest {
 /// Mmap the file and hash the mapped bytes (no extra copy of the tensor file).
 pub fn verify_sha256_mmap(path: &Path, expected: &str) -> Result<()> {
     let f = fs::File::open(path)?;
+    // SAFETY: model files must remain immutable while mapped
+    // (docs/library.md), and the map is only hashed, then dropped.
     let map = unsafe { memmap2::MmapOptions::new().map(&f) }?;
     let mut hasher = Sha256::new();
     hasher.update(&map[..]);

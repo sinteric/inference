@@ -31,14 +31,17 @@ pub(super) fn infer_shape(node: &Node, shapes: &[Shape], block: usize) -> Result
             weights: w,
             spatial,
         } => {
-            check_shape!(s[1] == w.input, "conv input channels");
-            spatial.output(s, w.kernel, w.output, w.transpose)?
+            check_shape!(s[1] == w.filters.input, "conv input channels");
+            spatial.output(s, w.filters.kernel, w.filters.output, w.filters.transpose)?
         }
         Op::Pool {
             kernel, spatial, ..
         } => spatial.output(s, *kernel, s[1], false)?,
         Op::DepthToSpace2x => {
-            check_shape!(s[1] % 4 == 0, "depth-to-space requires 4*C channels");
+            check_shape!(
+                s[1].is_multiple_of(4),
+                "depth-to-space requires 4*C channels"
+            );
             [
                 s[0],
                 s[1] / 4,
@@ -82,30 +85,7 @@ pub(super) fn infer_shape(node: &Node, shapes: &[Shape], block: usize) -> Result
             }
             o
         }
-        Op::ConcatAlignedChannels | Op::Concat { .. } => {
-            let axis = if let Op::Concat { axis } = node.op {
-                axis
-            } else {
-                1
-            };
-            if matches!(node.op, Op::ConcatAlignedChannels) {
-                check_shape!(
-                    node.inputs.iter().all(|&id| shapes[id][1] % block == 0),
-                    "channel concat needs complete blocks"
-                );
-            }
-            check_shape!(axis < 4, "concat axis");
-            let mut o = s;
-            o[axis] = 0;
-            for &id in &node.inputs {
-                let t = shapes[id];
-                check_shape!((0..4).all(|i| i == axis || t[i] == s[i]), "concat shapes");
-                o[axis] = o[axis]
-                    .checked_add(t[axis])
-                    .ok_or(Error::size_overflow("concat"))?;
-            }
-            o
-        }
+        Op::ConcatAlignedChannels | Op::Concat { .. } => concat_shape(node, shapes, block)?,
         Op::Binary(_) => {
             check_shape!(node.inputs.len() == 2, "binary needs two inputs");
             broadcast(s, shapes[node.inputs[1]])?;
@@ -117,10 +97,39 @@ pub(super) fn infer_shape(node: &Node, shapes: &[Shape], block: usize) -> Result
     Ok(output)
 }
 
+/// The output of a concat node: its inputs' shapes summed along the axis.
+fn concat_shape(node: &Node, shapes: &[Shape], block: usize) -> Result<Shape> {
+    let s = shapes[node.inputs[0]];
+    let axis = if let Op::Concat { axis } = node.op {
+        axis
+    } else {
+        1
+    };
+    if matches!(node.op, Op::ConcatAlignedChannels) {
+        check_shape!(
+            node.inputs
+                .iter()
+                .all(|&id| shapes[id][1].is_multiple_of(block)),
+            "channel concat needs complete blocks"
+        );
+    }
+    check_shape!(axis < 4, "concat axis");
+    let mut o = s;
+    o[axis] = 0;
+    for &id in &node.inputs {
+        let t = shapes[id];
+        check_shape!((0..4).all(|i| i == axis || t[i] == s[i]), "concat shapes");
+        o[axis] = o[axis]
+            .checked_add(t[axis])
+            .ok_or(Error::size_overflow("concat"))?;
+    }
+    Ok(o)
+}
+
 pub(super) fn output_blocked(node: &Node, output: Shape, block: usize) -> bool {
     match &node.op {
         Op::Reorder { blocked } => *blocked,
-        Op::DepthToSpace2x => output[1] % block == 0,
+        Op::DepthToSpace2x => output[1].is_multiple_of(block),
         Op::Concat { .. } | Op::SpatialMean(_) | Op::Prelu { .. } => false,
         _ => true,
     }
@@ -157,12 +166,16 @@ impl ConvNet {
             let bias = w
                 .bias
                 .as_ref()
-                .map(|_| Md::tagged(&[w.output], dnnl_x))
+                .map(|_| Md::tagged(&[w.filters.output], dnnl_x))
                 .transpose()?;
             let a = spatial.arrays()?;
             let mut attr = Attr(ptr::null_mut());
             let mut pd = Pd(ptr::null_mut());
             let mut info = ptr::null::<std::ffi::c_char>();
+            // SAFETY: oneDNN writes each new handle into its owner (`attr`,
+            // `pd`) before the next call reads it; every descriptor is live,
+            // each spatial array holds the two entries oneDNN reads, and
+            // `info` is a valid out-pointer for the implementation string.
             unsafe {
                 Api::check(dnnl_primitive_attr_create(&mut attr.0), "conv probe attr")?;
                 Api::check(
@@ -201,9 +214,11 @@ impl ConvNet {
                     "conv probe implementation",
                 )?;
             }
-            Ok(crate::cpu::onednn::api::cstr(info).starts_with("ref"))
+            // SAFETY: the implementation string is the probe descriptor's
+            // own, alive while it is.
+            Ok(unsafe { crate::cpu::onednn::api::cstr(info) }.starts_with("ref"))
         };
-        if w.transpose
+        if w.filters.transpose
             || spatial
                 .pads_begin
                 .iter()
@@ -222,7 +237,7 @@ impl ConvNet {
         let unpadded = Spatial {
             pads_begin: [0; 2],
             pads_end: [0; 2],
-            ..spatial.clone()
+            ..*spatial
         };
         Ok(!reference(padded, &unpadded)?)
     }
@@ -299,7 +314,7 @@ impl ConvNet {
                         spatial: Spatial {
                             pads_begin: [0; 2],
                             pads_end: [0; 2],
-                            ..spatial.clone()
+                            ..*spatial
                         },
                     };
                     nodes.push(pad);

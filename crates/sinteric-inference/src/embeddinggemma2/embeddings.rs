@@ -4,9 +4,6 @@
 use crate::image::ImageView;
 use crate::{Error, Result};
 
-#[allow(unused_imports)] // named in docs
-use super::MAX_SAMPLES;
-
 /// Flat embedding matrix: `data.len() == n * dim`, row-major.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -18,7 +15,7 @@ pub struct Embeddings {
 impl Embeddings {
     /// Rows of `dim` floats; `data.len()` must be a multiple of `dim`.
     pub fn new(dim: usize, data: Vec<f32>) -> Result<Self> {
-        if dim == 0 || data.len() % dim != 0 {
+        if dim == 0 || !data.len().is_multiple_of(dim) {
             return Err(Error::invalid_input(format!(
                 "{} floats do not form rows of {dim}",
                 data.len()
@@ -61,7 +58,7 @@ pub enum Part<'a> {
     /// Any [`PixelFormat`]; resized to the model's
     /// [`cpu::Config::image_tokens`](super::cpu::Config::image_tokens).
     Image(ImageView<'a>),
-    /// 16 kHz mono samples; past 30 s ([`MAX_SAMPLES`]) is truncated.
+    /// 16 kHz mono samples; past 30 s ([`MAX_SAMPLES`](super::MAX_SAMPLES)) is truncated.
     Audio(&'a [f32]),
 }
 

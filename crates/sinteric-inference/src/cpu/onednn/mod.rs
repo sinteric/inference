@@ -43,6 +43,7 @@ pub use cache::{
     apply_cache, cache_path_with, file_stamp, pinned_dnnl, CacheMeta, CacheWriter, FileStamp,
     RawTensor, CACHE_VERSION,
 };
+pub(crate) use cpu::{Attention, Gemm};
 pub use cpu::{OnednnCpu, PackedWeight};
 pub use options::{CacheOptions, CpuIsaCap, SessionOptions, DEFAULT_WORKSPACE_LIMIT};
 pub use tuning::TuningPlan;
@@ -70,10 +71,10 @@ mod bad_input_tests {
         assert!(hw.pack(0, 1, &[]).is_err());
         assert!(hw.pack(usize::MAX, 2, &[]).is_err());
         assert!(hw.restore_packed_checked(usize::MAX, 2, &[], &[]).is_err());
-        assert!(hw.mm(0, 1, 1, 1, 0, 1, 0, 1, false, &[], &[]).is_err());
-        assert!(hw.mm(1, 1, 1, 1, 0, 1, 0, 1, false, &[], &[1.]).is_err());
+        assert!(hw.mm(Gemm::nn(0, 1, 1, 1, 0, 0), &[], &[]).is_err());
+        assert!(hw.mm(Gemm::nn(1, 1, 1, 1, 0, 0), &[], &[1.]).is_err());
         assert!(hw
-            .mm(2, 2, 2, 2, usize::MAX, 2, 0, 2, false, &[], &[])
+            .mm(Gemm::nn(2, 2, 2, 2, usize::MAX, 0), &[], &[])
             .is_err());
         assert!(hw.buffer(usize::MAX).is_err());
         // The workspace limit caps pool retention only; larger buffers still allocate.
@@ -86,24 +87,23 @@ mod bad_input_tests {
         assert!(hw
             .layernorm(1, 2, &[1., 2.], &[1.], &[0., 0.], 1e-6)
             .is_err());
-        assert!(hw
-            .attention(&[], &[], &[], 1, 1, 1, 1, 1, false, 0, &[vec![]])
-            .is_err());
-        assert!(hw
-            .attention(
-                &[0.],
-                &[0.],
-                &[0.],
-                1,
-                1,
-                1,
-                1,
-                1,
-                false,
-                usize::MAX,
-                &[vec![]]
-            )
-            .is_err());
+        let one = Attention {
+            batch: 1,
+            seq: 1,
+            q_heads: 1,
+            kv_heads: 1,
+            head_dim: 1,
+            tile: 1,
+            window: None,
+            scale: 1.0,
+            padding: &[vec![]],
+        };
+        assert!(hw.attention(&one, &[], &[], &[]).is_err());
+        let wide = Attention {
+            window: Some(usize::MAX),
+            ..one
+        };
+        assert!(hw.attention(&wide, &[0.], &[0.], &[0.]).is_err());
     }
     #[test]
     fn invalid_session_options_fail_before_global_installation() {

@@ -60,17 +60,23 @@ fn run(cpu: Arc<OnednnCpu>, shape: Shape, input: &[f32], nodes: Vec<Node>) -> (S
 fn index(s: Shape, n: usize, c: usize, y: usize, x: usize) -> usize {
     ((n * s[1] + c) * s[2] + y) * s[3] + x
 }
+/// The reference: a direct convolution (or deconvolution) of `x` with
+/// `filters` (OIHW weights `w`, bias `b`) under `p`.
 fn naive_conv(
     s: Shape,
     x: &[f32],
-    oc: usize,
-    k: [usize; 2],
-    g: usize,
+    f: Filters,
     p: &Spatial,
     w: &[f32],
     b: &[f32],
-    deconv: bool,
 ) -> (Shape, Vec<f32>) {
+    let Filters {
+        output: oc,
+        kernel: k,
+        groups: g,
+        transpose: deconv,
+        ..
+    } = f;
     let mut d = [s[0], oc, 0, 0];
     for j in 0..2 {
         let e = (k[j] - 1) * p.dilations[j] + 1;
@@ -157,14 +163,38 @@ fn convolution_cases(cpu: Arc<OnednnCpu>) -> Vec<f32> {
                 [(k[0] - 1).min(1), (k[1] - 1).min(2)]
             },
         };
-        let packed = ConvWeights::pack(cpu.clone(), oc, ic, k, g, deconv, &w, Some(&b));
+        let packed = ConvWeights::pack(
+            cpu.clone(),
+            Filters {
+                output: oc,
+                input: ic,
+                kernel: k,
+                groups: g,
+                transpose: deconv,
+            },
+            &w,
+            Some(&b),
+        );
         if deconv && cpu.conv_block() != 16 {
             // oneDNN names no 8-channel deconvolution weight layout.
             assert!(packed.is_err_and(|e| e.kind() == crate::ErrorKind::Unsupported));
             continue;
         }
         let weights = packed.unwrap();
-        let (d, expected) = naive_conv(s, &x, oc, k, g, &p, &w, &b, deconv);
+        let (d, expected) = naive_conv(
+            s,
+            &x,
+            Filters {
+                output: oc,
+                input: ic,
+                kernel: k,
+                groups: g,
+                transpose: deconv,
+            },
+            &p,
+            &w,
+            &b,
+        );
         let (got_d, got) = run(
             cpu.clone(),
             s,
@@ -222,10 +252,10 @@ fn wide_padding_runs_on_jit_kernels() {
             dilations: [dilation; 2],
             pads_begin: [pad; 2],
             pads_end: [pad; 2],
-            ..none.clone()
+            ..none
         };
-        let (_, mid) = naive_conv(s, &x, c, [1, 1], 1, &none, &w1, &b1, false);
-        let (d, conv) = naive_conv(s, &mid, c, [k, k], 1, &wide, &w2, &b2, false);
+        let (_, mid) = naive_conv(s, &x, Filters::new(c, c, [1, 1]), &none, &w1, &b1);
+        let (d, conv) = naive_conv(s, &mid, Filters::new(c, c, [k, k]), &wide, &w2, &b2);
         assert_eq!(d, s);
         let expected = conv
             .iter()
@@ -233,12 +263,12 @@ fn wide_padding_runs_on_jit_kernels() {
             .map(|(y, r)| (y + r).max(0.))
             .collect::<Vec<_>>();
         let pack = |k: usize, w: &[f32], b: &[f32]| {
-            ConvWeights::pack(cpu.clone(), c, c, [k, k], 1, false, w, Some(b)).unwrap()
+            ConvWeights::pack(cpu.clone(), Filters::new(c, c, [k, k]), w, Some(b)).unwrap()
         };
         let first = Node::new(
             Op::Conv {
                 weights: pack(1, &w1, &b1),
-                spatial: none.clone(),
+                spatial: none,
             },
             [0],
         );
@@ -305,8 +335,16 @@ fn fusion_cases(cpu: Arc<OnednnCpu>) -> Vec<f32> {
     let mut results = vec![];
     let w = values(17 * 17);
     let b = values(17);
-    let weights = ConvWeights::pack(cpu.clone(), 17, 17, [1, 1], 1, false, &w, Some(&b)).unwrap();
-    let (_, base) = naive_conv(s, &x, 17, [1, 1], 1, &Spatial::default(), &w, &b, false);
+    let weights =
+        ConvWeights::pack(cpu.clone(), Filters::new(17, 17, [1, 1]), &w, Some(&b)).unwrap();
+    let (_, base) = naive_conv(
+        s,
+        &x,
+        Filters::new(17, 17, [1, 1]),
+        &Spatial::default(),
+        &w,
+        &b,
+    );
     for a in [
         Activation::Relu,
         Activation::HardSwish,
@@ -617,7 +655,7 @@ fn lru_liveness_bounds_and_invalid_input() {
     );
     assert!(ConvNet::new(c.clone(), vec![relu(1)], 1).is_err());
     assert!(ConvNet::new(c.clone(), vec![], 1).is_err());
-    assert!(ConvWeights::pack(c, 16, 16, [0, 3], 1, false, &[], None).is_err());
+    assert!(ConvWeights::pack(c, Filters::new(16, 16, [0, 3]), &[], None).is_err());
 }
 
 #[test]
@@ -644,11 +682,7 @@ fn memory_budget_evicts_conv_plans_without_changing_results() {
         };
         let w = ConvWeights::pack(
             cpu.clone(),
-            16,
-            16,
-            [3, 3],
-            1,
-            false,
+            Filters::new(16, 16, [3, 3]),
             &values(16 * 16 * 9),
             Some(&values(16)),
         )
@@ -760,7 +794,8 @@ fn nonoverlapping_deconv_depth_to_space() {
             }
         }
         let b = bias.iter().flat_map(|&v| [v; 4]).collect::<Vec<_>>();
-        let weights = ConvWeights::pack(cpu(), oc * 4, 16, [1; 2], 1, false, &w, Some(&b)).unwrap();
+        let weights =
+            ConvWeights::pack(cpu(), Filters::new(oc * 4, 16, [1; 2]), &w, Some(&b)).unwrap();
         let mut conv = Node::new(
             Op::Conv {
                 weights,
@@ -770,20 +805,15 @@ fn nonoverlapping_deconv_depth_to_space() {
         );
         conv.post_ops.push(PostOp::Eltwise(Activation::Relu));
         let (shape, got) = run(cpu(), s, &x, vec![conv, Node::new(Op::DepthToSpace2x, [1])]);
-        let (expected_shape, mut expected) = naive_conv(
-            s,
-            &x,
-            oc,
-            [2; 2],
-            1,
-            &Spatial {
-                strides: [2; 2],
-                ..Default::default()
-            },
-            &raw,
-            &bias,
-            true,
-        );
+        let filters = Filters {
+            transpose: true,
+            ..Filters::new(oc, 16, [2; 2])
+        };
+        let spatial = Spatial {
+            strides: [2; 2],
+            ..Default::default()
+        };
+        let (expected_shape, mut expected) = naive_conv(s, &x, filters, &spatial, &raw, &bias);
         expected.iter_mut().for_each(|v| *v = v.max(0.));
         assert_eq!(shape, expected_shape);
         close(&got, &expected, 2e-6);
@@ -797,7 +827,7 @@ fn nonoverlapping_deconv_depth_to_space() {
 fn pointwise_tiles_preserve_fused_values_and_partial_tiles() {
     crate::test_support::own_process!(pointwise_tiles_preserve_fused_values_and_partial_tiles);
     let weights =
-        ConvWeights::pack(cpu(), 17, 16, [1; 2], 1, false, &values(17 * 16), None).unwrap();
+        ConvWeights::pack(cpu(), Filters::new(17, 16, [1; 2]), &values(17 * 16), None).unwrap();
     let mut node = Node::new(
         Op::Conv {
             weights,
@@ -843,7 +873,8 @@ fn concat_producer_views_and_shared_workspace() {
         for i in 0..16 {
             eye[i * 17] = 1.;
         }
-        let weights = ConvWeights::pack(cpu.clone(), 16, 16, [1, 1], 1, false, &eye, None).unwrap();
+        let weights =
+            ConvWeights::pack(cpu.clone(), Filters::new(16, 16, [1, 1]), &eye, None).unwrap();
         let mut node = Node::new(
             Op::Conv {
                 weights,

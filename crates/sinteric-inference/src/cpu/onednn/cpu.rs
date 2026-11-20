@@ -5,11 +5,8 @@
 //! packed weight reorder, residual sum post-op, kind-7 GeGLU
 //! (`MatMul + GELU_ERF + BINARY_MUL`).
 
-#![allow(clippy::too_many_arguments)]
-
 use crate::cpu::kernels::{
-    f32_slice_to_bf16_nthreads, for_ranges, row_mut, row_ref, rows_mut, rows_ref,
-    softmax_rows_nthreads, softmax_window,
+    f32_slice_to_bf16_nthreads, for_ranges, softmax_rows_nthreads, softmax_window,
 };
 use crate::cpu::onednn::api::Api;
 use crate::cpu::onednn::cache::LayoutTag;
@@ -30,6 +27,10 @@ mod buffers;
 mod ops;
 mod pack;
 mod plan;
+
+pub(crate) use attention::Attention;
+pub(crate) use ops::Gemm;
+pub(crate) use plan::{Operand, Operands};
 
 /// Matmul operand types. The destination is always f32.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -59,16 +60,20 @@ impl MatDt {
     }
 }
 
+/// A 64-byte-aligned heap buffer of at least 64 bytes, every byte of it
+/// initialized, that oneDNN reads and writes through [`Aligned::ptr`].
 pub struct Aligned {
     ptr: NonNull<u8>,
     layout: std::alloc::Layout,
-    pub bytes: usize,
+    bytes: usize,
 }
 
 impl Aligned {
+    /// A zeroed buffer of `bytes` (at least 64).
     pub fn new(bytes: usize) -> AResult<Self> {
         let n = bytes.max(64);
         let layout = std::alloc::Layout::from_size_align(n, 64)?;
+        // SAFETY: `layout` has a nonzero size (at least 64).
         let ptr = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
             .context("aligned allocation")?;
         Ok(Self {
@@ -77,18 +82,42 @@ impl Aligned {
             bytes: n,
         })
     }
+    /// The buffer's length in bytes.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+    /// The start of the buffer, for oneDNN to read or write. A write through
+    /// it must not overlap a live [`Aligned::as_bytes`].
     pub fn ptr(&self) -> *mut c_void {
         self.ptr.as_ptr().cast()
     }
     pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the allocation holds `self.bytes` bytes, all initialized
+        // when it was made, and lives as long as `self`.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.bytes) }
+    }
+    /// The buffer as f32s, its length rounded down to whole ones.
+    pub(crate) fn as_f32_mut(&mut self) -> &mut [f32] {
+        // SAFETY: the allocation holds `self.bytes` initialized bytes, 64-byte
+        // aligned, every bit pattern is an f32, and `self` is borrowed
+        // mutably for as long as the slice.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().cast(), self.bytes / 4) }
+    }
+    /// The buffer as BF16 bit patterns, its length rounded down to whole
+    /// ones.
+    pub(crate) fn as_u16_mut(&mut self) -> &mut [u16] {
+        // SAFETY: as for `as_f32_mut`, with two-byte elements.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().cast(), self.bytes / 2) }
     }
     /// Copy `src` into a 64-byte-aligned buffer without zero-filling first.
     pub fn copy_from(src: &[u8]) -> AResult<Self> {
         let n = src.len().max(64);
         let layout = std::alloc::Layout::from_size_align(n, 64)?;
+        // SAFETY: `layout` has a nonzero size (at least 64).
         let ptr =
             NonNull::new(unsafe { std::alloc::alloc(layout) }).context("aligned allocation")?;
+        // SAFETY: the new allocation holds `n >= src.len()` bytes and cannot
+        // overlap `src`; the copy and the zero tail initialize all of them.
         unsafe {
             ptr.as_ptr()
                 .copy_from_nonoverlapping(src.as_ptr(), src.len());
@@ -106,11 +135,16 @@ impl Aligned {
 
 impl Drop for Aligned {
     fn drop(&mut self) {
+        // SAFETY: allocated with `self.layout` and freed only here.
         unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
     }
 }
 
+// SAFETY: an `Aligned` owns its allocation as a `Box<[u8]>` would. Sharing
+// it shares `as_bytes` reads; a write through `ptr` is a caller's unsafe
+// call, which must keep it from overlapping them.
 unsafe impl Send for Aligned {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for Aligned {}
 
 pub(crate) struct WeightLayout {
@@ -125,6 +159,9 @@ pub(crate) struct WeightLayout {
 
 impl Drop for WeightLayout {
     fn drop(&mut self) {
+        // SAFETY: each handle, where not null, was created for this layout
+        // alone and is destroyed only here; the weights packed with it keep
+        // only their bytes.
         unsafe {
             if !self.reorder.is_null() {
                 (self.api.prim_destroy)(self.reorder);
@@ -142,9 +179,15 @@ impl Drop for WeightLayout {
     }
 }
 
+// SAFETY: oneDNN descriptors and primitives are not tied to the thread that
+// made them, and are immutable once made: a primitive may run on several
+// threads at once given separate memories, which each reorder binds.
 unsafe impl Send for WeightLayout {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for WeightLayout {}
 
+/// A weight in the blocked layout this CPU's matmuls read, with the layout
+/// it was packed for.
 pub struct PackedWeight {
     layout: Arc<WeightLayout>,
     data: Aligned,
@@ -152,6 +195,17 @@ pub struct PackedWeight {
     k: usize,
     dt: MatDt,
     tag: LayoutTag,
+}
+
+impl std::fmt::Debug for PackedWeight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackedWeight")
+            .field("n", &self.n)
+            .field("k", &self.k)
+            .field("dt", &self.dt)
+            .field("bytes", &self.layout.bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PackedWeight {
@@ -195,6 +249,8 @@ struct Plan {
 
 impl Drop for Plan {
     fn drop(&mut self) {
+        // SAFETY: each handle, where not null, was created for this plan
+        // alone and is destroyed only here, once nothing holds the plan.
         unsafe {
             if !self.prim.is_null() {
                 (self.api.prim_destroy)(self.prim);
@@ -213,10 +269,14 @@ impl Drop for Plan {
     }
 }
 
+// SAFETY: oneDNN handles are not tied to the thread that made them.
 unsafe impl Send for Plan {}
-// Shared only to keep `prim` alive through an execute that runs outside the
-// state lock; plan-owned memories are bound under that lock.
+// SAFETY: shared only to keep `prim` alive through an execute that runs
+// outside the state lock; a primitive may run on several threads at once,
+// and plan-owned memories are bound only under that lock.
 unsafe impl Sync for Plan {}
+// SAFETY: a stream is not tied to the thread that made it, and the exec pool
+// hands each workspace to one caller at a time.
 unsafe impl Send for ExecWorkspace {}
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -328,6 +388,8 @@ impl ExecWorkspace {
     fn new(api: &Api, engine: dnnl_engine_t, threadpool: *mut c_void) -> AResult<Self> {
         let mut stream = ptr::null_mut();
         Api::check(
+            // SAFETY: `engine` and `threadpool` are live (the backend's own),
+            // and oneDNN writes the new handle to a live local.
             unsafe { (api.stream_create)(&mut stream, engine, threadpool) },
             "stream",
         )?;
@@ -430,7 +492,11 @@ pub struct OnednnCpu {
     strategy: crate::cpu::onednn::IsaStrategy,
 }
 
+// SAFETY: the engine may be used from any thread; every other handle lives
+// in a plan, layout or workspace whose sharing is argued at its type, or
+// behind the state, pool and exec locks.
 unsafe impl Send for OnednnCpu {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for OnednnCpu {}
 
 /// An owned `threadpool_iface` reporting at most `n` threads to oneDNN.
@@ -438,6 +504,7 @@ struct CappedThreadpool(*mut c_void);
 
 impl CappedThreadpool {
     fn new(n: i32) -> AResult<Self> {
+        // SAFETY: no preconditions; the result is owned here, or null.
         let p = unsafe { onednn_sys::sinteric_dnnl_threadpool_create_capped(n) };
         if p.is_null() {
             return Err(crate::Error::out_of_memory(16));
@@ -448,6 +515,8 @@ impl CappedThreadpool {
 
 impl Drop for CappedThreadpool {
     fn drop(&mut self) {
+        // SAFETY: created by `new` (not null) and destroyed only here, after
+        // `OnednnCpu::drop` has destroyed every stream that used it.
         unsafe { onednn_sys::sinteric_dnnl_threadpool_destroy(self.0) };
     }
 }
@@ -464,6 +533,8 @@ impl Drop for OnednnCpu {
         }
         if let Ok(mut idle) = self.exec.idle.lock() {
             for ws in idle.drain(..) {
+                // SAFETY: every workspace is idle (nothing borrows `self`),
+                // and its stream is destroyed only here.
                 unsafe {
                     if !ws.stream.is_null() {
                         (self.api.stream_destroy)(ws.stream);
@@ -471,6 +542,8 @@ impl Drop for OnednnCpu {
                 }
             }
         }
+        // SAFETY: the plans, layouts and streams that used the engine are
+        // gone (above), and it is destroyed only here.
         unsafe {
             if !self.engine.is_null() {
                 (self.api.engine_destroy)(self.engine);
@@ -479,21 +552,15 @@ impl Drop for OnednnCpu {
     }
 }
 
-fn touch_pages<T>(buf: &mut [T]) {
-    if buf.is_empty() {
-        return;
-    }
-    let bytes = std::mem::size_of_val(buf);
-    let ptr = buf.as_mut_ptr().cast::<u8>();
-    let mut off = 0;
-    while off < bytes {
-        unsafe {
-            ptr.add(off).write_volatile(ptr.add(off).read());
-        }
-        off += 4096;
-    }
-    unsafe {
-        ptr.add(bytes - 1).write_volatile(ptr.add(bytes - 1).read());
+/// Rewrites one element in every 4 KiB page of `buf`, and its last, so that
+/// the pages are faulted in now rather than on the first forward.
+fn touch_pages<T: Copy>(buf: &mut [T]) {
+    let step = (4096 / std::mem::size_of::<T>().max(1)).max(1);
+    let last = buf.len().checked_sub(1);
+    for i in (0..buf.len()).step_by(step).chain(last) {
+        let p: *mut T = &mut buf[i];
+        // SAFETY: `p` comes from a live `&mut` to an initialized element.
+        unsafe { p.write_volatile(p.read_volatile()) };
     }
 }
 
@@ -502,8 +569,11 @@ fn fill_bf16(buf: &mut Aligned, src: &[f32], nthreads: i32) -> AResult<*mut c_vo
     if buf.bytes < need {
         *buf = Aligned::new(need)?;
     }
-    let dst = unsafe { std::slice::from_raw_parts_mut(buf.ptr.as_ptr().cast::<u16>(), src.len()) };
-    f32_slice_to_bf16_nthreads(src, dst, nthreads.max(1) as usize)?;
+    f32_slice_to_bf16_nthreads(
+        src,
+        &mut buf.as_u16_mut()[..src.len()],
+        nthreads.max(1) as usize,
+    )?;
     Ok(buf.ptr())
 }
 
@@ -606,8 +676,8 @@ impl OnednnCpu {
         if released >= TRIM_AFTER_BYTES {
             self.retained.released.store(0, Ordering::Relaxed);
             self.retained.trims.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: malloc_trim only touches allocator-internal free lists.
             #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            // SAFETY: malloc_trim only touches allocator-internal free lists.
             unsafe {
                 libc::malloc_trim(0);
             }
@@ -694,6 +764,7 @@ impl OnednnCpu {
         )?);
         let mut engine = ptr::null_mut();
         Api::check(
+            // SAFETY: oneDNN writes the new handle to a live local.
             unsafe { (api.engine_create)(&mut engine, dnnl_cpu, 0) },
             "engine",
         )?;
@@ -717,6 +788,7 @@ impl OnednnCpu {
         for _ in 0..exec_slots {
             idle.push(ExecWorkspace::new(&api, engine, threadpool)?);
         }
+        // SAFETY: no preconditions once the library is loaded (`Api::init`).
         let cpu_isa = unsafe { (api.get_effective_cpu_isa)() as u32 as u64 };
         let workspace_limit = if opts.workspace_limit == 0 {
             DEFAULT_WORKSPACE_LIMIT

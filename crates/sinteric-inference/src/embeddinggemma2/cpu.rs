@@ -462,11 +462,7 @@ impl EmbeddingGemma2 {
 
     /// Preprocess one input. Placeholder counts fix the sequence length,
     /// which is checked before any tower runs.
-    fn prepare(
-        &self,
-        parts: &[Part<'_>],
-        prompt: Option<PromptKind>,
-    ) -> Result<(Vec<u32>, Vec<(usize, Media)>)> {
+    fn prepare(&self, parts: &[Part<'_>], prompt: Option<PromptKind>) -> Result<Prepared> {
         if parts.is_empty() {
             return Err(Error::invalid_input("an input has no parts"));
         }
@@ -568,6 +564,9 @@ impl EmbeddingGemma2 {
         Ok(())
     }
 }
+
+/// An input's token ids, with each media part's position among them.
+type Prepared = (Vec<u32>, Vec<(usize, Media)>);
 
 enum Media {
     Image(media::ImagePatches),

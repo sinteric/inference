@@ -73,6 +73,8 @@ pub fn amx_probe_enabled() -> bool {
 /// result. It runs its own two threads pinned to one CPU of the caller's
 /// affinity mask and leaves the caller's affinity alone.
 pub fn amx_health() -> AmxHealth {
+    // SAFETY: the probe takes a time budget and only touches its own
+    // threads' tile state.
     *HEALTH.get_or_init(|| probe_with(|ms| unsafe { sinteric_amx_tile_state_probe(ms) }))
 }
 
@@ -179,6 +181,7 @@ mod tests {
     fn single_run_detection_rate() {
         let runs = 200;
         let hits = (0..runs)
+            // SAFETY: as in `amx_health`.
             .filter(|_| unsafe { sinteric_amx_tile_state_probe(BUDGETS_MS[0]) }.corrupt > 0)
             .count();
         eprintln!(

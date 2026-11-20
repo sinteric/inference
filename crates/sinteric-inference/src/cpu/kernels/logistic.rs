@@ -5,7 +5,12 @@
 //! this exact sequence: clamp to [-18, 18], two FMA Horner chains in x^2,
 //! one divide, +0.5, clamp below at 0 (no upper clamp).
 
-use crate::cpu::kernels::parallel::{for_ranges, rows_mut};
+#![expect(
+    clippy::excessive_precision,
+    reason = "the constants are MLAS's digits, so they check against its source; each rounds to the f32 MLAS loads"
+)]
+
+use crate::cpu::kernels::parallel::for_rows;
 
 const LOWER: f32 = -18.0;
 const UPPER: f32 = 18.0;
@@ -53,6 +58,8 @@ fn range_portable(x: &mut [f32]) {
     }
 }
 
+/// # Safety
+/// The CPU must support AVX2 and FMA.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn range_fma(x: &mut [f32]) {
@@ -68,6 +75,7 @@ fn range(x: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: the CPU has both features (checked just above).
             return unsafe { range_fma(x) };
         }
     }
@@ -76,12 +84,7 @@ fn range(x: &mut [f32]) {
 
 /// In-place ORT/MLAS-exact logistic over `x`, split across `nthreads`.
 pub fn logistic_ort_inplace(x: &mut [f32], nthreads: usize) {
-    let n = x.len();
-    let p = x.as_mut_ptr() as usize;
-    for_ranges(nthreads, n, 1 << 16, |lo, hi| {
-        let chunk = unsafe { rows_mut(p as *mut f32, lo, hi, 1) };
-        range(chunk);
-    });
+    for_rows(nthreads, 1 << 16, x, 1, |_, _, chunk| range(chunk));
 }
 
 #[cfg(test)]

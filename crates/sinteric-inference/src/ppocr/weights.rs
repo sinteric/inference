@@ -140,7 +140,9 @@ fn mapped(path: &Path, pin: &PinnedFile, verify: bool) -> Result<Mmap> {
                 pin.size
             )));
         }
-        // Model files must remain immutable for the lifetime of this mapping.
+        // SAFETY: model files must remain immutable for the lifetime of this
+        // mapping (docs/library.md); the size was checked above and every
+        // tensor extent is checked against it before use.
         let map = unsafe { Mmap::map(&f) }?;
         if verify {
             digest(&map, &pin.sha256)?;

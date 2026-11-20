@@ -3,7 +3,7 @@
 //! model's precision, and kept in their own packed cache (`<text cache>.<tag>`)
 //! so a text-only load never reads or packs them.
 
-use crate::cpu::kernels::{bf16_bits_to_f32, for_ranges, rows_mut};
+use crate::cpu::kernels::{bf16_bits_to_f32, for_rows};
 use crate::cpu::onednn::{
     apply_cache, file_stamp, pinned_dnnl, CacheMeta, CacheOptions, CacheWriter, OnednnCpu,
     PackedWeight, RawTensor,
@@ -110,7 +110,10 @@ impl TowerParts {
         name: &str,
     ) -> Result<Vec<f32>> {
         let w = self.linear(name)?;
-        check_shape!(x.len() % w.k() == 0, "EG2 tower linear {name}: input width");
+        check_shape!(
+            x.len().is_multiple_of(w.k()),
+            "EG2 tower linear {name}: input width"
+        );
         let mut y = hw.buffer(crate::checked_size(
             "EG2 tower activations",
             &[x.len() / w.k(), w.n()],
@@ -235,11 +238,7 @@ pub(crate) fn par_rows(
     grain: usize,
     f: impl Fn(usize, &mut [f32]) + Sync,
 ) {
-    let rows = out.len() / width;
-    let p = out.as_mut_ptr() as usize;
-    for_ranges(threads, rows, grain, |lo, hi| {
-        // SAFETY: workers get disjoint row ranges of `out`.
-        let dst = unsafe { rows_mut(p as *mut f32, lo, hi, width) };
+    for_rows(threads, grain, out, width, |lo, hi, dst| {
         for (r, row) in (lo..hi).zip(dst.chunks_exact_mut(width)) {
             f(r, row);
         }

@@ -40,19 +40,7 @@ libc = "0.2"
 missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]
-too_many_arguments = "allow"
-uninlined_format_args = "allow"
-needless_range_loop = "allow"
-nonminimal_bool = "allow"
-type_complexity = "allow"
-excessive_precision = "allow"
-manual_contains = "allow"
-ptr_as_ptr = "allow"
-explicit_counter_loop = "allow"
-collapsible_if = "allow"
-manual_range_contains = "allow"
-useless_vec = "allow"
-manual_is_multiple_of = "allow"
+undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 lto = "thin"

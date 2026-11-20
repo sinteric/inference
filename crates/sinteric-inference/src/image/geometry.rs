@@ -62,13 +62,25 @@ pub fn order_quad(mut q: Quad) -> Quad {
 /// affect Clipper's integer truncation, and can move a DB box by a whole pixel.
 /// Returns None for fewer than three non-collinear points.
 pub fn min_area_rect(points: &[Point]) -> Result<Option<(Quad, f32)>> {
+    let hull = hull_in_input_order(points)?;
+    if hull.len() < 3 {
+        return Ok(None);
+    }
+    let Some(best) = calipers(&hull)? else {
+        return Ok(None);
+    };
+    Ok(Some(rect_from_calipers(&hull, best)))
+}
+
+/// The convex hull of `points`, cyclically shifted as OpenCV's is: to keep
+/// the input's own index order where a shift can. This fixes which edge
+/// wins equal-area caliper ties.
+fn hull_in_input_order(points: &[Point]) -> Result<Vec<Point>> {
     let mut hull = convex_hull(points)?;
     let n = hull.len();
     if n < 3 {
-        return Ok(None);
+        return Ok(hull);
     }
-    // Like OpenCV, preserve monotone input indices when a cyclic shift permits
-    // it. This also fixes which edge wins equal-area caliper ties.
     let mut indices = crate::try_vec::<usize>(n)?;
     for (i, p) in hull.iter().enumerate() {
         indices[i] = points.iter().position(|x| x == p).unwrap_or(0);
@@ -85,6 +97,17 @@ pub fn min_area_rect(points: &[Point]) -> Result<Option<(Quad, f32)>> {
         .unwrap_or(0);
         hull.rotate_left(start);
     }
+    Ok(hull)
+}
+
+/// The smallest rectangle's caliper state, from rotating calipers over a
+/// hull of at least three points: the unit direction `(a, b)` of its
+/// leading edge, its width and height along that direction, and the hull
+/// points its left and bottom calipers touch.
+type Calipers = (f32, f32, f32, f32, usize, usize);
+
+fn calipers(hull: &[Point]) -> Result<Option<Calipers>> {
+    let n = hull.len();
     let mut edges = crate::try_vec::<Point>(n)?;
     let mut inv = crate::try_vec::<f32>(n)?;
     let (mut left, mut right, mut bottom, mut top) = (0, 0, 0, 0);
@@ -149,9 +172,12 @@ pub fn min_area_rect(points: &[Point]) -> Result<Option<(Quad, f32)>> {
             best = Some((a, b, w, h, seq[3], seq[0]));
         }
     }
-    let Some((a, b, w, h, l, d)) = best else {
-        return Ok(None);
-    };
+    Ok(best)
+}
+
+/// The rectangle from its caliper state, its corners and center rebuilt as
+/// OpenCV does, with its shorter side.
+fn rect_from_calipers(hull: &[Point], (a, b, w, h, l, d): Calipers) -> (Quad, f32) {
     let c1 = a * hull[l][0] + hull[l][1] * b;
     let c2 = -b * hull[d][0] + hull[d][1] * a;
     let determinant = 1. / (a * a + b * b);
@@ -185,7 +211,7 @@ pub fn min_area_rect(points: &[Point]) -> Result<Option<(Quad, f32)>> {
         center[0] + sa * height - ca * width,
         center[1] - ca * height - sa * width,
     ];
-    Ok(Some((
+    (
         order_quad([
             p0,
             p1,
@@ -193,7 +219,7 @@ pub fn min_area_rect(points: &[Point]) -> Result<Option<(Quad, f32)>> {
             [2. * center[0] - p1[0], 2. * center[1] - p1[1]],
         ]),
         width.min(height),
-    )))
+    )
 }
 
 /// Suzuki-Abe border following, RETR_LIST / CHAIN_APPROX_SIMPLE. Nonzero mask
@@ -223,18 +249,7 @@ pub fn contours(mask: &[u8], width: usize, height: usize) -> Result<Vec<Vec<Poin
             image[(y + 1) * stride + x + 1] = i32::from(mask[y * width + x] != 0);
         }
     }
-    // Clockwise neighbours, starting east, in image coordinates.
-    let offsets = [
-        1,
-        1 + stride as isize,
-        stride as isize,
-        stride as isize - 1,
-        -1,
-        -1 - stride as isize,
-        -(stride as isize),
-        1 - stride as isize,
-    ];
-    let xy = |p: usize| [(p % stride - 1) as f32, (p / stride - 1) as f32];
+    let offsets = neighbours(stride);
     let mut result = Vec::new();
     let mut border = 1i32;
     for y in 1..=height {
@@ -253,65 +268,12 @@ pub fn contours(mask: &[u8], width: usize, height: usize) -> Result<Vec<Vec<Poin
             let first = (0..8)
                 .map(|k| (back + k) % 8)
                 .find(|&k| image[(start as isize + offsets[k]) as usize] != 0);
-            let mut contour = Vec::new();
-            // A traced boundary has at most eight directed visits per foreground
-            // pixel. Grow outside the inner neighbour search, returning alloc errors.
-            if let Some(first) = first {
-                let first_pos = (start as isize + offsets[first]) as usize;
-                let mut prev = first_pos;
-                let mut current = start;
-                let mut last_dir = None;
-                loop {
-                    let back = offsets
-                        .iter()
-                        .position(|&o| current as isize + o == prev as isize)
-                        .ok_or_else(|| Error::internal("contour predecessor"))?;
-                    let mut east_zero = false;
-                    let dir = (1..=8)
-                        .map(|k| (back + 8 - k) % 8)
-                        .find(|&k| {
-                            let nonzero = image[(current as isize + offsets[k]) as usize] != 0;
-                            if k == 0 && !nonzero {
-                                east_zero = true;
-                            }
-                            nonzero
-                        })
-                        .ok_or_else(|| Error::internal("contour neighbour"))?;
-                    let next = (current as isize + offsets[dir]) as usize;
-                    if east_zero {
-                        image[current] = -border;
-                    } else if image[current] == 1 {
-                        image[current] = border;
-                    }
-                    if last_dir != Some(dir) {
-                        contour
-                            .try_reserve(1)
-                            .map_err(|_| Error::out_of_memory(contour.len().saturating_mul(8)))?;
-                        contour.push(xy(current));
-                        last_dir = Some(dir);
-                    }
-                    if next == start && current == first_pos {
-                        break;
-                    }
-                    prev = current;
-                    current = next;
-                }
-                // If the first and final segments share a direction, the start is
-                // interior to that segment and CHAIN_APPROX_SIMPLE omits it.
-                if contour.len() > 2 {
-                    let n = contour.len();
-                    if cross(contour[n - 1], contour[0], contour[1]) == 0.
-                        && (contour[0][0] - contour[n - 1][0]) * (contour[1][0] - contour[0][0])
-                            + (contour[0][1] - contour[n - 1][1]) * (contour[1][1] - contour[0][1])
-                            > 0.
-                    {
-                        contour.remove(0);
-                    }
-                }
+            let contour = if let Some(first) = first {
+                follow_border(&mut image, stride, start, first, border)?
             } else {
                 image[start] = -border;
-                contour.push(xy(start));
-            }
+                vec![unpadded(start, stride)]
+            };
             result
                 .try_reserve(1)
                 .map_err(|_| Error::out_of_memory(result.len().saturating_mul(24)))?;
@@ -320,6 +282,94 @@ pub fn contours(mask: &[u8], width: usize, height: usize) -> Result<Vec<Vec<Poin
     }
     result.reverse();
     Ok(result)
+}
+
+/// Clockwise neighbour offsets, starting east, in a padded image whose rows
+/// are `stride` apart.
+fn neighbours(stride: usize) -> [isize; 8] {
+    [
+        1,
+        1 + stride as isize,
+        stride as isize,
+        stride as isize - 1,
+        -1,
+        -1 - stride as isize,
+        -(stride as isize),
+        1 - stride as isize,
+    ]
+}
+
+/// The mask coordinates of position `p` in the padded image.
+fn unpadded(p: usize, stride: usize) -> Point {
+    [(p % stride - 1) as f32, (p / stride - 1) as f32]
+}
+
+/// Follow the border that starts at `start`, whose first nonzero neighbour
+/// lies in direction `first`, labelling it `border`: its corner points, as
+/// CHAIN_APPROX_SIMPLE keeps them.
+fn follow_border(
+    image: &mut [i32],
+    stride: usize,
+    start: usize,
+    first: usize,
+    border: i32,
+) -> Result<Vec<Point>> {
+    let offsets = neighbours(stride);
+    let mut contour = Vec::new();
+    // A traced boundary has at most eight directed visits per foreground
+    // pixel. Grow outside the inner neighbour search, returning alloc errors.
+    let first_pos = (start as isize + offsets[first]) as usize;
+    let mut prev = first_pos;
+    let mut current = start;
+    let mut last_dir = None;
+    loop {
+        let back = offsets
+            .iter()
+            .position(|&o| current as isize + o == prev as isize)
+            .ok_or_else(|| Error::internal("contour predecessor"))?;
+        let mut east_zero = false;
+        let dir = (1..=8)
+            .map(|k| (back + 8 - k) % 8)
+            .find(|&k| {
+                let nonzero = image[(current as isize + offsets[k]) as usize] != 0;
+                if k == 0 && !nonzero {
+                    east_zero = true;
+                }
+                nonzero
+            })
+            .ok_or_else(|| Error::internal("contour neighbour"))?;
+        let next = (current as isize + offsets[dir]) as usize;
+        if east_zero {
+            image[current] = -border;
+        } else if image[current] == 1 {
+            image[current] = border;
+        }
+        if last_dir != Some(dir) {
+            contour
+                .try_reserve(1)
+                .map_err(|_| Error::out_of_memory(contour.len().saturating_mul(8)))?;
+            contour.push(unpadded(current, stride));
+            last_dir = Some(dir);
+        }
+        if next == start && current == first_pos {
+            break;
+        }
+        prev = current;
+        current = next;
+    }
+    // If the first and final segments share a direction, the start is
+    // interior to that segment and CHAIN_APPROX_SIMPLE omits it.
+    if contour.len() > 2 {
+        let n = contour.len();
+        if cross(contour[n - 1], contour[0], contour[1]) == 0.
+            && (contour[0][0] - contour[n - 1][0]) * (contour[1][0] - contour[0][0])
+                + (contour[0][1] - contour[n - 1][1]) * (contour[1][1] - contour[0][1])
+                > 0.
+        {
+            contour.remove(0);
+        }
+    }
+    Ok(contour)
 }
 
 /// Round-join outward offset of a convex polygon using Clipper's integer
@@ -473,7 +523,28 @@ pub fn polygon_mean_score(prob: &[f32], width: usize, height: usize, q: Quad) ->
     let h = ymax - ymin + 1;
     let mut mask = crate::try_vec::<u8>(crate::checked_size("polygon ROI", &[w, h])?)?;
     let p = q.map(|a| [(a[0] - xmin as f32) as i64, (a[1] - ymin as f32) as i64]);
-    // LINE_8 boundary using OpenCV's major-axis half-error convention.
+    draw_border(&mut mask, w, h, &p);
+    fill_interior(&mut mask, w, h, &p);
+    let mut sum = 0f64;
+    let mut count = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            if mask[y * w + x] != 0 {
+                sum += prob[(y + ymin) * width + x + xmin] as f64;
+                count += 1;
+            }
+        }
+    }
+    Ok(if count == 0 {
+        0.
+    } else {
+        (sum / count as f64) as f32
+    })
+}
+
+/// Draw the quad `p`'s edges into the `w x h` `mask` as OpenCV's LINE_8
+/// does, with its major-axis half-error convention.
+fn draw_border(mask: &mut [u8], w: usize, h: usize, p: &[[i64; 2]; 4]) {
     for i in 0..4 {
         let (mut a, mut b) = (p[i], p[(i + 1) % 4]);
         if !clip_line(&mut a, &mut b, w as i64, h as i64) {
@@ -515,6 +586,11 @@ pub fn polygon_mean_score(prob: &[f32], width: usize, height: usize, q: Quad) ->
             }
         }
     }
+}
+
+/// Fill the quad `p`'s interior in the `w x h` `mask` scanline by scanline,
+/// in cv2.fillPoly's 16.16 fixed point.
+fn fill_interior(mask: &mut [u8], w: usize, h: usize, p: &[[i64; 2]; 4]) {
     for y in 0..h {
         let mut xs = [0i64; 4];
         let mut n = 0;
@@ -544,19 +620,4 @@ pub fn polygon_mean_score(prob: &[f32], width: usize, height: usize, q: Quad) ->
             }
         }
     }
-    let mut sum = 0f64;
-    let mut count = 0usize;
-    for y in 0..h {
-        for x in 0..w {
-            if mask[y * w + x] != 0 {
-                sum += prob[(y + ymin) * width + x + xmin] as f64;
-                count += 1;
-            }
-        }
-    }
-    Ok(if count == 0 {
-        0.
-    } else {
-        (sum / count as f64) as f32
-    })
 }

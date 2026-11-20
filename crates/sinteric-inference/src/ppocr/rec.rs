@@ -1,5 +1,5 @@
 //! Korean PP-OCRv5 mobile: PPLCNetV3, two SVTR blocks and greedy CTC.
-use crate::cpu::onednn::{OnednnCpu, PackedWeight};
+use crate::cpu::onednn::{Gemm, OnednnCpu, PackedWeight};
 use crate::image::{ImageView, Quad, RecCrop};
 use crate::ppocr::net::{self, OcrNet, Tensor};
 use crate::ppocr::rec_graph::{self, Segments};
@@ -143,16 +143,19 @@ impl Linear {
                 dst.copy_from_slice(&dst_padded[..m * n]);
             }
         }
-        let p = y.as_mut_ptr() as usize;
-        crate::cpu::kernels::for_ranges(cpu.threads(), rows, ROW_GRAIN.div_ceil(n), |lo, hi| {
-            // SAFETY: workers receive disjoint row ranges of `y`.
-            let y = unsafe { crate::cpu::kernels::rows_mut(p as *mut f32, lo, hi, n) };
-            for row in y.chunks_exact_mut(n) {
-                for (v, b) in row.iter_mut().zip(&self.bias) {
-                    *v += b;
+        crate::cpu::kernels::for_rows(
+            cpu.threads(),
+            ROW_GRAIN.div_ceil(n),
+            &mut y,
+            n,
+            |_, _, y| {
+                for row in y.chunks_exact_mut(n) {
+                    for (v, b) in row.iter_mut().zip(&self.bias) {
+                        *v += b;
+                    }
                 }
-            }
-        });
+            },
+        );
         Ok(y)
     }
 }
@@ -230,7 +233,7 @@ impl Block {
         let mut logits = if t > 1 {
             crate::cpu::kernels::seq_matmul_nt(g, t, 15, t, &q, &k, threads)?
         } else {
-            cpu.mm(g, t, t, 15, t * 15, 15, t * 15, 15, true, &q, &k)?
+            cpu.mm(Gemm::nt(g, t, t, 15, t * 15, t * 15), &q, &k)?
         };
         for b in 0..batch {
             if lengths[b] < t {
@@ -247,7 +250,7 @@ impl Block {
         let context = if t > 1 {
             crate::cpu::kernels::seq_matmul_nn(g, t, t, 15, &prob, &v, threads)?
         } else {
-            cpu.mm(g, t, 15, t, t * t, t, t * 15, 15, false, &prob, &v)?
+            cpu.mm(Gemm::nn(g, t, 15, t, t * t, t * 15), &prob, &v)?
         };
         let mut joined = try_vec(rows * 120)?;
         for b in 0..batch {
@@ -486,22 +489,14 @@ impl Recognizer {
             let chunk = self.cpu.softmax(tile, CTC_CLASSES, &logits)?;
             drop(logits);
             let ok = AtomicBool::new(true);
-            let (pi, pp) = (
-                ids[start..].as_mut_ptr() as usize,
-                probs[start..].as_mut_ptr() as usize,
-            );
-            crate::cpu::kernels::for_ranges(
+            crate::cpu::kernels::for_rows2(
                 threads,
-                m,
                 ROW_GRAIN.div_ceil(CTC_CLASSES),
-                |lo, hi| {
-                    // SAFETY: workers receive disjoint row ranges of `ids` and `probs`.
-                    let (ids, probs) = unsafe {
-                        (
-                            crate::cpu::kernels::rows_mut(pi as *mut usize, lo, hi, 1),
-                            crate::cpu::kernels::rows_mut(pp as *mut f32, lo, hi, 1),
-                        )
-                    };
+                &mut ids[start..start + m],
+                1,
+                &mut probs[start..start + m],
+                1,
+                |lo, hi, ids, probs| {
                     for ((i, id), p) in (lo..hi).zip(ids).zip(probs) {
                         let row = &chunk[i * CTC_CLASSES..(i + 1) * CTC_CLASSES];
                         if !row.iter().all(|v| v.is_finite() && (0. ..=1.).contains(v)) {
@@ -854,27 +849,28 @@ pub fn decode(
     let mut ids = try_vec::<usize>(batch * t)?;
     let mut probs = try_vec::<f32>(batch * t)?;
     let ok = AtomicBool::new(true);
-    let (pi, pp) = (ids.as_mut_ptr() as usize, probs.as_mut_ptr() as usize);
-    crate::cpu::kernels::for_ranges(threads, batch * t, ROW_GRAIN.div_ceil(classes), |lo, hi| {
-        // SAFETY: workers receive disjoint row ranges of `ids` and `probs`.
-        let (ids, probs) = unsafe {
-            (
-                crate::cpu::kernels::rows_mut(pi as *mut usize, lo, hi, 1),
-                crate::cpu::kernels::rows_mut(pp as *mut f32, lo, hi, 1),
-            )
-        };
-        for ((r, id), p) in (lo..hi).zip(ids).zip(probs) {
-            let row = &prob.values[r * classes..(r + 1) * classes];
-            if !row.iter().all(|v| v.is_finite() && (0. ..=1.).contains(v)) {
-                ok.store(false, Ordering::Relaxed);
-                return;
+    let grain = ROW_GRAIN.div_ceil(classes);
+    crate::cpu::kernels::for_rows2(
+        threads,
+        grain,
+        &mut ids,
+        1,
+        &mut probs,
+        1,
+        |lo, hi, ids, probs| {
+            for ((r, id), p) in (lo..hi).zip(ids).zip(probs) {
+                let row = &prob.values[r * classes..(r + 1) * classes];
+                if !row.iter().all(|v| v.is_finite() && (0. ..=1.).contains(v)) {
+                    ok.store(false, Ordering::Relaxed);
+                    return;
+                }
+                if r % t < length(r / t) {
+                    *id = first_argmax(row);
+                    *p = row[*id];
+                }
             }
-            if r % t < length(r / t) {
-                *id = first_argmax(row);
-                *p = row[*id];
-            }
-        }
-    });
+        },
+    );
     crate::check_shape!(ok.into_inner(), "invalid CTC probability");
     Ok(assemble(
         &ids, &probs, batch, t, classes, dictionary, length,

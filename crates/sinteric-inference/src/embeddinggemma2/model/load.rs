@@ -86,14 +86,14 @@ struct Assembled {
 fn assemble_raw(raw: Vec<RawTensor>) -> Result<Assembled> {
     let mut map: HashMap<String, Vec<f32>> = raw.into_iter().map(|t| (t.name, t.data)).collect();
     let mut scalars = vec![1.0f32; N_LAYERS];
-    for i in 0..N_LAYERS {
+    for (i, scalar) in scalars.iter_mut().enumerate() {
         let key = format!("language_model.layers.{i}.layer_scalar");
         {
             let v = map
                 .remove(&key)
                 .with_context(|| format!("missing tensor {key}"))?;
             check_files!(v.len() == 1, "layer_scalar rank {key}");
-            scalars[i] = v[0];
+            *scalar = v[0];
         }
     }
     Ok(Assembled {
@@ -237,46 +237,80 @@ impl Model {
             name.push(".fp32");
             cache_file = name.into();
         }
-        let mut load_profile = BTreeMap::new();
-
+        let mut load = Load {
+            backend,
+            tile,
+            precision,
+            st_path,
+            cache_file,
+            sha,
+            profile: BTreeMap::new(),
+        };
         if cache.enabled && !cache.verify_weights {
-            let t = Instant::now();
-            let stamp = file_stamp(&st_path).ok();
-            let mut linears = HashMap::new();
-            let applied = apply_cache(
-                &cache_file,
-                &sha,
-                stamp,
-                pinned_dnnl(),
-                backend.cpu_isa(),
-                |name, n, k, bytes, layout| {
-                    let weight = if precision == Precision::Fp32 {
-                        backend.restore_packed_bf16_f32_checked(n, k, bytes, layout)?
-                    } else {
-                        backend.restore_packed_bf16_checked(n, k, bytes, layout)?
-                    };
-                    linears.insert(name.to_string(), Linear { weight });
-                    Ok(())
-                },
-            );
-            load_profile.insert("cache_read_s".into(), t.elapsed().as_secs_f64());
-            if let Ok(Some(raw)) = applied {
-                if let (Ok(parts), Ok(embeddings)) = (assemble_raw(raw), embedding_table(&st_path))
-                {
-                    return Self::finish(
-                        backend,
-                        linears,
-                        parts,
-                        embeddings,
-                        tile,
-                        precision,
-                        WeightSource::Cache { path: cache_file },
-                        load_profile,
-                    );
-                }
+            if let Some((linears, parts, embeddings)) = load.read_cache() {
+                let source = WeightSource::Cache {
+                    path: load.cache_file.clone(),
+                };
+                return load.finish(linears, parts, embeddings, source);
             }
         }
+        load.pack_checkpoint(cache, pinned_size)
+    }
+}
 
+/// One load of the text tower: what it reads, how it packs, and how long
+/// each stage took.
+struct Load {
+    backend: Arc<OnednnCpu>,
+    tile: usize,
+    precision: Precision,
+    st_path: std::path::PathBuf,
+    cache_file: std::path::PathBuf,
+    sha: String,
+    profile: BTreeMap<String, f64>,
+}
+
+/// Packed linears by name, as the model looks them up.
+type Linears = HashMap<String, Linear>;
+
+impl Load {
+    /// The packed weights from the cache when it matches the checkpoint; any
+    /// failure falls back to packing from the checkpoint.
+    fn read_cache(&mut self) -> Option<(Linears, Assembled, Mapped<u16>)> {
+        let t = Instant::now();
+        let stamp = file_stamp(&self.st_path).ok();
+        let mut linears = HashMap::new();
+        let (backend, precision) = (&self.backend, self.precision);
+        let applied = apply_cache(
+            &self.cache_file,
+            &self.sha,
+            stamp,
+            pinned_dnnl(),
+            backend.cpu_isa(),
+            |name, n, k, bytes, layout| {
+                let weight = if precision == Precision::Fp32 {
+                    backend.restore_packed_bf16_f32_checked(n, k, bytes, layout)?
+                } else {
+                    backend.restore_packed_bf16_checked(n, k, bytes, layout)?
+                };
+                linears.insert(name.to_string(), Linear { weight });
+                Ok(())
+            },
+        );
+        self.profile
+            .insert("cache_read_s".into(), t.elapsed().as_secs_f64());
+        let raw = applied.ok()??;
+        let (Ok(parts), Ok(embeddings)) = (assemble_raw(raw), embedding_table(&self.st_path))
+        else {
+            return None;
+        };
+        Some((linears, parts, embeddings))
+    }
+
+    /// Every text-tower matrix packed from the checkpoint, the cache written
+    /// as they pack when `cache` asks for it.
+    fn pack_checkpoint(mut self, cache: &CacheOptions, pinned_size: u64) -> Result<Model> {
+        let st_path = self.st_path.clone();
         let stamp = file_stamp(&st_path).with_context(|| st_path.display().to_string())?;
         check_files!(
             stamp.size == pinned_size,
@@ -285,32 +319,64 @@ impl Model {
         );
         if cache.verify_weights {
             let t = Instant::now();
-            crate::assets::verify_sha256_mmap(&st_path, &sha)?;
-            load_profile.insert("verify_s".into(), t.elapsed().as_secs_f64());
+            crate::assets::verify_sha256_mmap(&st_path, &self.sha)?;
+            self.profile
+                .insert("verify_s".into(), t.elapsed().as_secs_f64());
         }
 
         let t = Instant::now();
         let file = TensorFile::open(&st_path)?;
-        load_profile.insert("mmap_s".into(), t.elapsed().as_secs_f64());
+        self.profile
+            .insert("mmap_s".into(), t.elapsed().as_secs_f64());
         let t = Instant::now();
-        let mut linears = HashMap::new();
-        let mut raw_out: Vec<RawTensor> = Vec::new();
         let mut cache_w = if cache.enabled {
             Some(CacheWriter::start(
-                &cache_file,
+                &self.cache_file,
                 &CacheMeta {
-                    source_sha256: sha,
+                    source_sha256: self.sha.clone(),
                     source_size: stamp.size,
                     source_mtime_secs: stamp.mtime_secs,
                     dnnl: pinned_dnnl(),
-                    cpu_isa: backend.cpu_isa(),
+                    cpu_isa: self.backend.cpu_isa(),
                 },
             ))
         } else {
             None
         };
+        let (linears, raw_out) = self.pack_all(&file, &mut cache_w)?;
+        self.profile
+            .insert("pack_s".into(), t.elapsed().as_secs_f64());
+        let embeddings = file.into_view(EMB_NAME, &[VOCAB, HIDDEN])?;
+        let cache_write = match cache_w {
+            Some(w) => {
+                let t = Instant::now();
+                let written = w.close(&raw_out);
+                self.profile
+                    .insert("cache_write_s".into(), t.elapsed().as_secs_f64());
+                written
+            }
+            None => CacheWrite::Off,
+        };
+        let parts = assemble_raw(raw_out)?;
+        self.finish(
+            linears,
+            parts,
+            embeddings,
+            WeightSource::Safetensors { cache: cache_write },
+        )
+    }
+
+    /// Pack every text-tower matrix of `file` (Q, K and V of a layer as one)
+    /// and widen its vectors to FP32.
+    fn pack_all(
+        &self,
+        file: &TensorFile,
+        cache_w: &mut Option<CacheWriter>,
+    ) -> Result<(Linears, Vec<RawTensor>)> {
+        let mut linears = HashMap::new();
+        let mut raw_out: Vec<RawTensor> = Vec::new();
         let names = file.index().names().map(str::to_owned).collect::<Vec<_>>();
-        let mut qkv: HashMap<usize, [Option<(usize, usize, Vec<u16>)>; 3]> = HashMap::new();
+        let mut qkv: HashMap<usize, [Part; 3]> = HashMap::new();
         for n in names {
             if n == EMB_NAME || skip_tensor(&n) || !n.starts_with("language_model.") {
                 continue;
@@ -329,13 +395,13 @@ impl Model {
                     .context("weight tensor suffix")?
                     .to_string();
                 let weight = pack_bf16(
-                    &backend,
-                    precision,
+                    &self.backend,
+                    self.precision,
                     &key,
                     shape[0],
                     shape[1],
                     bits,
-                    &mut cache_w,
+                    cache_w,
                 )?;
                 linears.insert(key, Linear { weight });
                 file.release(&n);
@@ -357,92 +423,75 @@ impl Model {
             }
         }
         for (layer, parts) in qkv {
-            let Some((qn, qk, q)) = parts[0].as_ref() else {
-                return Err(Error::model_files(format!(
-                    "missing q_proj for layer {layer}"
-                )));
-            };
-            let Some((kn, kk, k)) = parts[1].as_ref() else {
-                return Err(Error::model_files(format!(
-                    "missing k_proj for layer {layer}"
-                )));
-            };
-            let Some((vn, vk, v)) = parts[2].as_ref() else {
-                return Err(Error::model_files(format!(
-                    "missing v_proj for layer {layer}"
-                )));
-            };
-            check_files!(*qk == *kk && *kk == *vk, "qkv input width layer {layer}");
-            let mut cat = Vec::with_capacity(q.len() + k.len() + v.len());
-            cat.extend_from_slice(q);
-            cat.extend_from_slice(k);
-            cat.extend_from_slice(v);
-            let key = format!("language_model.layers.{layer}.self_attn.qkv_proj");
-            let weight = pack_bf16(
-                &backend,
-                precision,
-                &key,
-                qn + kn + vn,
-                *qk,
-                &cat,
-                &mut cache_w,
-            )?;
+            let (key, weight) = self.pack_qkv(layer, &parts, cache_w)?;
             linears.insert(key, Linear { weight });
         }
-        load_profile.insert("pack_s".into(), t.elapsed().as_secs_f64());
-        let embeddings = file.into_view(EMB_NAME, &[VOCAB, HIDDEN])?;
-        let cache_write = match cache_w {
-            Some(w) => {
-                let t = Instant::now();
-                let written = w.close(&raw_out);
-                load_profile.insert("cache_write_s".into(), t.elapsed().as_secs_f64());
-                written
-            }
-            None => CacheWrite::Off,
+        Ok((linears, raw_out))
+    }
+
+    /// Layer `layer`'s Q, K and V packed as one matrix, and its name.
+    fn pack_qkv(
+        &self,
+        layer: usize,
+        parts: &[Part; 3],
+        cache_w: &mut Option<CacheWriter>,
+    ) -> Result<(String, PackedWeight)> {
+        let part = |i: usize, name: &str| {
+            parts[i]
+                .as_ref()
+                .ok_or_else(|| Error::model_files(format!("missing {name} for layer {layer}")))
         };
-        let parts = assemble_raw(raw_out)?;
-        Self::finish(
-            backend,
-            linears,
-            parts,
-            embeddings,
-            tile,
-            precision,
-            WeightSource::Safetensors { cache: cache_write },
-            load_profile,
-        )
+        let (qn, qk, q) = part(0, "q_proj")?;
+        let (kn, kk, k) = part(1, "k_proj")?;
+        let (vn, vk, v) = part(2, "v_proj")?;
+        check_files!(*qk == *kk && *kk == *vk, "qkv input width layer {layer}");
+        let mut cat = Vec::with_capacity(q.len() + k.len() + v.len());
+        cat.extend_from_slice(q);
+        cat.extend_from_slice(k);
+        cat.extend_from_slice(v);
+        let key = format!("language_model.layers.{layer}.self_attn.qkv_proj");
+        let weight = pack_bf16(
+            &self.backend,
+            self.precision,
+            &key,
+            qn + kn + vn,
+            *qk,
+            &cat,
+            cache_w,
+        )?;
+        Ok((key, weight))
     }
 
     fn finish(
-        backend: Arc<OnednnCpu>,
-        linears: HashMap<String, Linear>,
+        self,
+        linears: Linears,
         parts: Assembled,
         embeddings: Mapped<u16>,
-        tile: usize,
-        precision: Precision,
         load_source: WeightSource,
-        load_profile: BTreeMap<String, f64>,
-    ) -> Result<Self> {
+    ) -> Result<Model> {
         validate_weights(&linears, &parts.norms)?;
         check_files!(parts.scalars.len() == N_LAYERS, "layer_scalar count");
-        Ok(Self {
+        Ok(Model {
             embeddings,
             vision: None,
             audio: None,
-            backend,
+            backend: self.backend,
             linears,
             norms: parts.norms,
             scalars: parts.scalars,
             local_rope: DefaultRope::new(head_dim(0), MAX_SEQ, LOCAL_THETA)?,
             global_rope: DefaultRope::new(head_dim(5), MAX_SEQ, GLOBAL_THETA)?,
-            tile,
+            tile: self.tile,
             max: MAX_SEQ,
-            precision,
+            precision: self.precision,
             load_source,
-            load_profile,
+            load_profile: self.profile,
         })
     }
 }
+
+/// One of a layer's Q, K and V as it arrives: (rows, cols, BF16 data).
+type Part = Option<(usize, usize, Vec<u16>)>;
 
 #[cfg(test)]
 mod malformed_file_tests {

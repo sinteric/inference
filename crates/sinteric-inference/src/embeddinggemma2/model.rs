@@ -8,10 +8,10 @@
 
 use crate::cpu::kernels::{
     add_rmsnorm, bf16_bits_to_f32, f32_slice_to_bf16_nthreads, for_ranges, for_row_tiles,
-    rmsnorm_rope_to_bf16, rmsnorm_to_bf16, row_mut, row_ref, scale_inplace, DefaultRope,
+    gelu_tanh_mul, rmsnorm_rope_to_bf16, rmsnorm_to_bf16, scale_inplace, DefaultRope, RowsMut,
     SQRT_512_BF16,
 };
-use crate::cpu::onednn::{cache_path_with, CacheOptions, OnednnCpu, PackedWeight};
+use crate::cpu::onednn::{cache_path_with, Attention, CacheOptions, OnednnCpu, PackedWeight};
 use crate::cpu::runtime::{BackendStats, Isa, LoadReport, PackedWeights, WeightSource};
 use crate::tensor_file::Mapped;
 use crate::{check_shape, Result, ResultContext as Context};
@@ -97,7 +97,7 @@ impl Model {
             .linears
             .get(name)
             .with_context(|| format!("linear {name}"))?;
-        check_shape!(x.len() % l.weight.k() == 0, "linear matrix {name}");
+        check_shape!(x.len().is_multiple_of(l.weight.k()), "linear matrix {name}");
         let mut y = self.backend.buffer(crate::checked_size(
             "activation elements",
             &[x.len() / l.weight.k(), l.weight.n()],
@@ -111,7 +111,7 @@ impl Model {
             .linears
             .get(name)
             .with_context(|| format!("linear {name}"))?;
-        check_shape!(x.len() % l.weight.k() == 0, "linear matrix {name}");
+        check_shape!(x.len().is_multiple_of(l.weight.k()), "linear matrix {name}");
         let mut y = self.backend.buffer(crate::checked_size(
             "activation elements",
             &[x.len() / l.weight.k(), l.weight.n()],
@@ -131,7 +131,10 @@ impl Model {
             .norms
             .get(name)
             .with_context(|| format!("norm {name}"))?;
-        check_shape!(x.len() % width == 0 && scale.len() == width, "rms {name}");
+        check_shape!(
+            x.len().is_multiple_of(width) && scale.len() == width,
+            "rms {name}"
+        );
         self.backend
             .rmsnorm(x.len() / width, width, x, Some(scale), RMS_EPS)
     }
@@ -141,7 +144,10 @@ impl Model {
             .norms
             .get(name)
             .with_context(|| format!("norm {name}"))?;
-        check_shape!(x.len() % width == 0 && scale.len() == width, "rms {name}");
+        check_shape!(
+            x.len().is_multiple_of(width) && scale.len() == width,
+            "rms {name}"
+        );
         let mut y = self.backend.buffer_u16(x.len())?;
         let t = Instant::now();
         rmsnorm_to_bf16(
@@ -184,20 +190,20 @@ impl Model {
             "activation elements",
             &[m_pad, HIDDEN],
         )?)?;
-        let x_p = x.as_mut_ptr() as usize;
         let ids: Vec<u32> = batch.input_ids.iter().flatten().copied().collect();
-        let table = self.embeddings.as_slice().as_ptr() as usize;
+        let table = self.embeddings.as_slice();
+        let rows = RowsMut::new(&mut x, HIDDEN);
         for_row_tiles(
             self.backend.threads(),
             ntok,
             self.backend.residual_row_tile(ntok),
             8,
             |lo, hi| {
-                for t in lo..hi {
-                    let id = ids[t] as usize;
-                    let src = unsafe { row_ref(table as *const u16, id, HIDDEN) };
-                    let dst = unsafe { row_mut(x_p as *mut f32, t, HIDDEN) };
-                    embed_row(src, dst, SQRT_512_BF16);
+                // SAFETY: `for_row_tiles` hands out disjoint ranges, each once.
+                let dst = unsafe { rows.range(lo, hi) };
+                for (&id, dst) in ids[lo..hi].iter().zip(dst.as_chunks_mut::<HIDDEN>().0) {
+                    let id = id as usize;
+                    embed_row(&table[id * HIDDEN..(id + 1) * HIDDEN], dst, SQRT_512_BF16);
                 }
             },
         )?;
@@ -218,36 +224,25 @@ impl Model {
         Ok(x)
     }
 
+    /// `[b, s, nh * d]` rows split into `[b, nh, s, d]` heads.
     fn to_heads(&self, src: &[f32], b: usize, s: usize, nh: usize, d: usize) -> Result<Vec<f32>> {
-        self.to_heads_strided(src, b, s, nh, d, nh * d, 0)
-    }
-
-    fn to_heads_strided(
-        &self,
-        src: &[f32],
-        b: usize,
-        s: usize,
-        nh: usize,
-        d: usize,
-        stride: usize,
-        off: usize,
-    ) -> Result<Vec<f32>> {
+        let stride = nh * d;
         let mut out = self
             .backend
             .buffer(crate::checked_size("activation elements", &[b, nh, s, d])?)?;
         let ntok = b * s;
-        let src_p = src.as_ptr() as usize;
-        let dst_p = out.as_mut_ptr() as usize;
+        let rows = RowsMut::new(&mut out, d);
         for_ranges(self.backend.threads(), ntok, 8, |lo, hi| {
             for idx in lo..hi {
                 let bi = idx / s;
                 let p = idx % s;
                 for h in 0..nh {
-                    let so = (bi * s + p) * stride + off + h * d;
-                    let dst = ((bi * nh + h) * s + p) * d;
-                    let src = unsafe { row_ref(src_p as *const f32, so / d, d) };
-                    let dst = unsafe { row_mut(dst_p as *mut f32, dst / d, d) };
-                    dst.copy_from_slice(src);
+                    let so = (bi * s + p) * stride + h * d;
+                    // SAFETY: token `(bi, p)` alone writes row `(bi * nh + h)
+                    // * s + p` for head `h`, and `for_ranges` hands each token
+                    // to one call.
+                    let dst = unsafe { rows.row((bi * nh + h) * s + p) };
+                    dst.copy_from_slice(&src[so..so + d]);
                 }
             }
         });
@@ -283,32 +278,30 @@ impl Model {
             .backend
             .buffer(crate::checked_size("activation elements", &[b, nkv, s, d])?)?;
         let ntok = b * s;
-        let src_p = fused.as_ptr() as usize;
-        let q_p = q.as_mut_ptr() as usize;
-        let k_p = k.as_mut_ptr() as usize;
-        let v_p = v.as_mut_ptr() as usize;
+        let (qr, kr, vr) = (
+            RowsMut::new(&mut q, d),
+            RowsMut::new(&mut k, d),
+            RowsMut::new(&mut v, d),
+        );
         for_ranges(self.backend.threads(), ntok, 8, |lo, hi| {
             for idx in lo..hi {
                 let bi = idx / s;
                 let p = idx % s;
-                let base = (bi * s + p) * stride;
+                let src = &fused[(bi * s + p) * stride..][..stride];
+                // Token `(bi, p)` alone writes row `(bi * heads + h) * s + p`
+                // of each output for head `h`, and `for_ranges` hands each
+                // token to one call.
                 for h in 0..nq {
-                    let so = base + h * d;
-                    let dst = ((bi * nq + h) * s + p) * d;
-                    let src = unsafe { row_ref(src_p as *const f32, so / d, d) };
-                    let dst = unsafe { row_mut(q_p as *mut f32, dst / d, d) };
-                    dst.copy_from_slice(src);
+                    // SAFETY: this token's own row of Q for head `h` (above).
+                    let dst = unsafe { qr.row((bi * nq + h) * s + p) };
+                    dst.copy_from_slice(&src[h * d..][..d]);
                 }
                 for h in 0..nkv {
-                    let ks = base + qn + h * d;
-                    let vs = base + qn + kn + h * d;
-                    let dst = ((bi * nkv + h) * s + p) * d;
-                    let ksrc = unsafe { row_ref(src_p as *const f32, ks / d, d) };
-                    let vsrc = unsafe { row_ref(src_p as *const f32, vs / d, d) };
-                    let kdst = unsafe { row_mut(k_p as *mut f32, dst / d, d) };
-                    let vdst = unsafe { row_mut(v_p as *mut f32, dst / d, d) };
-                    kdst.copy_from_slice(ksrc);
-                    vdst.copy_from_slice(vsrc);
+                    let r = (bi * nkv + h) * s + p;
+                    // SAFETY: this token's own row of K for head `h` (above).
+                    unsafe { kr.row(r) }.copy_from_slice(&src[qn + h * d..][..d]);
+                    // SAFETY: this token's own row of V for head `h` (above).
+                    unsafe { vr.row(r) }.copy_from_slice(&src[qn + kn + h * d..][..d]);
                 }
             }
         });
@@ -388,70 +381,7 @@ impl Model {
             return self.forward_dense_fp32(batch, b, s, splices);
         }
         self.backend.begin_shape(b, s);
-        let tokens = crate::checked_size("EG2 tokens", &[b, s])?;
-        crate::checked_size(
-            "EG2 workspace",
-            &[
-                tokens
-                    .checked_add(64)
-                    .ok_or(crate::Error::size_overflow("padded rows"))?,
-                N_LAYERS,
-                PLE_WIDTH,
-                4,
-            ],
-        )?;
-        let m_pad = self.work_rows(tokens);
-        // These are the existing reservation counts; sum before allocating any.
-        let row_bytes = HIDDEN * 4 * 4
-            + 2048 * 3 * 4
-            + 3072 * 2 * 4
-            + PLE_WIDTH * 3 * 4
-            + N_LAYERS * PLE_WIDTH * 2 * 4
-            + HIDDEN * 3 * 2
-            + HIDDEN * 2 * 4;
-        let planned = crate::checked_size("EG2 reserved activations", &[m_pad, row_bytes])?
-            .checked_add(crate::checked_size(
-                "EG2 reserved BF16 heads",
-                &[tokens, N_QUERY_HEADS, 512, 5, 2],
-            )?)
-            .ok_or(crate::Error::size_overflow("EG2 workspace"))?;
-        self.backend.validate_workspace(planned)?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, HIDDEN])?,
-            4,
-        )?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, 2048])?,
-            3,
-        )?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, 3072])?,
-            2,
-        )?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, PLE_WIDTH])?,
-            3,
-        )?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, N_LAYERS, PLE_WIDTH])?,
-            2,
-        )?;
-        self.backend.reserve_u16(
-            crate::checked_size("activation elements", &[m_pad, HIDDEN])?,
-            3,
-        )?;
-        self.backend.reserve_u16(
-            crate::checked_size("activation elements", &[tokens, N_QUERY_HEADS, 512])?,
-            3,
-        )?;
-        self.backend.reserve_u16(
-            crate::checked_size("activation elements", &[tokens, N_QUERY_HEADS, 512])?,
-            2,
-        )?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, HIDDEN])?,
-            2,
-        )?;
+        let (tokens, m_pad) = self.reserve_dense(b, s)?;
 
         let mut x = self.embed(batch, b, s, m_pad, splices)?;
         let mut ple_raw = self.linear(&x, "language_model.ple.per_layer_model_projection")?;
@@ -474,218 +404,35 @@ impl Model {
                     .collect()
             })
             .collect();
-
+        let dense = Dense {
+            b,
+            s,
+            tokens,
+            m_pad,
+            padding: &padding,
+        };
         for layer in 0..N_LAYERS {
             let base = format!("language_model.layers.{layer}");
-            let global = is_global(layer);
-            let d = head_dim(layer);
-            let nkv = n_kv(layer);
-            let nq = N_QUERY_HEADS;
-
-            let residual = x;
-            let h_bf =
-                self.rms_bf16(&residual, &format!("{base}.input_layernorm.weight"), HIDDEN)?;
-            let qkv_name = format!("{base}.self_attn.qkv_proj");
-            let (q, k, v) = if self.linears.contains_key(&qkv_name) {
-                let fused = self.linear_src(&h_bf, &qkv_name)?;
-                let qkv = self.split_qkv_heads(&fused, b, s, nq, nkv, d)?;
-                self.backend.recycle(fused);
-                qkv
-            } else {
-                let q_flat = self.linear_src(&h_bf, &format!("{base}.self_attn.q_proj"))?;
-                let k_flat = self.linear_src(&h_bf, &format!("{base}.self_attn.k_proj"))?;
-                let v_flat = self.linear_src(&h_bf, &format!("{base}.self_attn.v_proj"))?;
-                let q = self.to_heads(&q_flat, b, s, nq, d)?;
-                let k = self.to_heads(&k_flat, b, s, nkv, d)?;
-                let v = self.to_heads(&v_flat, b, s, nkv, d)?;
-                self.backend.recycle(q_flat);
-                self.backend.recycle(k_flat);
-                self.backend.recycle(v_flat);
-                (q, k, v)
-            };
-            self.backend.recycle_u16(h_bf);
-            let q_scale = self
-                .norms
-                .get(&format!("{base}.self_attn.q_norm.weight"))
-                .with_context(|| format!("{base}.self_attn.q_norm.weight"))?;
-            let k_scale = self
-                .norms
-                .get(&format!("{base}.self_attn.k_norm.weight"))
-                .with_context(|| format!("{base}.self_attn.k_norm.weight"))?;
-            let rope = if global {
-                &self.global_rope
-            } else {
-                &self.local_rope
-            };
-            let mut q_bf = self.backend.buffer_u16(q.len())?;
-            let mut k_bf = self.backend.buffer_u16(k.len())?;
-            let mut v_bf = self.backend.buffer_u16(v.len())?;
-            let threads = self.backend.threads();
-            // Row-major [b,nh,s,d] so each pass streams contiguous head rows.
-            let t_glue = Instant::now();
-            rmsnorm_rope_to_bf16(
-                &q,
-                &mut q_bf,
-                b,
-                s,
-                nq,
-                d,
-                Some(q_scale),
-                RMS_EPS,
-                Some((&rope.cos, &rope.sin)),
-                threads,
-            )?;
-            rmsnorm_rope_to_bf16(
-                &k,
-                &mut k_bf,
-                b,
-                s,
-                nkv,
-                d,
-                Some(k_scale),
-                RMS_EPS,
-                Some((&rope.cos, &rope.sin)),
-                threads,
-            )?;
-            rmsnorm_to_bf16(&v, d, None, RMS_EPS, &mut v_bf, threads)?;
-            self.backend
-                .add_category("glue", t_glue.elapsed().as_secs_f64());
-            self.backend.recycle(q);
-            self.backend.recycle(k);
-            self.backend.recycle(v);
-
-            let attn = self.backend.attention_gqa_src(
-                &q_bf,
-                &k_bf,
-                &v_bf,
-                b,
-                s,
-                nq,
-                nkv,
-                d,
-                self.tile,
-                !global,
-                SLIDING_WINDOW,
-                ATTN_SCALE,
-                &padding,
-            )?;
-            self.backend.recycle_u16(q_bf);
-            self.backend.recycle_u16(k_bf);
-            self.backend.recycle_u16(v_bf);
-            check_shape!(attn.len() == m_pad * nq * d, "attn residual rows");
-
-            let o = self.linear(&attn, &format!("{base}.self_attn.o_proj"))?;
-            self.backend.recycle(attn);
-            let post_attn = self
-                .norms
-                .get(&format!("{base}.post_attention_layernorm.weight"))
-                .with_context(|| format!("{base}.post_attention_layernorm.weight"))?;
-            let mut h = residual;
-            check_shape!(h.len() == o.len(), "attn residual");
-            let t_glue = Instant::now();
-            add_rmsnorm(
-                &mut h,
-                &o,
-                HIDDEN,
-                Some(post_attn),
-                1.0,
-                RMS_EPS,
-                self.backend.threads(),
-            )?;
-            self.backend
-                .add_category("glue", t_glue.elapsed().as_secs_f64());
-            self.backend.recycle(o);
-
-            let residual = h;
-            let pre_bf = self.rms_bf16(
-                &residual,
-                &format!("{base}.pre_feedforward_layernorm.weight"),
-                HIDDEN,
-            )?;
-            let up = self.linear_src(&pre_bf, &format!("{base}.mlp.up_proj"))?;
-            let gate_w = &self
-                .linears
-                .get(&format!("{base}.mlp.gate_proj"))
-                .with_context(|| format!("{base}.mlp.gate_proj"))?
-                .weight;
-            let gated = self.backend.gated_linear_tanh_src(&pre_bf, gate_w, &up)?;
-            self.backend.recycle_u16(pre_bf);
-            self.backend.recycle(up);
-            let down = self.linear(&gated, &format!("{base}.mlp.down_proj"))?;
-            self.backend.recycle(gated);
-            let post_ff = self
-                .norms
-                .get(&format!("{base}.post_feedforward_layernorm.weight"))
-                .with_context(|| format!("{base}.post_feedforward_layernorm.weight"))?;
-            let mut h = residual;
-            let t_glue = Instant::now();
-            add_rmsnorm(
-                &mut h,
-                &down,
-                HIDDEN,
-                Some(post_ff),
-                1.0,
-                RMS_EPS,
-                self.backend.threads(),
-            )?;
-            self.backend
-                .add_category("glue", t_glue.elapsed().as_secs_f64());
-            self.backend.recycle(down);
-
-            let residual = h;
-            let res_bf = self.to_bf16(&residual)?;
-            let gate =
-                self.linear_src(&res_bf, &format!("{base}.ple_block.per_layer_input_gate"))?;
-            self.backend.recycle_u16(res_bf);
-            let mut mixed = self.backend.buffer(gate.len())?;
-            let ple_off = layer * PLE_WIDTH;
-            let threads = self.backend.threads();
-            let gate_p = gate.as_ptr() as usize;
-            let ple_p = ple.as_ptr() as usize;
-            let mix_p = mixed.as_mut_ptr() as usize;
-            let mix_rows = gate.len() / PLE_WIDTH;
-            for_row_tiles(
-                threads,
-                mix_rows,
-                self.backend.residual_row_tile(tokens),
-                8,
-                |lo, hi| {
-                    for ti in lo..hi {
-                        let src = unsafe { row_ref(gate_p as *const f32, ti, PLE_WIDTH) };
-                        let p = unsafe {
-                            row_ref(
-                                (ple_p as *const f32).add(ti * (N_LAYERS * PLE_WIDTH) + ple_off),
-                                0,
-                                PLE_WIDTH,
-                            )
-                        };
-                        let row = unsafe { row_mut(mix_p as *mut f32, ti, PLE_WIDTH) };
-                        unsafe { crate::cpu::kernels::gelu_tanh_mul_unchecked(src, p, row) };
-                    }
-                },
-            )?;
-            self.backend.recycle(gate);
-            let proj = self.linear(&mixed, &format!("{base}.ple_block.per_layer_projection"))?;
-            self.backend.recycle(mixed);
-            let ple_norm = self
-                .norms
-                .get(&format!(
-                    "{base}.ple_block.post_per_layer_input_norm.weight"
-                ))
-                .with_context(|| format!("{base}.ple_block.post_per_layer_input_norm.weight"))?;
-            x = residual;
-            let t_glue = Instant::now();
-            add_rmsnorm(
+            let o = self.self_attention(layer, &base, &x, &dense)?;
+            check_shape!(x.len() == o.len(), "attn residual");
+            self.add_norm(
                 &mut x,
-                &proj,
-                HIDDEN,
-                Some(ple_norm),
-                self.scalars[layer],
-                RMS_EPS,
-                self.backend.threads(),
+                &o,
+                &format!("{base}.post_attention_layernorm.weight"),
+                1.0,
             )?;
-            self.backend
-                .add_category("glue", t_glue.elapsed().as_secs_f64());
+            self.backend.recycle(o);
+            let down = self.mlp(&base, &x)?;
+            self.add_norm(
+                &mut x,
+                &down,
+                &format!("{base}.post_feedforward_layernorm.weight"),
+                1.0,
+            )?;
+            self.backend.recycle(down);
+            let proj = self.per_layer_input(layer, &base, &x, &ple, tokens)?;
+            let norm = format!("{base}.ple_block.post_per_layer_input_norm.weight");
+            self.add_norm(&mut x, &proj, &norm, self.scalars[layer])?;
             self.backend.recycle(proj);
         }
         self.backend.recycle(ple);
@@ -698,6 +445,263 @@ impl Model {
         let pooled = mean_pool(&proj[..tokens * EMBED_DIM], batch, b, s, EMBED_DIM);
         self.backend.recycle(proj);
         Ok(l2_rows(pooled, EMBED_DIM))
+    }
+
+    /// Check that a `b x s` forward fits the workspace limit, then reserve
+    /// every buffer it takes before allocating any: the token count and the
+    /// padded row count.
+    fn reserve_dense(&self, b: usize, s: usize) -> Result<(usize, usize)> {
+        let tokens = crate::checked_size("EG2 tokens", &[b, s])?;
+        crate::checked_size(
+            "EG2 workspace",
+            &[
+                tokens
+                    .checked_add(64)
+                    .ok_or(crate::Error::size_overflow("padded rows"))?,
+                N_LAYERS,
+                PLE_WIDTH,
+                4,
+            ],
+        )?;
+        let m_pad = self.work_rows(tokens);
+        // These are the reservation counts below; sum before allocating any.
+        let row_bytes = HIDDEN * 4 * 4
+            + 2048 * 3 * 4
+            + 3072 * 2 * 4
+            + PLE_WIDTH * 3 * 4
+            + N_LAYERS * PLE_WIDTH * 2 * 4
+            + HIDDEN * 3 * 2
+            + HIDDEN * 2 * 4;
+        let planned = crate::checked_size("EG2 reserved activations", &[m_pad, row_bytes])?
+            .checked_add(crate::checked_size(
+                "EG2 reserved BF16 heads",
+                &[tokens, N_QUERY_HEADS, 512, 5, 2],
+            )?)
+            .ok_or(crate::Error::size_overflow("EG2 workspace"))?;
+        self.backend.validate_workspace(planned)?;
+        let elements = |dims: &[usize]| crate::checked_size("activation elements", dims);
+        self.backend.reserve(elements(&[m_pad, HIDDEN])?, 4)?;
+        self.backend.reserve(elements(&[m_pad, 2048])?, 3)?;
+        self.backend.reserve(elements(&[m_pad, 3072])?, 2)?;
+        self.backend.reserve(elements(&[m_pad, PLE_WIDTH])?, 3)?;
+        self.backend
+            .reserve(elements(&[m_pad, N_LAYERS, PLE_WIDTH])?, 2)?;
+        self.backend.reserve_u16(elements(&[m_pad, HIDDEN])?, 3)?;
+        self.backend
+            .reserve_u16(elements(&[tokens, N_QUERY_HEADS, 512])?, 3)?;
+        self.backend
+            .reserve_u16(elements(&[tokens, N_QUERY_HEADS, 512])?, 2)?;
+        self.backend.reserve(elements(&[m_pad, HIDDEN])?, 2)?;
+        Ok((tokens, m_pad))
+    }
+
+    /// `x += rmsnorm(delta) * scale` row by row, `norm` naming the norm's
+    /// weight; timed as glue.
+    fn add_norm(&self, x: &mut [f32], delta: &[f32], norm: &str, scale: f32) -> Result<()> {
+        let weight = self.norms.get(norm).with_context(|| norm.to_string())?;
+        let t_glue = Instant::now();
+        add_rmsnorm(
+            x,
+            delta,
+            HIDDEN,
+            Some(weight),
+            scale,
+            RMS_EPS,
+            self.backend.threads(),
+        )?;
+        self.backend
+            .add_category("glue", t_glue.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// Layer `layer`'s attention over `x`, through its output projection.
+    fn self_attention(
+        &self,
+        layer: usize,
+        base: &str,
+        x: &[f32],
+        dense: &Dense<'_>,
+    ) -> Result<Vec<f32>> {
+        let Dense {
+            b,
+            s,
+            m_pad,
+            padding,
+            ..
+        } = *dense;
+        let global = is_global(layer);
+        let d = head_dim(layer);
+        let nkv = n_kv(layer);
+        let nq = N_QUERY_HEADS;
+
+        let [q, k, v] = self.qkv_heads(layer, base, x, dense)?;
+        let q_scale = self
+            .norms
+            .get(&format!("{base}.self_attn.q_norm.weight"))
+            .with_context(|| format!("{base}.self_attn.q_norm.weight"))?;
+        let k_scale = self
+            .norms
+            .get(&format!("{base}.self_attn.k_norm.weight"))
+            .with_context(|| format!("{base}.self_attn.k_norm.weight"))?;
+        let rope = if global {
+            &self.global_rope
+        } else {
+            &self.local_rope
+        };
+        let mut q_bf = self.backend.buffer_u16(q.len())?;
+        let mut k_bf = self.backend.buffer_u16(k.len())?;
+        let mut v_bf = self.backend.buffer_u16(v.len())?;
+        let threads = self.backend.threads();
+        // Row-major [b,nh,s,d] so each pass streams contiguous head rows.
+        let t_glue = Instant::now();
+        let rotation = Some((&rope.cos[..], &rope.sin[..]));
+        rmsnorm_rope_to_bf16(
+            &q,
+            &mut q_bf,
+            b,
+            s,
+            nq,
+            d,
+            Some(q_scale),
+            RMS_EPS,
+            rotation,
+            threads,
+        )?;
+        rmsnorm_rope_to_bf16(
+            &k,
+            &mut k_bf,
+            b,
+            s,
+            nkv,
+            d,
+            Some(k_scale),
+            RMS_EPS,
+            rotation,
+            threads,
+        )?;
+        rmsnorm_to_bf16(&v, d, None, RMS_EPS, &mut v_bf, threads)?;
+        self.backend
+            .add_category("glue", t_glue.elapsed().as_secs_f64());
+        self.backend.recycle(q);
+        self.backend.recycle(k);
+        self.backend.recycle(v);
+
+        let shape = Attention {
+            batch: b,
+            seq: s,
+            q_heads: nq,
+            kv_heads: nkv,
+            head_dim: d,
+            tile: self.tile,
+            window: (!global).then_some(SLIDING_WINDOW),
+            scale: ATTN_SCALE,
+            padding,
+        };
+        let attn = self
+            .backend
+            .attention_gqa_src(&shape, &q_bf, &k_bf, &v_bf)?;
+        self.backend.recycle_u16(q_bf);
+        self.backend.recycle_u16(k_bf);
+        self.backend.recycle_u16(v_bf);
+        check_shape!(attn.len() == m_pad * nq * d, "attn residual rows");
+
+        let o = self.linear(&attn, &format!("{base}.self_attn.o_proj"))?;
+        self.backend.recycle(attn);
+        Ok(o)
+    }
+
+    /// Layer `layer`'s Q, K and V heads (`[b, heads, s, d]`) from the rows
+    /// `x`, through the fused projection when the weights have one.
+    fn qkv_heads(
+        &self,
+        layer: usize,
+        base: &str,
+        x: &[f32],
+        dense: &Dense<'_>,
+    ) -> Result<[Vec<f32>; 3]> {
+        let Dense { b, s, .. } = *dense;
+        let (d, nkv, nq) = (head_dim(layer), n_kv(layer), N_QUERY_HEADS);
+        let h_bf = self.rms_bf16(x, &format!("{base}.input_layernorm.weight"), HIDDEN)?;
+        let qkv_name = format!("{base}.self_attn.qkv_proj");
+        let qkv = if self.linears.contains_key(&qkv_name) {
+            let fused = self.linear_src(&h_bf, &qkv_name)?;
+            let (q, k, v) = self.split_qkv_heads(&fused, b, s, nq, nkv, d)?;
+            self.backend.recycle(fused);
+            [q, k, v]
+        } else {
+            let q_flat = self.linear_src(&h_bf, &format!("{base}.self_attn.q_proj"))?;
+            let k_flat = self.linear_src(&h_bf, &format!("{base}.self_attn.k_proj"))?;
+            let v_flat = self.linear_src(&h_bf, &format!("{base}.self_attn.v_proj"))?;
+            let q = self.to_heads(&q_flat, b, s, nq, d)?;
+            let k = self.to_heads(&k_flat, b, s, nkv, d)?;
+            let v = self.to_heads(&v_flat, b, s, nkv, d)?;
+            self.backend.recycle(q_flat);
+            self.backend.recycle(k_flat);
+            self.backend.recycle(v_flat);
+            [q, k, v]
+        };
+        self.backend.recycle_u16(h_bf);
+        Ok(qkv)
+    }
+
+    /// The gated feed-forward over `x`, through its down projection.
+    fn mlp(&self, base: &str, x: &[f32]) -> Result<Vec<f32>> {
+        let pre_bf = self.rms_bf16(
+            x,
+            &format!("{base}.pre_feedforward_layernorm.weight"),
+            HIDDEN,
+        )?;
+        let up = self.linear_src(&pre_bf, &format!("{base}.mlp.up_proj"))?;
+        let gate_w = &self
+            .linears
+            .get(&format!("{base}.mlp.gate_proj"))
+            .with_context(|| format!("{base}.mlp.gate_proj"))?
+            .weight;
+        let gated = self.backend.gated_linear_tanh_src(&pre_bf, gate_w, &up)?;
+        self.backend.recycle_u16(pre_bf);
+        self.backend.recycle(up);
+        let down = self.linear(&gated, &format!("{base}.mlp.down_proj"))?;
+        self.backend.recycle(gated);
+        Ok(down)
+    }
+
+    /// Layer `layer`'s per-layer input: `x`'s gate times that layer's slice
+    /// of `ple`, through its projection.
+    fn per_layer_input(
+        &self,
+        layer: usize,
+        base: &str,
+        x: &[f32],
+        ple: &[f32],
+        tokens: usize,
+    ) -> Result<Vec<f32>> {
+        let res_bf = self.to_bf16(x)?;
+        let gate = self.linear_src(&res_bf, &format!("{base}.ple_block.per_layer_input_gate"))?;
+        self.backend.recycle_u16(res_bf);
+        let mut mixed = self.backend.buffer(gate.len())?;
+        let ple_off = layer * PLE_WIDTH;
+        let threads = self.backend.threads();
+        let mix_rows = gate.len() / PLE_WIDTH;
+        let rows = RowsMut::new(&mut mixed, PLE_WIDTH);
+        for_row_tiles(
+            threads,
+            mix_rows,
+            self.backend.residual_row_tile(tokens),
+            8,
+            |lo, hi| {
+                // SAFETY: `for_row_tiles` hands out disjoint ranges, each once.
+                let out = unsafe { rows.range(lo, hi) };
+                for (ti, row) in (lo..hi).zip(out.as_chunks_mut::<PLE_WIDTH>().0) {
+                    let src = &gate[ti * PLE_WIDTH..(ti + 1) * PLE_WIDTH];
+                    let p = &ple[ti * (N_LAYERS * PLE_WIDTH) + ple_off..][..PLE_WIDTH];
+                    gelu_tanh_mul(src, p, row);
+                }
+            },
+        )?;
+        self.backend.recycle(gate);
+        let proj = self.linear(&mixed, &format!("{base}.ple_block.per_layer_projection"))?;
+        self.backend.recycle(mixed);
+        Ok(proj)
     }
 
     /// Load the image and/or audio towers next to the text tower. Each keeps
@@ -863,10 +867,12 @@ impl Model {
 }
 
 fn embed_row(src: &[u16], dst: &mut [f32], scale: f32) {
-    debug_assert_eq!(src.len(), dst.len());
+    assert_eq!(src.len(), dst.len(), "embedding row length");
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bf16") {
+            // SAFETY: the CPU has both features (checked just above) and the
+            // lengths are checked above.
             unsafe {
                 embed_row_avx512(src, dst, scale);
             }
@@ -878,6 +884,9 @@ fn embed_row(src: &[u16], dst: &mut [f32], scale: f32) {
     }
 }
 
+/// # Safety
+/// The CPU must support AVX-512F and AVX512_BF16, and `dst` must be as long
+/// as `src`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bf16")]
 unsafe fn embed_row_avx512(src: &[u16], dst: &mut [f32], scale: f32) {
@@ -895,6 +904,20 @@ unsafe fn embed_row_avx512(src: &[u16], dst: &mut [f32], scale: f32) {
         *dst.get_unchecked_mut(i) = bf16_bits_to_f32(*src.get_unchecked(i)) * scale;
         i += 1;
     }
+}
+
+/// The shape of one dense forward.
+struct Dense<'a> {
+    /// Rows in the batch.
+    b: usize,
+    /// Tokens per row.
+    s: usize,
+    /// `b * s`.
+    tokens: usize,
+    /// Rows the workspace holds, `tokens` padded up (`Model::work_rows`).
+    m_pad: usize,
+    /// Each row's padded positions, which attention skips.
+    padding: &'a [Vec<usize>],
 }
 
 fn dense_uniform(batch: &Batch) -> bool {

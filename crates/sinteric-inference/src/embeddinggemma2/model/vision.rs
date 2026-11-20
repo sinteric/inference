@@ -12,7 +12,7 @@
 //! RMSNorm and `embed_vision` (768 -> 512).
 
 use crate::cpu::kernels::{add_rmsnorm, bf16_bits_to_f32, qkv_split_norm_rope, rmsnorm_nthreads};
-use crate::cpu::onednn::OnednnCpu;
+use crate::cpu::onednn::{Attention, OnednnCpu};
 use crate::{check_shape, Result};
 
 use super::tower::{load_tower, Packer, TowerParts, TowerSource, Views};
@@ -185,8 +185,8 @@ impl VisionTower {
         let n = img.patches();
         check_shape!(
             n > 0
-                && img.pw % POOL == 0
-                && img.ph % POOL == 0
+                && img.pw.is_multiple_of(POOL)
+                && img.ph.is_multiple_of(POOL)
                 && img.pixels.len() == n * PATCH_PIXELS
                 && img.pw.max(img.ph) <= POSITIONS,
             "vision patches {}x{}",
@@ -247,38 +247,21 @@ impl VisionTower {
                 threads,
             )?;
             hw.recycle(fused);
+            let shape = Attention {
+                batch: 1,
+                seq: n,
+                q_heads: HEADS,
+                kv_heads: HEADS,
+                head_dim: HEAD_DIM,
+                tile,
+                window: None,
+                scale: 1.0,
+                padding: &[vec![]],
+            };
             let attn = if precision == Precision::Fp32 {
-                hw.attention_gqa_f32(
-                    &q,
-                    &k,
-                    &v,
-                    1,
-                    n,
-                    HEADS,
-                    HEADS,
-                    HEAD_DIM,
-                    tile,
-                    false,
-                    0,
-                    1.0,
-                    &[vec![]],
-                )?
+                hw.attention_gqa_f32(&shape, &q, &k, &v)?
             } else {
-                hw.attention_gqa(
-                    &q,
-                    &k,
-                    &v,
-                    1,
-                    n,
-                    HEADS,
-                    HEADS,
-                    HEAD_DIM,
-                    tile,
-                    false,
-                    0,
-                    1.0,
-                    &[vec![]],
-                )?
+                hw.attention_gqa(&shape, &q, &k, &v)?
             };
             hw.recycle(q);
             hw.recycle(k);

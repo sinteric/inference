@@ -49,23 +49,20 @@ impl Graph<'_> {
         self.nodes.push(Node::new(op, inputs));
         self.nodes.len()
     }
-    /// A square `k x k` convolution with folded batch norm (`.w`, `.b`).
-    #[allow(clippy::too_many_arguments)]
-    fn conv(
-        &mut self,
-        id: usize,
-        src: usize,
-        oc: usize,
-        ic: usize,
-        k: usize,
-        stride: usize,
-        dilation: usize,
-        pad: usize,
-    ) -> Result<usize> {
+    /// A convolution with folded batch norm (`.w`, `.b`).
+    fn conv(&mut self, id: usize, src: usize, filters: Filters, spatial: Spatial) -> Result<usize> {
+        let Filters {
+            output,
+            input,
+            kernel,
+            groups,
+            ..
+        } = filters;
         let key = format!("uvdoc.conv{id:03}");
         let tensors = &self.assets.graph().tensors;
-        if tensors.get(&format!("{key}.w")) != Some(&vec![oc, ic, k, k])
-            || tensors.get(&format!("{key}.b")) != Some(&vec![oc])
+        if tensors.get(&format!("{key}.w"))
+            != Some(&vec![output, input / groups, kernel[0], kernel[1]])
+            || tensors.get(&format!("{key}.b")) != Some(&vec![output])
         {
             return Err(Error::model_files(format!(
                 "compiled unwarper weight shape {key}"
@@ -73,28 +70,8 @@ impl Graph<'_> {
         }
         let raw = self.assets.tensor(&format!("{key}.w"))?;
         let bias = self.assets.tensor(&format!("{key}.b"))?;
-        let weights = ConvWeights::pack(
-            self.cpu.clone(),
-            oc,
-            ic,
-            [k, k],
-            1,
-            false,
-            &raw,
-            Some(&bias),
-        )?;
-        Ok(self.push(
-            Op::Conv {
-                weights,
-                spatial: Spatial {
-                    strides: [stride; 2],
-                    dilations: [dilation; 2],
-                    pads_begin: [pad; 2],
-                    pads_end: [pad; 2],
-                },
-            },
-            [src],
-        ))
+        let weights = ConvWeights::pack(self.cpu.clone(), filters, &raw, Some(&bias))?;
+        Ok(self.push(Op::Conv { weights, spatial }, [src]))
     }
     fn relu(&mut self, src: usize) -> usize {
         debug_assert_eq!(src, self.nodes.len());
@@ -114,26 +91,55 @@ impl Graph<'_> {
         post.push(PostOp::Eltwise(Activation::Relu));
         src
     }
-    /// A 5x5 residual block. `shortcut` names the downsampling convolution
-    /// that replaces the identity on the first block of a stage.
-    fn block(
+    /// A 5x5 residual block: two convolutions with `dilation` over
+    /// `channels`, and the identity as its shortcut.
+    fn block(&mut self, src: usize, id: usize, channels: usize, dilation: usize) -> Result<usize> {
+        let filters = Filters::square(channels, channels, 5);
+        self.residual(
+            src,
+            src,
+            id,
+            filters,
+            Spatial::square(1, dilation, 2 * dilation),
+        )
+    }
+    /// The first block of a stage: it halves the resolution, and the 5x5
+    /// stride-2 convolution `shortcut` replaces the identity.
+    fn down_block(
         &mut self,
         src: usize,
+        shortcut: usize,
         id: usize,
-        ic: usize,
-        oc: usize,
-        dilation: usize,
-        stride: usize,
-        shortcut: Option<usize>,
+        input: usize,
+        output: usize,
     ) -> Result<usize> {
-        let pad = 2 * dilation;
-        let residual = match shortcut {
-            Some(s) => self.conv(s, src, oc, ic, 5, stride, 1, 2)?,
-            None => src,
-        };
-        let a = self.conv(id, src, oc, ic, 5, stride, dilation, pad)?;
+        let (filters, spatial) = (Filters::square(output, input, 5), Spatial::square(2, 1, 2));
+        let residual = self.conv(shortcut, src, filters, spatial)?;
+        self.residual(src, residual, id, filters, spatial)
+    }
+    /// `relu(b(relu(a(src))) + residual)`: convolution `id` with `filters`
+    /// and `spatial`, then convolution `id + 1`, a 5x5 over its output
+    /// channels with the same dilation and padding at stride 1.
+    fn residual(
+        &mut self,
+        src: usize,
+        residual: usize,
+        id: usize,
+        filters: Filters,
+        spatial: Spatial,
+    ) -> Result<usize> {
+        let a = self.conv(id, src, filters, spatial)?;
         let a = self.relu(a);
-        let b = self.conv(id + 1, a, oc, oc, 5, 1, dilation, pad)?;
+        let second = Filters::square(filters.output, filters.output, 5);
+        let b = self.conv(
+            id + 1,
+            a,
+            second,
+            Spatial {
+                strides: [1; 2],
+                ..spatial
+            },
+        )?;
         Ok(self.add_relu(b, residual))
     }
     fn finish(self, capacity: usize) -> Result<ConvNet> {
@@ -143,23 +149,23 @@ impl Graph<'_> {
 
 fn backbone(cpu: &Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Result<ConvNet> {
     let mut g = Graph::new(assets, cpu);
-    let a = g.conv(0, 0, 32, 3, 5, 2, 1, 2)?;
+    let a = g.conv(0, 0, Filters::square(32, 3, 5), Spatial::square(2, 1, 2))?;
     let a = g.relu(a);
-    let a = g.conv(1, a, 32, 32, 5, 2, 1, 2)?;
+    let a = g.conv(1, a, Filters::square(32, 32, 5), Spatial::square(2, 1, 2))?;
     let mut a = g.relu(a);
     // Stage 1: 32 channels at 178 x 122.
-    a = g.block(a, 2, 32, 32, 1, 1, None)?;
-    a = g.block(a, 4, 32, 32, 3, 1, None)?;
-    a = g.block(a, 6, 32, 32, 3, 1, None)?;
+    a = g.block(a, 2, 32, 1)?;
+    a = g.block(a, 4, 32, 3)?;
+    a = g.block(a, 6, 32, 3)?;
     // Stage 2: 64 channels at 89 x 61.
-    a = g.block(a, 9, 32, 64, 1, 2, Some(8))?;
+    a = g.down_block(a, 8, 9, 32, 64)?;
     for id in [11, 13, 15] {
-        a = g.block(a, id, 64, 64, 3, 1, None)?;
+        a = g.block(a, id, 64, 3)?;
     }
     // Stage 3: 128 channels at 45 x 31.
-    a = g.block(a, 18, 64, 128, 1, 2, Some(17))?;
+    a = g.down_block(a, 17, 18, 64, 128)?;
     for id in [20, 22, 24, 26, 28] {
-        a = g.block(a, id, 128, 128, 3, 1, None)?;
+        a = g.block(a, id, 128, 3)?;
     }
     // The bridge: each branch reads the stage-3 features.
     let c = BRIDGE_CHANNELS;
@@ -167,13 +173,23 @@ fn backbone(cpu: &Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Result<Co
     for convs in BRANCHES {
         let mut b = a;
         for &(id, dilation) in convs {
-            b = g.conv(id, b, c, c, 3, 1, dilation, dilation)?;
+            b = g.conv(
+                id,
+                b,
+                Filters::square(c, c, 3),
+                Spatial::square(1, dilation, dilation),
+            )?;
             b = g.relu(b);
         }
         ends.push(b);
     }
     let bridge = g.push(Op::Concat { axis: 1 }, ends);
-    let a = g.conv(42, bridge, c, BRANCHES.len() * c, 1, 1, 1, 0)?;
+    let a = g.conv(
+        42,
+        bridge,
+        Filters::square(c, BRANCHES.len() * c, 1),
+        Spatial::default(),
+    )?;
     g.relu(a);
     g.finish(capacity)
 }
@@ -205,14 +221,24 @@ fn head(cpu: &Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Result<ConvNe
     }
     let slope = assets.tensor(name)?;
     let mut g = Graph::new(assets, cpu);
-    let a = g.conv(43, 0, HEAD_CHANNELS, BRIDGE_CHANNELS, 5, 1, 1, 0)?;
+    let a = g.conv(
+        43,
+        0,
+        Filters::square(HEAD_CHANNELS, BRIDGE_CHANNELS, 5),
+        Spatial::default(),
+    )?;
     g.push(Op::Prelu { slopes: slope }, [a]);
     g.finish(capacity)
 }
 
 fn points(cpu: &Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Result<ConvNet> {
     let mut g = Graph::new(assets, cpu);
-    g.conv(44, 0, 2, HEAD_CHANNELS, 5, 1, 1, 0)?;
+    g.conv(
+        44,
+        0,
+        Filters::square(2, HEAD_CHANNELS, 5),
+        Spatial::default(),
+    )?;
     g.finish(capacity)
 }
 

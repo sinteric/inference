@@ -105,6 +105,10 @@ fn homography(src: Quad, dst: Quad) -> Result<[f64; 9]> {
         a.swap(k, pivot);
         for i in k + 1..8 {
             let ratio = a[i][k] * (-1. / a[k][k]);
+            #[expect(
+                clippy::needless_range_loop,
+                reason = "elimination reads the pivot row and writes row `i` at the same column"
+            )]
             for j in k + 1..9 {
                 a[i][j] += ratio * a[k][j];
             }
@@ -207,7 +211,7 @@ pub fn warp_quad_bgr(src: &ImageView<'_>, quad: Quad, max_pixels: usize) -> Resu
             let wy = cubic(sy - iy as f32);
             for c in 0..3 {
                 let mut acc = 0f32;
-                for ky in 0..4 {
+                for (ky, &wy) in wy.iter().enumerate() {
                     let yy = (iy + ky as i64 - 1).clamp(0, src.height() as i64 - 1) as usize;
                     let mut row = 0.;
                     for (kx, &weight) in wx.iter().enumerate() {
@@ -218,7 +222,7 @@ pub fn warp_quad_bgr(src: &ImageView<'_>, quad: Quad, max_pixels: usize) -> Resu
                             row = (src.bgr(xx, yy, c) as f32).mul_add(weight, row);
                         }
                     }
-                    acc = row.mul_add(wy[ky], acc);
+                    acc = row.mul_add(wy, acc);
                 }
                 data[(y * w + x) * 3 + c] = acc.round_ties_even().clamp(0., 255.) as u8;
             }

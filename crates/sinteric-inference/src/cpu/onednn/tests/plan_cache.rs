@@ -14,11 +14,8 @@ fn full_cache_evicts_least_recently_used_plan() {
     )
     .unwrap();
     cpu.set_primitive_capacity(2).unwrap();
-    // Kind 3 is GELU (erf), an elementwise plan keyed by its row count.
-    let gelu = |m: usize| {
-        cpu.op_inner(3, m, 8, &vec![-1.; m * 8], None, None, 0.)
-            .unwrap()
-    };
+    // GELU (erf) is an elementwise plan keyed by its row count.
+    let gelu = |m: usize| cpu.gelu_erf(m, 8, &vec![-1.; m * 8]).unwrap();
     gelu(1);
     gelu(2);
     gelu(1);

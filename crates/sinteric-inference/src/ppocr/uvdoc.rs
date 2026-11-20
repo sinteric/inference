@@ -13,7 +13,7 @@
 //! found on it does not address the caller's pixels. When to keep it is the
 //! caller's decision.
 use crate::cpu::onednn::OnednnCpu;
-use crate::image::{ImageView, PixelFormat};
+use crate::image::{ImageView, PixelFormat, Planes};
 use crate::ppocr::net::{self, OcrNet, Tensor};
 use crate::ppocr::uvdoc_graph::{
     self, Nets, BRIDGE_CHANNELS, GRID_HEIGHT, GRID_WIDTH, HEAD_CHANNELS, HEAD_PAD, INPUT_HEIGHT,
@@ -196,11 +196,9 @@ impl Unwarper {
             crate::ppocr::rec::all_par(self.threads, input, f32::is_finite),
             "nonfinite unwarper input"
         );
+        let input = Planes::new(input, 3, shape[2], shape[3])?;
         let resized = crate::image::resize_linear_align_corners_nchw(
             input,
-            3,
-            shape[2],
-            shape[3],
             INPUT_HEIGHT,
             INPUT_WIDTH,
             self.threads,
@@ -214,10 +212,11 @@ impl Unwarper {
             .nets
             .backbone
             .run([1, 3, INPUT_HEIGHT, INPUT_WIDTH], resized)?;
-        let padded = crate::image::reflect_pad_nchw(&fused, c, gh, gw, HEAD_PAD)?;
+        let padded = crate::image::reflect_pad_nchw(Planes::new(&fused, c, gh, gw)?, HEAD_PAD)?;
         let (ph, pw) = (gh + 2 * HEAD_PAD, gw + 2 * HEAD_PAD);
         let (_, hidden) = self.nets.head.run([1, c, ph, pw], &padded)?;
-        let padded = crate::image::reflect_pad_nchw(&hidden, HEAD_CHANNELS, gh, gw, HEAD_PAD)?;
+        let hidden = Planes::new(&hidden, HEAD_CHANNELS, gh, gw)?;
+        let padded = crate::image::reflect_pad_nchw(hidden, HEAD_PAD)?;
         let (shape, grid) = self.nets.points.run([1, HEAD_CHANNELS, ph, pw], &padded)?;
         crate::check_shape!(
             shape == [1, 2, gh, gw] && grid.iter().all(|v| v.is_finite()),
@@ -233,13 +232,8 @@ impl Unwarper {
             "unwarper grid shape"
         );
         let values = crate::image::grid_sample_coarse_align_corners(
-            input,
-            3,
-            shape[2],
-            shape[3],
-            &grid.values,
-            GRID_HEIGHT,
-            GRID_WIDTH,
+            Planes::new(input, 3, shape[2], shape[3])?,
+            Planes::new(&grid.values, 2, GRID_HEIGHT, GRID_WIDTH)?,
             self.threads,
         )?;
         Tensor::new(shape.to_vec(), values)
@@ -254,11 +248,9 @@ impl Unwarper {
         let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.;
         let t = Instant::now();
         let input = self.preprocess(image)?;
+        let planes = Planes::new(&input.values, 3, input.shape[2], input.shape[3])?;
         let resized = crate::image::resize_linear_align_corners_nchw(
-            &input.values,
-            3,
-            input.shape[2],
-            input.shape[3],
+            planes,
             INPUT_HEIGHT,
             INPUT_WIDTH,
             self.threads,

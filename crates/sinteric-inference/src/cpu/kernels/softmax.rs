@@ -1,4 +1,4 @@
-use crate::cpu::kernels::parallel::{for_ranges, rows_mut};
+use crate::cpu::kernels::parallel::for_rows;
 
 pub fn softmax_inplace(row: &mut [f32]) {
     if row.is_empty() {
@@ -7,6 +7,7 @@ pub fn softmax_inplace(row: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU has AVX-512F (checked just above).
             unsafe {
                 softmax_inplace_avx512(row);
             }
@@ -42,10 +43,13 @@ fn softmax_inplace_scalar(row: &mut [f32]) {
     }
 }
 
+/// # Safety
+/// The CPU must support AVX-512F.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn softmax_inplace_avx512(row: &mut [f32]) {
     use std::arch::x86_64::*;
+    // Every access below is at an index in `[0, n)`.
     let n = row.len();
     let ptr = row.as_mut_ptr();
     let mut i = 0;
@@ -97,9 +101,12 @@ unsafe fn softmax_inplace_avx512(row: &mut [f32]) {
 }
 
 /// `exp(x)` on 16 lanes. Relative error is ~1e-6 on the softmax domain.
+///
+/// # Safety
+/// The CPU must support AVX-512F.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-unsafe fn exp_avx512(x: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512 {
+pub(super) unsafe fn exp_avx512(x: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512 {
     use std::arch::x86_64::*;
     // Clamp so n = round(x / ln2) fits a reasonable exponent.
     let x = _mm512_min_ps(
@@ -129,14 +136,14 @@ unsafe fn exp_avx512(x: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512 
     _mm512_mul_ps(p, _mm512_scalef_ps(one, n))
 }
 
+/// Softmax of each row of `cols` in `logits`, in place.
+///
+/// # Panics
+/// If `cols` is zero or does not divide `logits.len()`.
 pub(crate) fn softmax_rows_nthreads(logits: &mut [f32], cols: usize, nthreads: usize) {
-    debug_assert!(cols > 0 && logits.len().is_multiple_of(cols));
-    let rows = logits.len() / cols;
-    let p = logits.as_mut_ptr() as usize;
-    for_ranges(nthreads, rows, 4, |lo, hi| {
-        let logits = unsafe { rows_mut(p as *mut f32, lo, hi, cols) };
-        for i in 0..(hi - lo) {
-            softmax_inplace(&mut logits[i * cols..(i + 1) * cols]);
+    for_rows(nthreads, 4, logits, cols, |_, _, rows| {
+        for row in rows.chunks_exact_mut(cols) {
+            softmax_inplace(row);
         }
     });
 }

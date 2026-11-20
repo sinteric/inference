@@ -1,6 +1,8 @@
 //! Default (non-YaRN) RoPE matching Hugging Face `apply_rotary_pos_emb` + `rotate_half`.
 //! Cos/sin last-dim is duplicated: `emb = cat(freqs, freqs)`.
 
+use crate::cpu::kernels::parallel::{for_ranges, RowsMut};
+
 #[derive(Clone, Debug)]
 pub struct DefaultRope {
     pub cos: Vec<f32>,
@@ -46,12 +48,17 @@ impl DefaultRope {
 /// Apply RoPE in-place to one head vector of length `dim`.
 pub(crate) fn apply_rope_vec(x: &mut [f32], cos: &[f32], sin: &[f32]) {
     let dim = x.len();
-    debug_assert_eq!(cos.len(), dim);
-    debug_assert_eq!(sin.len(), dim);
-    debug_assert!(dim.is_multiple_of(2));
+    assert!(
+        cos.len() == dim && sin.len() == dim && dim.is_multiple_of(2),
+        "RoPE row of {dim} with tables of {}/{}",
+        cos.len(),
+        sin.len()
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU has AVX-512F (checked just above) and the
+            // tables are as long as `x` (checked above).
             unsafe {
                 apply_rope_vec_avx512(x, cos, sin);
             }
@@ -67,6 +74,8 @@ pub(crate) fn apply_rope_vec(x: &mut [f32], cos: &[f32], sin: &[f32]) {
     }
 }
 
+/// # Safety
+/// The CPU must support AVX-512F, and `cos` and `sin` must be as long as `x`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn apply_rope_vec_avx512(x: &mut [f32], cos: &[f32], sin: &[f32]) {
@@ -114,54 +123,34 @@ pub(crate) fn layout_qkv_rope(
 ) {
     let h = nh * d;
     let half = d / 2;
-    debug_assert!(d >= 2 && d.is_multiple_of(2));
-    debug_assert_eq!(fused.len(), b * s * 3 * h);
-    debug_assert_eq!(q.len(), b * s * h);
-    debug_assert_eq!(k.len(), q.len());
-    debug_assert_eq!(v.len(), q.len());
-    let ntok = b * s;
-    let src_p = fused.as_ptr() as usize;
-    let q_p = q.as_mut_ptr() as usize;
-    let k_p = k.as_mut_ptr() as usize;
-    let v_p = v.as_mut_ptr() as usize;
-    let c_p = cos.as_ptr() as usize;
-    let si_p = sin.as_ptr() as usize;
-    let src_len = fused.len();
-    let q_len = q.len();
-    let k_len = k.len();
-    let v_len = v.len();
-    let cos_len = cos.len();
-    let sin_len = sin.len();
-    crate::cpu::kernels::parallel::for_ranges(nthreads, ntok, 4, |lo, hi| {
-        let src = unsafe { std::slice::from_raw_parts(src_p as *const f32, src_len) };
-        let q = unsafe { std::slice::from_raw_parts_mut(q_p as *mut f32, q_len) };
-        let k = unsafe { std::slice::from_raw_parts_mut(k_p as *mut f32, k_len) };
-        let v = unsafe { std::slice::from_raw_parts_mut(v_p as *mut f32, v_len) };
-        let cos = unsafe { std::slice::from_raw_parts(c_p as *const f32, cos_len) };
-        let sin = unsafe { std::slice::from_raw_parts(si_p as *const f32, sin_len) };
+    assert!(
+        d >= 2
+            && d.is_multiple_of(2)
+            && fused.len() == b * s * 3 * h
+            && q.len() == b * s * h
+            && k.len() == q.len()
+            && v.len() == q.len(),
+        "fused QKV shape"
+    );
+    let (q, k, v) = (RowsMut::new(q, d), RowsMut::new(k, d), RowsMut::new(v, d));
+    for_ranges(nthreads, b * s, 4, |lo, hi| {
         for idx in lo..hi {
             let bi = idx / s;
             let p = idx % s;
             let c = &cos[p * half..(p + 1) * half];
             let si = &sin[p * half..(p + 1) * half];
             for head in 0..nh {
-                let src_off = (bi * s + p) * 3 * h + head * d;
-                let dst = ((bi * nh + head) * s + p) * d;
-                rope_scale(
-                    &src[src_off..src_off + d],
-                    &mut q[dst..dst + d],
-                    c,
-                    si,
-                    q_scale,
-                );
-                rope_scale(
-                    &src[src_off + h..src_off + h + d],
-                    &mut k[dst..dst + d],
-                    c,
-                    si,
-                    1.0,
-                );
-                v[dst..dst + d].copy_from_slice(&src[src_off + 2 * h..src_off + 2 * h + d]);
+                let src = &fused[(bi * s + p) * 3 * h + head * d..];
+                // Token `idx` is `(bi, p)` and alone writes row `r` of each
+                // output for head `head`; `for_ranges` hands each token to one
+                // call.
+                let r = (bi * nh + head) * s + p;
+                // SAFETY: this token's own row of Q for this head (above).
+                rope_scale(&src[..d], unsafe { q.row(r) }, c, si, q_scale);
+                // SAFETY: this token's own row of K for this head (above).
+                rope_scale(&src[h..h + d], unsafe { k.row(r) }, c, si, 1.0);
+                // SAFETY: this token's own row of V for this head (above).
+                unsafe { v.row(r) }.copy_from_slice(&src[2 * h..2 * h + d]);
             }
         }
     });

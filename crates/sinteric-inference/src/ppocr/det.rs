@@ -160,8 +160,8 @@ impl Detector {
                 && shape[1] == 3
                 && shape[2] > 0
                 && shape[3] > 0
-                && shape[2] % 32 == 0
-                && shape[3] % 32 == 0,
+                && shape[2].is_multiple_of(32)
+                && shape[3].is_multiple_of(32),
             "detector requires NCHW BGR with H/W positive multiples of 32"
         );
         self.options.pixels(shape[3], shape[2])?;

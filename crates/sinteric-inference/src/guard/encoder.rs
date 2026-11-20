@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cpu::kernels::{add_inplace, f32_slice_to_bf16_nthreads, for_ranges, layout_qkv_rope};
 use crate::cpu::onednn::{
-    file_stamp, CacheOptions, CacheWriter, OnednnCpu, PackedWeight, RawTensor,
+    file_stamp, Attention, CacheOptions, CacheWriter, OnednnCpu, PackedWeight, RawTensor,
 };
 use crate::cpu::runtime::{BackendStats, CacheWrite, Isa, LoadReport, PackedWeights, WeightSource};
 use crate::guard::config::EncoderConfig;
@@ -587,17 +587,25 @@ impl Encoder {
         )?;
         self.backend.recycle(qkv);
         let radius = self.cfg.local_radius;
+        let shape = Attention {
+            batch: b,
+            seq: s,
+            q_heads: nh,
+            kv_heads: nh,
+            head_dim: d,
+            tile: self.tile,
+            window: (!global).then_some(radius),
+            scale: 1.0,
+            padding,
+        };
         let attn = if self.native_bf16 {
             // Q is already scaled; `attention_gqa` rounds Q/K/V to BF16.
             // Its output carries zero rows of backend padding.
-            let mut a = self.backend.attention_gqa(
-                &q, &k, &v, b, s, nh, nh, d, self.tile, !global, radius, 1.0, padding,
-            )?;
+            let mut a = self.backend.attention_gqa(&shape, &q, &k, &v)?;
             a.truncate(tokens * h);
             a
         } else {
-            self.backend
-                .attention(&q, &k, &v, b, s, nh, d, self.tile, !global, radius, padding)?
+            self.backend.attention(&shape, &q, &k, &v)?
         };
         self.backend.recycle(q);
         self.backend.recycle(k);

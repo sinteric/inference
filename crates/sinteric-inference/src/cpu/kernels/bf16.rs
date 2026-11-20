@@ -1,6 +1,6 @@
 //! Round-to-nearest-even f32↔bf16 conversions (IEEE-like, matching PyTorch / VCVTNEPS2BF16).
 
-use crate::cpu::kernels::parallel::for_ranges;
+use crate::cpu::kernels::parallel::for_rows;
 
 #[inline]
 pub fn f32_to_bf16_bits(x: f32) -> u16 {
@@ -24,18 +24,15 @@ pub fn f32_slice_to_bf16(src: &[f32], dst: &mut [u16]) {
     f32_slice_to_bf16_nthreads(src, dst, 1);
 }
 
+/// # Panics
+/// If `src` and `dst` differ in length.
 pub(crate) fn f32_slice_to_bf16_nthreads(src: &[f32], dst: &mut [u16], nthreads: usize) {
-    debug_assert_eq!(src.len(), dst.len());
-    let n = src.len();
-    if n == 0 {
+    assert_eq!(src.len(), dst.len(), "bf16 conversion lengths");
+    if src.is_empty() {
         return;
     }
-    let src_p = src.as_ptr() as usize;
-    let dst_p = dst.as_mut_ptr() as usize;
-    for_ranges(nthreads, n, 1024, |lo, hi| {
-        let s = unsafe { crate::cpu::kernels::parallel::rows_ref(src_p as *const f32, lo, hi, 1) };
-        let d = unsafe { crate::cpu::kernels::parallel::rows_mut(dst_p as *mut u16, lo, hi, 1) };
-        convert_range(s, d);
+    for_rows(nthreads, 1024, dst, 1, |lo, hi, dst| {
+        convert_range(&src[lo..hi], dst)
     });
 }
 
@@ -43,6 +40,7 @@ fn convert_range(src: &[f32], dst: &mut [u16]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bf16") {
+            // SAFETY: the CPU has both features (checked just above).
             unsafe {
                 convert_range_avx512(src, dst);
             }
@@ -54,11 +52,14 @@ fn convert_range(src: &[f32], dst: &mut [u16]) {
     }
 }
 
+/// # Safety
+/// The CPU must support AVX-512F and AVX512_BF16.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bf16")]
 unsafe fn convert_range_avx512(src: &[f32], dst: &mut [u16]) {
     use std::arch::x86_64::*;
-    let n = src.len();
+    // Every load and store below stays inside `[0, n)` of both slices.
+    let n = src.len().min(dst.len());
     let mut i = 0;
     while i + 32 <= n {
         let lo = _mm512_loadu_ps(src.as_ptr().add(i));

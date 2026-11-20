@@ -420,7 +420,9 @@ fn embeddings_match_across_thread_counts() {
                 continue;
             }
         }
-        let mut references: Vec<(usize, Vec<(String, Vec<f32>)>)> = Vec::new();
+        // Per thread count, each input's embedding: (threads, [(input, values)]).
+        type Vectors = Vec<(String, Vec<f32>)>;
+        let mut references: Vec<(usize, Vectors)> = Vec::new();
         let mut min_cross = 1.0f32;
         for t in [1usize, 2, 4, 8] {
             if crate::cpu::threads::ThreadBudget::new(t).is_err() {

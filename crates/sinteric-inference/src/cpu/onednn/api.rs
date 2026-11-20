@@ -18,7 +18,10 @@ static MAX_CPU_ISA: Mutex<Option<CpuIsaCap>> = Mutex::new(None);
 static TP_THREADS: OnceLock<i32> = OnceLock::new();
 /// Process-lifetime C++ `threadpool_iface`. Streams borrow this pointer.
 struct ThreadpoolPtr(*mut c_void);
+// SAFETY: the pool behind the pointer lives for the process, and oneDNN calls
+// its C++ interface from any thread.
 unsafe impl Send for ThreadpoolPtr {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for ThreadpoolPtr {}
 static THREADPOOL: OnceLock<ThreadpoolPtr> = OnceLock::new();
 
@@ -32,8 +35,6 @@ pub struct Api {
     pub threadpool: *mut c_void,
     pub stream_wait: unsafe extern "C" fn(dnnl_stream_t) -> dnnl_status_t,
     pub stream_destroy: unsafe extern "C" fn(dnnl_stream_t) -> dnnl_status_t,
-    #[allow(dead_code)]
-    pub set_cache: unsafe extern "C" fn(i32) -> dnnl_status_t,
     pub attr_create: unsafe extern "C" fn(*mut dnnl_primitive_attr_t) -> dnnl_status_t,
     pub attr_destroy: unsafe extern "C" fn(dnnl_primitive_attr_t) -> dnnl_status_t,
     pub attr_fpmath:
@@ -165,7 +166,10 @@ pub struct Api {
     ) -> dnnl_status_t,
 }
 
+// SAFETY: the table holds plain function pointers and the process-lifetime
+// threadpool, which oneDNN calls from any thread.
 unsafe impl Send for Api {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for Api {}
 
 impl Api {
@@ -177,70 +181,68 @@ impl Api {
     pub fn init(isa: CpuIsaCap, verbose: i32, nthreads: i32) -> Result<Self> {
         apply_tp_threads(nthreads)?;
         let threadpool = threadpool_ptr()?;
-        unsafe {
-            apply_max_cpu_isa(dnnl_set_max_cpu_isa, isa)?;
-            let _ = dnnl_set_verbose(verbose);
-
-            let v = dnnl_version();
-            check_shape!(!v.is_null(), "dnnl_version returned null");
-            let ver = &*v;
-            check_shape!(
-                ver.major == onednn_sys::PINNED_MAJOR
-                    && ver.minor == onednn_sys::PINNED_MINOR
-                    && ver.patch == onednn_sys::PINNED_PATCH,
-                "oneDNN ABI/release mismatch: {}.{}.{} (want 3.13.4)",
-                ver.major,
-                ver.minor,
-                ver.patch
-            );
-            check_shape!(
-                dnnl_set_primitive_cache_capacity(0) == dnnl_success,
-                "primitive cache configuration"
-            );
-
-            Ok(Self {
-                engine_create: dnnl_engine_create,
-                engine_destroy: dnnl_engine_destroy,
-                stream_create: dnnl_threadpool_interop_stream_create,
-                threadpool,
-                stream_wait: dnnl_stream_wait,
-                stream_destroy: dnnl_stream_destroy,
-                set_cache: dnnl_set_primitive_cache_capacity,
-                attr_create: dnnl_primitive_attr_create,
-                attr_destroy: dnnl_primitive_attr_destroy,
-                attr_fpmath: dnnl_primitive_attr_set_fpmath_mode,
-                attr_accum: dnnl_primitive_attr_set_accumulation_mode,
-                attr_scratch: dnnl_primitive_attr_set_scratchpad_mode,
-                attr_post_ops: dnnl_primitive_attr_set_post_ops,
-                post_ops_create: dnnl_post_ops_create,
-                post_ops_destroy: dnnl_post_ops_destroy,
-                post_ops_sum: dnnl_post_ops_append_sum,
-                post_ops_eltwise: dnnl_post_ops_append_eltwise,
-                post_ops_binary: dnnl_post_ops_append_binary,
-                md_strides: dnnl_memory_desc_create_with_strides,
-                md_tag: dnnl_memory_desc_create_with_tag,
-                md_clone: dnnl_memory_desc_clone,
-                md_destroy: dnnl_memory_desc_destroy,
-                md_size: dnnl_memory_desc_get_size,
-                md_query: dnnl_memory_desc_query,
-                get_effective_cpu_isa: dnnl_get_effective_cpu_isa,
-                mem_create: dnnl_memory_create,
-                mem_set: dnnl_memory_set_data_handle,
-                mem_destroy: dnnl_memory_destroy,
-                pd_query: dnnl_primitive_desc_query,
-                pd_query_md: dnnl_primitive_desc_query_md,
-                pd_destroy: dnnl_primitive_desc_destroy,
-                prim_create: dnnl_primitive_create,
-                prim_destroy: dnnl_primitive_destroy,
-                prim_execute: dnnl_primitive_execute,
-                reorder_pd: dnnl_reorder_primitive_desc_create,
-                matmul_pd: dnnl_matmul_primitive_desc_create,
-                binary_pd: dnnl_binary_primitive_desc_create,
-                eltwise_pd: dnnl_eltwise_forward_primitive_desc_create,
-                softmax_pd: dnnl_softmax_forward_primitive_desc_create,
-                layernorm_pd: dnnl_layer_normalization_forward_primitive_desc_create,
-            })
-        }
+        apply_max_cpu_isa(dnnl_set_max_cpu_isa, isa)?;
+        // SAFETY: no preconditions; a level oneDNN does not know is refused.
+        let _ = unsafe { dnnl_set_verbose(verbose) };
+        // SAFETY: no preconditions.
+        let v = unsafe { dnnl_version() };
+        check_shape!(!v.is_null(), "dnnl_version returned null");
+        // SAFETY: not null (checked above); oneDNN's version record is static.
+        let ver = unsafe { &*v };
+        check_shape!(
+            ver.major == onednn_sys::PINNED_MAJOR
+                && ver.minor == onednn_sys::PINNED_MINOR
+                && ver.patch == onednn_sys::PINNED_PATCH,
+            "oneDNN ABI/release mismatch: {}.{}.{} (want 3.13.4)",
+            ver.major,
+            ver.minor,
+            ver.patch
+        );
+        // SAFETY: no preconditions; capacity 0 turns oneDNN's own primitive
+        // cache off, since this backend keeps its own.
+        let rc = unsafe { dnnl_set_primitive_cache_capacity(0) };
+        check_shape!(rc == dnnl_success, "primitive cache configuration");
+        Ok(Self {
+            engine_create: dnnl_engine_create,
+            engine_destroy: dnnl_engine_destroy,
+            stream_create: dnnl_threadpool_interop_stream_create,
+            threadpool,
+            stream_wait: dnnl_stream_wait,
+            stream_destroy: dnnl_stream_destroy,
+            attr_create: dnnl_primitive_attr_create,
+            attr_destroy: dnnl_primitive_attr_destroy,
+            attr_fpmath: dnnl_primitive_attr_set_fpmath_mode,
+            attr_accum: dnnl_primitive_attr_set_accumulation_mode,
+            attr_scratch: dnnl_primitive_attr_set_scratchpad_mode,
+            attr_post_ops: dnnl_primitive_attr_set_post_ops,
+            post_ops_create: dnnl_post_ops_create,
+            post_ops_destroy: dnnl_post_ops_destroy,
+            post_ops_sum: dnnl_post_ops_append_sum,
+            post_ops_eltwise: dnnl_post_ops_append_eltwise,
+            post_ops_binary: dnnl_post_ops_append_binary,
+            md_strides: dnnl_memory_desc_create_with_strides,
+            md_tag: dnnl_memory_desc_create_with_tag,
+            md_clone: dnnl_memory_desc_clone,
+            md_destroy: dnnl_memory_desc_destroy,
+            md_size: dnnl_memory_desc_get_size,
+            md_query: dnnl_memory_desc_query,
+            get_effective_cpu_isa: dnnl_get_effective_cpu_isa,
+            mem_create: dnnl_memory_create,
+            mem_set: dnnl_memory_set_data_handle,
+            mem_destroy: dnnl_memory_destroy,
+            pd_query: dnnl_primitive_desc_query,
+            pd_query_md: dnnl_primitive_desc_query_md,
+            pd_destroy: dnnl_primitive_desc_destroy,
+            prim_create: dnnl_primitive_create,
+            prim_destroy: dnnl_primitive_destroy,
+            prim_execute: dnnl_primitive_execute,
+            reorder_pd: dnnl_reorder_primitive_desc_create,
+            matmul_pd: dnnl_matmul_primitive_desc_create,
+            binary_pd: dnnl_binary_primitive_desc_create,
+            eltwise_pd: dnnl_eltwise_forward_primitive_desc_create,
+            softmax_pd: dnnl_softmax_forward_primitive_desc_create,
+            layernorm_pd: dnnl_layer_normalization_forward_primitive_desc_create,
+        })
     }
 
     pub fn check(st: dnnl_status_t, what: &'static str) -> Result<()> {
@@ -273,6 +275,7 @@ impl Api {
 pub fn threadpool_ptr() -> Result<*mut c_void> {
     let p = THREADPOOL
         .get_or_init(|| {
+            // SAFETY: no preconditions; the pool lives for the process.
             let p = unsafe { sinteric_dnnl_threadpool_create() };
             ThreadpoolPtr(p)
         })
@@ -308,6 +311,7 @@ fn apply_tp_threads(n: i32) -> Result<()> {
 }
 
 fn set_max_concurrency(n: i32) -> Result<()> {
+    // SAFETY: no preconditions; it sets this thread's value.
     let st = unsafe { dnnl_threadpool_interop_set_max_concurrency(n) };
     check_shape!(
         st == dnnl_success,
@@ -339,6 +343,8 @@ fn apply_max_cpu_isa_in(
         }
         return Ok(());
     }
+    // SAFETY: the callers pass `dnnl_set_max_cpu_isa`, or a test's stand-in
+    // for it, and either takes any ISA value.
     let st = unsafe { set_max_cpu_isa(isa.as_dnnl()) };
     // `unimplemented` means the build disabled dispatcher control;
     // `invalid_arguments` on default can mean the ISA is already
@@ -355,10 +361,17 @@ pub fn memory_none() -> *mut c_void {
     ptr::null_mut()
 }
 
-pub fn cstr<'a>(p: *const c_char) -> &'a str {
+/// The UTF-8 text of a C string oneDNN returned, or `""` for null or text
+/// that is not UTF-8.
+///
+/// # Safety
+/// `p` is null or points at a NUL-terminated string that stays alive and
+/// unchanged for `'a`.
+pub(crate) unsafe fn cstr<'a>(p: *const c_char) -> &'a str {
     if p.is_null() {
         ""
     } else {
+        // SAFETY: the caller's contract.
         unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
     }
 }

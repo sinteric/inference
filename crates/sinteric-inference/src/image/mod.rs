@@ -522,7 +522,7 @@ mod tests {
         {
             assert!((actual - expected).abs() < 1e-6);
         }
-        assert_eq!(polygon_mean_score(&vec![0.7; 49], 7, 7, q).unwrap(), 0.7);
+        assert_eq!(polygon_mean_score(&[0.7; 49], 7, 7, q).unwrap(), 0.7);
         assert_eq!(
             convex_hull(&[[0., 0.], [1., 0.], [2., 0.]]).unwrap(),
             vec![[0., 0.], [2., 0.]]

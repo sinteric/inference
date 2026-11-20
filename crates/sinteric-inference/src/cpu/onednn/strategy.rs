@@ -205,7 +205,11 @@ pub fn clamp_attn_tile(
 mod tests {
     use super::*;
 
-    fn snapshot(policy: IsaStrategy) -> Vec<(usize, usize, usize, Vec<(usize, usize)>)> {
+    /// For one sequence length: the GEMM row padding, the residual rows,
+    /// the residual row tile and the attention query ranges.
+    type Plan = (usize, usize, usize, Vec<(usize, usize)>);
+
+    fn snapshot(policy: IsaStrategy) -> Vec<Plan> {
         [
             0usize, 1, 15, 16, 17, 33, 48, 64, 100, 128, 129, 192, 256, 300, 320, 777, 4224,
         ]

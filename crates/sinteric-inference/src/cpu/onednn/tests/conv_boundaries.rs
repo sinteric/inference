@@ -21,7 +21,13 @@ fn identity(cpu: &Arc<OnednnCpu>, channels: usize) -> Arc<ConvWeights> {
     for i in 0..channels {
         w[i * channels + i] = 1.;
     }
-    ConvWeights::pack(cpu.clone(), channels, channels, [1, 1], 1, false, &w, None).unwrap()
+    ConvWeights::pack(
+        cpu.clone(),
+        Filters::new(channels, channels, [1, 1]),
+        &w,
+        None,
+    )
+    .unwrap()
 }
 fn input(shape: Shape) -> Vec<f32> {
     (0..shape.iter().product())
@@ -170,9 +176,19 @@ fn malformed_graphs_weights_and_spatial_options_return_errors() {
         (1, 1, [1, 1], 1, false, vec![0.; 2], None),
         (1, 1, [1, 1], 1, false, vec![0.], Some(vec![0.; 2])),
     ] {
-        assert!(
-            ConvWeights::pack(cpu.clone(), oc, ic, k, groups, transpose, &w, b.as_deref()).is_err()
-        );
+        assert!(ConvWeights::pack(
+            cpu.clone(),
+            Filters {
+                output: oc,
+                input: ic,
+                kernel: k,
+                groups,
+                transpose
+            },
+            &w,
+            b.as_deref()
+        )
+        .is_err());
     }
     for spatial in [
         Spatial {
@@ -193,7 +209,7 @@ fn malformed_graphs_weights_and_spatial_options_return_errors() {
         },
     ] {
         let weights =
-            ConvWeights::pack(cpu.clone(), 1, 1, [3, 3], 1, false, &[0.; 9], None).unwrap();
+            ConvWeights::pack(cpu.clone(), Filters::new(1, 1, [3, 3]), &[0.; 9], None).unwrap();
         let net = ConvNet::new(
             cpu.clone(),
             vec![Node::new(Op::Conv { weights, spatial }, vec![0])],
