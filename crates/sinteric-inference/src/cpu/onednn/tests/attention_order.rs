@@ -22,7 +22,7 @@ fn onednn_attention_matmuls_are_sequential_fma_chains() {
     crate::test_support::own_process!(onednn_attention_matmuls_are_sequential_fma_chains);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
     let cpu = OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(threads).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(threads).unwrap(),
         SessionOptions {
             max_cpu_isa: CpuIsaCap::Avx512CoreBf16,
             workspace_limit: 1 << 28,

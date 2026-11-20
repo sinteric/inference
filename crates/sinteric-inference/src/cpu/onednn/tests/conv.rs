@@ -13,7 +13,7 @@ fn cpu() -> Arc<OnednnCpu> {
 }
 fn backend(threads: usize, limit: usize) -> Arc<OnednnCpu> {
     OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(threads).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(threads).unwrap(),
         SessionOptions {
             max_cpu_isa: crate::test_support::env::conv_isa(),
             workspace_limit: limit,
@@ -50,7 +50,7 @@ fn no_ref(info: &PlanInfo) {
     }
 }
 fn run(cpu: Arc<OnednnCpu>, shape: Shape, input: &[f32], nodes: Vec<Node>) -> (Shape, Vec<f32>) {
-    let net = ConvNet::new(cpu, nodes, 2).unwrap();
+    let net = ConvNet::try_new(cpu, nodes, 2).unwrap();
     let info = net
         .warmup(shape)
         .unwrap_or_else(|e| panic!("warmup shape={shape:?}: {e}"));
@@ -286,7 +286,7 @@ fn wide_padding_runs_on_jit_kernels() {
             },
             PostOp::Eltwise(Activation::Relu),
         ];
-        let net = ConvNet::new(cpu.clone(), vec![first, second], 2).unwrap();
+        let net = ConvNet::try_new(cpu.clone(), vec![first, second], 2).unwrap();
         let info = net.warmup(s).unwrap();
         for name in &info.implementations {
             assert!(!name.contains("ref:"), "{k}x{k} pad {pad}: {name}");
@@ -623,7 +623,7 @@ fn lru_liveness_bounds_and_invalid_input() {
     crate::test_support::own_process!(lru_liveness_bounds_and_invalid_input);
     let c = cpu();
     let nodes = (0..16).map(relu).collect();
-    let net = ConvNet::new(c.clone(), nodes, 2).unwrap();
+    let net = ConvNet::try_new(c.clone(), nodes, 2).unwrap();
     let s = [1, 16, 8, 8];
     let info = net.warmup(s).unwrap();
     assert!(
@@ -642,19 +642,19 @@ fn lru_liveness_bounds_and_invalid_input() {
         .warmup([1, 16, 1024, 1024])
         .is_err_and(|e| e.kind() == crate::ErrorKind::TooLarge));
     assert!(
-        ConvNet::new(c.clone(), vec![Node::new(Op::Binary(Binary::Add), [0])], 1)
+        ConvNet::try_new(c.clone(), vec![Node::new(Op::Binary(Binary::Add), [0])], 1)
             .unwrap()
             .warmup(s)
             .is_err()
     );
     assert!(
-        ConvNet::new(c.clone(), vec![Node::new(Op::Concat { axis: 4 }, [0])], 1)
+        ConvNet::try_new(c.clone(), vec![Node::new(Op::Concat { axis: 4 }, [0])], 1)
             .unwrap()
             .warmup(s)
             .is_err()
     );
-    assert!(ConvNet::new(c.clone(), vec![relu(1)], 1).is_err());
-    assert!(ConvNet::new(c.clone(), vec![], 1).is_err());
+    assert!(ConvNet::try_new(c.clone(), vec![relu(1)], 1).is_err());
+    assert!(ConvNet::try_new(c.clone(), vec![], 1).is_err());
     assert!(ConvWeights::pack(c, Filters::new(16, 16, [0, 3]), &[], None).is_err());
 }
 
@@ -663,7 +663,7 @@ fn memory_budget_evicts_conv_plans_without_changing_results() {
     crate::test_support::own_process!(memory_budget_evicts_conv_plans_without_changing_results);
     let load = |memory_budget| {
         OnednnCpu::load_with(
-            &crate::cpu::threads::ThreadBudget::new(1).unwrap(),
+            &crate::cpu::threads::ThreadBudget::try_new(1).unwrap(),
             SessionOptions {
                 max_cpu_isa: crate::test_support::env::conv_isa(),
                 workspace_limit: 32 * 1024 * 1024,
@@ -697,7 +697,7 @@ fn memory_budget_evicts_conv_plans_without_changing_results() {
             ),
             relu(1),
         ];
-        ConvNet::new(cpu, nodes, 8).unwrap()
+        ConvNet::try_new(cpu, nodes, 8).unwrap()
     };
     let (plain_cpu, tight_cpu) = (load(0), load(1));
     let (plain, tight) = (net(plain_cpu), net(tight_cpu.clone()));
@@ -818,7 +818,7 @@ fn nonoverlapping_deconv_depth_to_space() {
         assert_eq!(shape, expected_shape);
         close(&got, &expected, 2e-6);
     }
-    let net = ConvNet::new(cpu(), vec![Node::new(Op::DepthToSpace2x, [0])], 1).unwrap();
+    let net = ConvNet::try_new(cpu(), vec![Node::new(Op::DepthToSpace2x, [0])], 1).unwrap();
     assert!(net.warmup([1, 3, 8, 8]).is_err());
     assert!(net.warmup([1, 4, usize::MAX, 8]).is_err());
 }
@@ -843,8 +843,8 @@ fn pointwise_tiles_preserve_fused_values_and_partial_tiles() {
         },
         PostOp::Eltwise(Activation::HardSwish),
     ];
-    let plain = ConvNet::new(cpu(), vec![node.clone()], 2).unwrap();
-    let tiled = ConvNet::new(cpu(), vec![node], 2)
+    let plain = ConvNet::try_new(cpu(), vec![node.clone()], 2).unwrap();
+    let tiled = ConvNet::try_new(cpu(), vec![node], 2)
         .unwrap()
         .with_pointwise_tiles();
     // Different network widths use the same pointwise native code. Exercise
@@ -895,7 +895,7 @@ fn concat_producer_views_and_shared_workspace() {
         relu_conv(),
         Node::new(Op::Concat { axis: 1 }, [1, 2]),
     ];
-    let net = ConvNet::new(cpu.clone(), nodes, 2).unwrap();
+    let net = ConvNet::try_new(cpu.clone(), nodes, 2).unwrap();
     for n in [1, 2, 1] {
         let shape = [n, 16, 3, 5];
         let input = values(shape.iter().product());

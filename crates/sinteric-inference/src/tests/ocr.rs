@@ -9,7 +9,7 @@ fn runtime(options: Options) -> Runtime {
     // Concurrent tests must finish process-global ISA setup before model loads.
     static STARTUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _startup = STARTUP.lock().unwrap();
-    Runtime::new(options).unwrap()
+    Runtime::try_new(options).unwrap()
 }
 fn options() -> Options {
     Options::new()
@@ -71,7 +71,7 @@ fn decoded_page_api_and_missing_assets() {
     )
     .is_err_and(|e| e.kind() == ErrorKind::Config));
     let bytes = [255; 32 * 32 * 3];
-    let image = ImageView::new(&bytes, 32, 32, 32 * 3, PixelFormat::Rgb8).unwrap();
+    let image = ImageView::try_new(&bytes, 32, 32, 32 * 3, PixelFormat::Rgb8).unwrap();
     let separate = load(
         &rt,
         &root,

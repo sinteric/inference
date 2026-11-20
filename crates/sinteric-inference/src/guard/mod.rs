@@ -26,6 +26,7 @@ pub(crate) const ASSET_MANIFEST: &str = include_str!("../../../../assets/guard.t
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Tokens {
+    /// Token ids, special tokens included.
     pub ids: Vec<u32>,
     /// Per token, `[start, end)` in Unicode scalar values of the text
     /// (`(0, 0)` for a special token the tokenizer added).

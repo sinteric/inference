@@ -657,7 +657,7 @@ impl OnednnCpu {
         ops.check(&key, out.len())?;
         let mut ws = self
             .exec
-            .acquire(|| ExecWorkspace::new(&self.api, self.engine, self.threadpool()))?;
+            .acquire(|| ExecWorkspace::try_new(&self.api, self.engine, self.threadpool()))?;
         // Create a missing plan before taking the compute lock: primitive
         // creation (JIT, descriptors) touches no other caller's state, so a
         // cold shape on one model no longer stalls every model in the process.
@@ -683,7 +683,7 @@ impl OnednnCpu {
         self.check_workspace("operator scratch", &[plan.scratch])?;
         if ws.scratch.bytes < plan.scratch.max(64) {
             let old = ws.scratch.bytes;
-            ws.scratch = Aligned::new(plan.scratch.max(64))?;
+            ws.scratch = Aligned::try_new(plan.scratch.max(64))?;
             self.retained
                 .exec_scratch
                 .fetch_add(ws.scratch.bytes - old, Ordering::Relaxed);

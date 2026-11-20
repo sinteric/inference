@@ -226,7 +226,7 @@ fn pad_and_ranges_are_shape_only() {
 
 #[test]
 fn primitives_match_reference_within_1e6() {
-    let budget = ThreadBudget::new(1).unwrap();
+    let budget = ThreadBudget::try_new(1).unwrap();
     let hw = match OnednnCpu::load(&budget) {
         Ok(hw) => hw,
         Err(e) if e.to_string().contains("process-global") => return,
@@ -298,7 +298,7 @@ fn primitives_match_reference_within_1e6() {
 
 #[test]
 fn bf16_linear_tracks_fp32() {
-    let budget = ThreadBudget::new(1).unwrap();
+    let budget = ThreadBudget::try_new(1).unwrap();
     let hw = match OnednnCpu::load(&budget) {
         Ok(hw) => hw,
         Err(e) if e.to_string().contains("process-global") => return,
@@ -398,7 +398,7 @@ fn bf16_linear_tracks_fp32() {
 /// (exactly widened) weights as f32 gives, for plain and gated matmuls.
 #[test]
 fn bf16_stored_fp32_matmuls_match_f32_weights() {
-    let budget = ThreadBudget::new(1).unwrap();
+    let budget = ThreadBudget::try_new(1).unwrap();
     let hw = match OnednnCpu::load(&budget) {
         Ok(hw) => hw,
         Err(e) if e.to_string().contains("process-global") => return,
@@ -450,7 +450,7 @@ fn bf16_stored_fp32_matmuls_match_f32_weights() {
 /// sliding windows, padding and multi-tile query ranges.
 #[test]
 fn attention_gqa_f32_matches_reference() {
-    let budget = ThreadBudget::new(2).unwrap_or_else(|_| ThreadBudget::new(1).unwrap());
+    let budget = ThreadBudget::try_new(2).unwrap_or_else(|_| ThreadBudget::try_new(1).unwrap());
     let hw = match OnednnCpu::load(&budget) {
         Ok(hw) => hw,
         Err(e) if e.to_string().contains("process-global") => return,
@@ -551,7 +551,7 @@ fn gemm_cosine(a: &[f32], b: &[f32]) -> f32 {
 /// packed weight format there (`pack_bf16` returns unimplemented). On a
 /// CPU that has it, an unimplemented pack fails the test.
 fn packed_bf16_rows(threads: usize, ms: &[usize], pinned: bool) -> Option<Vec<(usize, Vec<f32>)>> {
-    let budget = ThreadBudget::new(threads).unwrap();
+    let budget = ThreadBudget::try_new(threads).unwrap();
     let opts = SessionOptions {
         max_cpu_isa: if pinned {
             CpuIsaCap::Avx512CoreBf16
@@ -680,7 +680,7 @@ fn packed_bf16_matches_across_thread_counts() {
         let mut references: Vec<(usize, Outputs)> = Vec::new();
         let mut min_cross = 1.0f32;
         for t in [1usize, 2, 4, 8] {
-            if ThreadBudget::new(t).is_err() {
+            if ThreadBudget::try_new(t).is_err() {
                 eprintln!("skip t={t}: not enough physical cores");
                 continue;
             }

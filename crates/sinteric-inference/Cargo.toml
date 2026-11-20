@@ -11,8 +11,8 @@ rust-version.workspace = true
 workspace = true
 
 [features]
-# Writes intermediate tensors to disk while a model runs; for debugging a
-# kernel against a reference only.
+# Builds the ignored `dump_means` test, which writes the detector's
+# intermediate tensors to disk to compare them with ONNX Runtime's dumps.
 debug-dumps = []
 # The PP-OCR steps around the networks (`ppocr::reference`), for the OCR
 # gate's ONNX Runtime runner in tools/drivers. Not a supported API.

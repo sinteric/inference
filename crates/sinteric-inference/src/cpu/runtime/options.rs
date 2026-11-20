@@ -53,6 +53,8 @@ impl Default for CacheConfig {
 }
 
 impl CacheConfig {
+    /// The cache on, next to the model's weights.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -120,6 +122,8 @@ impl Default for Options {
 }
 
 impl Options {
+    /// Every option at its default.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             threads: default_threads(),
@@ -131,26 +135,38 @@ impl Options {
         }
     }
 
+    /// Sets [`Self::threads`].
+    #[must_use]
     pub fn with_threads(mut self, n: usize) -> Self {
         self.threads = n;
         self
     }
+    /// Sets [`Self::cpuset`].
+    #[must_use]
     pub fn with_cpuset(mut self, cpuset: impl Into<String>) -> Self {
         self.cpuset = Some(cpuset.into());
         self
     }
+    /// Sets [`Self::isa_cap`].
+    #[must_use]
     pub fn with_isa_cap(mut self, cap: IsaCap) -> Self {
         self.isa_cap = cap;
         self
     }
+    /// Sets [`Self::workspace_limit_bytes`].
+    #[must_use]
     pub fn with_workspace_limit_bytes(mut self, n: usize) -> Self {
         self.workspace_limit_bytes = n;
         self
     }
+    /// Sets [`Self::exec_slots`].
+    #[must_use]
     pub fn with_exec_slots(mut self, n: usize) -> Self {
         self.exec_slots = n;
         self
     }
+    /// Sets [`Self::memory_budget_bytes`].
+    #[must_use]
     pub fn with_memory_budget_bytes(mut self, n: usize) -> Self {
         self.memory_budget_bytes = n;
         self
@@ -175,7 +191,7 @@ impl Options {
         if self.threads == 0 {
             return Err(Error::config("threads must be >= 1"));
         }
-        let mut b = crate::cpu::threads::ThreadBudget::new(self.threads)?;
+        let mut b = crate::cpu::threads::ThreadBudget::try_new(self.threads)?;
         if let Some(cs) = &self.cpuset {
             b = b.with_cpuset(cs)?;
         }

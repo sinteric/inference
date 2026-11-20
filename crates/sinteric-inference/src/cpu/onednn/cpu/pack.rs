@@ -162,11 +162,11 @@ impl OnednnCpu {
         let layout = self.layout_for(n, k, dt)?;
         let mut ws = self
             .exec
-            .acquire(|| ExecWorkspace::new(&self.api, self.engine, self.threadpool()))?;
+            .acquire(|| ExecWorkspace::try_new(&self.api, self.engine, self.threadpool()))?;
         let mut s = self.lock_state()?;
-        let data = Aligned::new(layout.bytes)?;
+        let data = Aligned::try_new(layout.bytes)?;
         if ws.scratch.bytes < layout.scratch {
-            ws.scratch = Aligned::new(layout.scratch)?;
+            ws.scratch = Aligned::try_new(layout.scratch)?;
         }
         let _ = self.api.apply_threads(self.threads);
         let from = match src {

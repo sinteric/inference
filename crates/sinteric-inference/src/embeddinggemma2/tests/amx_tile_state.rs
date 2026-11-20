@@ -47,7 +47,7 @@ fn eg2_bf16_ops_are_repeatable_under_load() {
     }
     let threads = env("EG2_REPRO_THREADS", 4);
     let calls = env("EG2_REPRO_CALLS", 300);
-    let rt = Runtime::new(Options::new().with_threads(threads)).unwrap();
+    let rt = Runtime::try_new(Options::new().with_threads(threads)).unwrap();
     let hw = rt.backend().unwrap();
     let tile = crate::embeddinggemma2::config::attn_tile(rt.cpu_isa());
     let stop = AtomicBool::new(false);

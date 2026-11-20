@@ -22,16 +22,22 @@ pub const DROP_SCORE: f32 = 0.5;
 /// One recognized line of a page.
 #[derive(Debug)]
 pub struct Line {
+    /// The line's box on the page, in pixels.
     pub quad: Quad,
+    /// The text read.
     pub text: String,
+    /// The recognizer's score.
     pub score: f32,
 }
 
 /// Where the pages come from and where results go.
 #[derive(Debug)]
 pub struct Pages {
+    /// The JSONL file of `{"img_id", "path"}` input lines.
     pub images: PathBuf,
+    /// The JSONL file results are appended to.
     pub out: PathBuf,
+    /// Input lines run first and not written.
     pub warmup: usize,
     /// Pages larger than this fail to decode.
     pub max_pixels: usize,
@@ -77,7 +83,7 @@ pub fn run(
         }
         let result = (|| {
             let (bytes, w, h) = crate::decode::load_bgr(&input.path, pages.max_pixels)?;
-            let view = ImageView::new(&bytes, w, h, w as usize * 3, PixelFormat::Bgr8)?;
+            let view = ImageView::try_new(&bytes, w, h, w as usize * 3, PixelFormat::Bgr8)?;
             let start = Instant::now();
             let (lines, timings) = page(&input.img_id, &view)?;
             let ms = rounded(start.elapsed().as_secs_f64() * 1000., 1);

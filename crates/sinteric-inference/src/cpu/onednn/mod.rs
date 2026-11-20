@@ -66,7 +66,7 @@ mod bad_input_tests {
     use super::*;
     #[test]
     fn malformed_native_requests_return_errors() {
-        let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+        let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
         let hw = OnednnCpu::load(&budget).unwrap();
         assert!(hw.pack(0, 1, &[]).is_err());
         assert!(hw.pack(usize::MAX, 2, &[]).is_err());
@@ -107,7 +107,7 @@ mod bad_input_tests {
     }
     #[test]
     fn invalid_session_options_fail_before_global_installation() {
-        let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+        let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
         assert!(OnednnCpu::load_with(
             &budget,
             SessionOptions {

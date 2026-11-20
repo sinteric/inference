@@ -42,6 +42,7 @@ struct Inner {
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
+/// What every fallible call in the library returns.
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
@@ -56,11 +57,13 @@ impl Error {
     }
 
     /// What kind of failure this is.
+    #[must_use]
     pub fn kind(&self) -> ErrorKind {
         self.0.kind
     }
 
     /// Prefix the message with the file it concerns.
+    #[must_use]
     pub fn at(self, path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().display().to_string();
         self.context(path)

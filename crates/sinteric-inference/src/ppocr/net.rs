@@ -7,7 +7,7 @@ pub struct Tensor {
     pub values: Vec<f32>,
 }
 impl Tensor {
-    pub fn new(shape: Vec<usize>, values: Vec<f32>) -> Result<Self> {
+    pub fn try_new(shape: Vec<usize>, values: Vec<f32>) -> Result<Self> {
         validate(&shape, values.len())?;
         Ok(Self { shape, values })
     }

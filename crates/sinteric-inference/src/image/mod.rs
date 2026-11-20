@@ -7,17 +7,32 @@ mod crop;
 mod geometry;
 mod warp;
 pub use bicubic::{resize_bicubic_aa_rgb, to_rgb};
-pub use crop::*;
-pub use geometry::*;
-pub use warp::*;
+pub use crop::{recognizer_crop, RecCrop};
+#[cfg(test)]
+pub(crate) use crop::{rotate_ccw_bgr, warp_quad_bgr};
+#[cfg(test)]
+pub(crate) use geometry::convex_hull;
+pub use geometry::{contours, min_area_rect, polygon_mean_score, unclip, Quad};
+pub use warp::{
+    grid_sample_coarse_align_corners, pack_unit_nchw, reflect_pad_nchw,
+    resize_linear_align_corners_nchw, rgb_unit_nchw_threads, Planes,
+};
 
+/// How an [`ImageView`]'s bytes are laid out: 8 bits per channel,
+/// channels interleaved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PixelFormat {
+    /// Blue, green, red.
     Bgr8,
+    /// Red, green, blue.
     Rgb8,
+    /// One luma channel.
     Gray8,
 }
 impl PixelFormat {
+    /// Bytes per pixel: 1 for gray, 3 otherwise.
+    #[must_use]
     pub fn channels(self) -> usize {
         if self == Self::Gray8 {
             1
@@ -37,7 +52,10 @@ pub struct ImageView<'a> {
     format: PixelFormat,
 }
 impl<'a> ImageView<'a> {
-    pub fn new(
+    /// `height` rows of `width` pixels in `format`, each row starting
+    /// `stride` bytes after the last. Fails when the image is empty, a row
+    /// is wider than `stride`, or `data` ends before the last row does.
+    pub fn try_new(
         data: &'a [u8],
         width: u32,
         height: u32,
@@ -63,18 +81,28 @@ impl<'a> ImageView<'a> {
             format,
         })
     }
+    /// Pixels per row.
+    #[must_use]
     pub fn width(&self) -> u32 {
         self.width
     }
+    /// Rows.
+    #[must_use]
     pub fn height(&self) -> u32 {
         self.height
     }
+    /// Bytes from the start of one row to the start of the next.
+    #[must_use]
     pub fn stride(&self) -> usize {
         self.stride
     }
+    /// The pixel layout.
+    #[must_use]
     pub fn format(&self) -> PixelFormat {
         self.format
     }
+    /// The borrowed bytes.
+    #[must_use]
     pub fn data(&self) -> &'a [u8] {
         self.data
     }
@@ -140,7 +168,8 @@ pub fn resize_triangle_bgr(src: &ImageView<'_>, width: u32, height: u32) -> Resu
     resize_triangle_bgr_threads(src, width, height, 1)
 }
 
-/// [`resize_triangle_bgr`] split by output rows across `threads`. Every
+/// Resize decoded pixels to interleaved BGR8 (Triangle, as `image` 0.25
+/// does), split by output rows across `threads`. Every
 /// output pixel uses the same taps in the same order at any thread count.
 pub fn resize_triangle_bgr_threads(
     src: &ImageView<'_>,
@@ -350,7 +379,7 @@ mod tests {
         ] {
             let stride = sw * format.channels() + 5;
             let data: Vec<u8> = (0..stride * sh).map(|_| next()).collect();
-            let view = ImageView::new(&data, sw as u32, sh as u32, stride, format).unwrap();
+            let view = ImageView::try_new(&data, sw as u32, sh as u32, stride, format).unwrap();
             let expected = resize_reference(&view, w, h);
             for threads in [1, 3, 4] {
                 let got = resize_triangle_bgr_threads(&view, w as u32, h as u32, threads).unwrap();
@@ -370,26 +399,26 @@ mod tests {
     #[test]
     fn validated_strides_colors_and_normalization() {
         let bgr = [10, 20, 30, 40, 50, 60, 99, 99, 70, 80, 90, 100, 110, 120];
-        let view = ImageView::new(&bgr, 2, 2, 8, PixelFormat::Bgr8).unwrap();
+        let view = ImageView::try_new(&bgr, 2, 2, 8, PixelFormat::Bgr8).unwrap();
         assert_eq!(
             resize_triangle_bgr(&view, 2, 2).unwrap(),
             [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
         );
         let rgb = [30, 20, 10, 60, 50, 40];
-        let rgb = ImageView::new(&rgb, 2, 1, 6, PixelFormat::Rgb8).unwrap();
+        let rgb = ImageView::try_new(&rgb, 2, 1, 6, PixelFormat::Rgb8).unwrap();
         assert_eq!(
             resize_triangle_bgr(&rgb, 2, 1).unwrap(),
             [10, 20, 30, 40, 50, 60]
         );
         let gray = [0, 255];
-        let gray = ImageView::new(&gray, 2, 1, 2, PixelFormat::Gray8).unwrap();
+        let gray = ImageView::try_new(&gray, 2, 1, 2, PixelFormat::Gray8).unwrap();
         assert_eq!(
             normalize_nchw(&gray, [0.5; 3], [0.5; 3]).unwrap(),
             [-1., 1., -1., 1., -1., 1.]
         );
         assert!(normalize_nchw(&gray, [0.; 3], [0.; 3]).is_err());
         let one = [121u8];
-        let one = ImageView::new(&one, 1, 1, 1, PixelFormat::Gray8).unwrap();
+        let one = ImageView::try_new(&one, 1, 1, 1, PixelFormat::Gray8).unwrap();
         assert!(resize_triangle_bgr(&one, 17, 3)
             .unwrap()
             .iter()
@@ -405,9 +434,9 @@ mod tests {
             (1, 2, usize::MAX),
             (u32::MAX, u32::MAX, usize::MAX),
         ] {
-            assert!(ImageView::new(&[0; 3], w, h, stride, PixelFormat::Bgr8).is_err());
+            assert!(ImageView::try_new(&[0; 3], w, h, stride, PixelFormat::Bgr8).is_err());
         }
-        let one = ImageView::new(&[0], 1, 1, 1, PixelFormat::Gray8).unwrap();
+        let one = ImageView::try_new(&[0], 1, 1, 1, PixelFormat::Gray8).unwrap();
         assert!(resize_triangle_bgr(&one, 0, 1).is_err());
         assert!(resize_triangle_bgr(&one, u32::MAX, u32::MAX).is_err());
         assert!(detector_size(
@@ -491,7 +520,7 @@ mod tests {
             }
         );
         let bytes = [0, 0, 255, 255];
-        let image = ImageView::new(&bytes, 4, 1, 4, PixelFormat::Gray8).unwrap();
+        let image = ImageView::try_new(&bytes, 4, 1, 4, PixelFormat::Gray8).unwrap();
         assert_eq!(
             resize_triangle_bgr(&image, 2, 1).unwrap(),
             [36, 36, 36, 219, 219, 219]

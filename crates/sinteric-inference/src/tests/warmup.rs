@@ -24,7 +24,7 @@ fn load_warmup_preserves_output_bits_and_request_limits() {
     let Some(dir) = asset_dir() else {
         return;
     };
-    let rt = Runtime::new(Options::new().with_threads(1)).unwrap();
+    let rt = Runtime::try_new(Options::new().with_threads(1)).unwrap();
     // Request caps apply to caller inputs. The internal 16-token dummy is
     // independent of tokenizer, max_seq_len, max_batch and MRL output width.
     let config = Config::new(dir)
@@ -61,7 +61,7 @@ fn small_workspace_limit_caps_retention_not_requests() {
     // `workspace_limit_bytes` caps the retained activation pool only. A budget
     // far below the warmup's activation plan must still load, warm up and
     // embed (same behavior as before typed errors).
-    let rt = Runtime::new(
+    let rt = Runtime::try_new(
         Options::new()
             .with_threads(1)
             .with_workspace_limit_bytes(2 * 1024 * 1024),

@@ -1,18 +1,21 @@
 //! The CPU runtime: [`Runtime`], built once per process from [`Options`],
 //! that every model on a CPU loads from.
 //!
-//! ```ignore
+//! ```no_run
 //! use sinteric_inference::cpu;
-//! let rt = cpu::Runtime::new(cpu::Options::new().with_threads(4))?;
+//! # fn main() -> sinteric_inference::Result<()> {
+//! let rt = cpu::Runtime::try_new(cpu::Options::new().with_threads(4))?;
 //! println!("{} on {} threads", rt.isa(), rt.threads());
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # What is process-wide
 //!
 //! | Resource | Scope | Set by |
 //! |---|---|---|
-//! | oneDNN's ISA cap (`dnnl_set_max_cpu_isa`) | process | [`Runtime::new`]; a second runtime with another cap fails |
-//! | the pinned thread pool every model computes on | process | [`Runtime::new`]; a second runtime with another width or cpuset fails |
+//! | oneDNN's ISA cap (`dnnl_set_max_cpu_isa`) | process | [`Runtime::try_new`]; a second runtime with another cap fails |
+//! | the pinned thread pool every model computes on | process | [`Runtime::try_new`]; a second runtime with another width or cpuset fails |
 //! | oneDNN engine, execute slots, activation pool | per model | its load, or one shared by the models of a [`Runtime::shared_backend`] handle |
 //! | packed weights, weight mmaps | per model | its load |
 //!
@@ -93,7 +96,7 @@ impl Runtime {
     /// Fails with [`ErrorKind::Unsupported`] on a CPU below AVX2, the
     /// library's floor, and with [`ErrorKind::Config`] when another runtime
     /// in this process installed a different cap, width or cpuset.
-    pub fn new(options: Options) -> Result<Self> {
+    pub fn try_new(options: Options) -> Result<Self> {
         let budget = options.thread_budget()?;
         budget.install_library_workers()?;
         // Creating a backend applies the ISA cap (after the AMX probe) first.
@@ -130,28 +133,33 @@ impl Runtime {
     }
 
     /// The options this runtime was built with.
+    #[must_use]
     pub fn options(&self) -> &Options {
         &self.inner.options
     }
 
     /// The ISA every model on this runtime runs on.
+    #[must_use]
     pub fn isa(&self) -> Isa {
         self.inner.isa
     }
 
     /// What the AMX probe found; [`AmxHealth::TileStateLoss`] means the
     /// runtime runs AVX512_CORE_BF16 although the CPU has AMX.
+    #[must_use]
     pub fn amx_health(&self) -> AmxHealth {
         self.inner.amx
     }
 
     /// Width of the thread pool.
+    #[must_use]
     pub fn threads(&self) -> usize {
         self.inner.budget.nthreads
     }
 
     /// The CPUs the pool's threads are pinned to, one per thread. A host
     /// that dedicates its process to inference can pin the process to them.
+    #[must_use]
     pub fn cpus(&self) -> &[usize] {
         &self.inner.budget.cpus
     }
@@ -173,7 +181,11 @@ impl Runtime {
     /// run one after another (an OCR detector and recognizer) then keep one
     /// working set instead of one each.
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use sinteric_inference::{cpu, ppocr};
+    /// # fn main() -> sinteric_inference::Result<()> {
+    /// # let rt = cpu::Runtime::try_new(cpu::Options::new())?;
+    /// # let (det_dir, rec_dir) = ("/models/ppocr/det", "/models/ppocr/rec");
     /// let ocr = rt.shared_backend(
     ///     cpu::BackendOverrides::default()
     ///         .with_workspace_limit_bytes(Some(1 << 30))
@@ -181,6 +193,8 @@ impl Runtime {
     /// )?;
     /// let det = ppocr::cpu::Detector::load(&ocr, ppocr::cpu::DetConfig::new(det_dir))?;
     /// let rec = ppocr::cpu::Recognizer::load(&ocr, ppocr::cpu::RecConfig::new(rec_dir))?;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// Workspace and budget belong to the handle: a model config loaded
@@ -199,6 +213,7 @@ impl Runtime {
     }
 
     /// Whether this handle came from [`Runtime::shared_backend`].
+    #[must_use]
     pub fn shares_backend(&self) -> bool {
         self.shared.is_some()
     }
@@ -250,6 +265,7 @@ impl Runtime {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BackendOverrides {
+    /// See [`Options::workspace_limit_bytes`].
     pub workspace_limit_bytes: Option<usize>,
     /// See [`Options::memory_budget_bytes`]; `Some(0)` is unbounded.
     pub memory_budget_bytes: Option<usize>,
@@ -261,14 +277,20 @@ pub struct BackendOverrides {
 }
 
 impl BackendOverrides {
+    /// Sets [`Self::memory_budget_bytes`].
+    #[must_use]
     pub fn with_memory_budget_bytes(mut self, bytes: Option<usize>) -> Self {
         self.memory_budget_bytes = bytes;
         self
     }
+    /// Sets [`Self::workspace_limit_bytes`].
+    #[must_use]
     pub fn with_workspace_limit_bytes(mut self, bytes: Option<usize>) -> Self {
         self.workspace_limit_bytes = bytes;
         self
     }
+    /// Sets [`Self::threads`].
+    #[must_use]
     pub fn with_threads(mut self, threads: Option<usize>) -> Self {
         self.threads = threads;
         self
@@ -306,6 +328,7 @@ pub(crate) fn resolve_precision<P: Copy + PartialEq + std::fmt::Display>(
 macro_rules! precision_names {
     ($ty:ty) => {
         impl $ty {
+            /// The lowercase name: `fp32` or `bf16`.
             pub const fn as_str(self) -> &'static str {
                 match self {
                     Self::Fp32 => "fp32",

@@ -268,7 +268,7 @@ impl OnednnCpu {
     }
 
     /// Runs a packed BF16 matmul with its rows padded to the count the
-    /// ISA's kernels want ([`super::IsaStrategy::gemm_pad_m`]). The padded
+    /// ISA's kernels want ([`IsaStrategy::gemm_pad_m`](crate::cpu::onednn::IsaStrategy::gemm_pad_m)). The padded
     /// rows are zero and only the first `key.m` rows of the result reach
     /// `out`; a sum post-op accumulates into the padded output, so that
     /// starts as `out`.
@@ -344,7 +344,8 @@ impl OnednnCpu {
 
     /// A batched BF16 matmul against BF16 `b`; an f32 `a` is converted on
     /// the way in. Short dense query blocks are padded to the row count the
-    /// ISA's kernels want, as [`super::IsaStrategy::attn_pad_m`] says.
+    /// ISA's kernels want, as
+    /// [`IsaStrategy::attn_pad_m`](crate::cpu::onednn::IsaStrategy::attn_pad_m) says.
     pub(crate) fn mm_bf16(&self, gemm: Gemm, a: Operand, b: &[u16]) -> Result<Vec<f32>> {
         let Gemm {
             g,

@@ -28,18 +28,25 @@ pub const IMAGE_TOKEN_BUDGETS: [usize; 5] = [70, 140, 280, 560, 1120];
 #[serde(try_from = "usize", into = "usize")]
 #[non_exhaustive]
 pub enum ImageTokens {
+    /// 70 soft tokens.
     T70,
+    /// 140 soft tokens.
     T140,
     /// The processor default.
     #[default]
     T280,
+    /// 560 soft tokens.
     T560,
+    /// 1,120 soft tokens.
     T1120,
 }
 
 impl ImageTokens {
+    /// Every budget, smallest first.
     pub const ALL: [Self; 5] = [Self::T70, Self::T140, Self::T280, Self::T560, Self::T1120];
 
+    /// The soft-token count.
+    #[must_use]
     pub const fn count(self) -> usize {
         match self {
             Self::T70 => 70,
@@ -68,6 +75,7 @@ impl TryFrom<usize> for ImageTokens {
     }
 }
 
+/// Audio samples per second the audio tower takes: mono at 16 kHz.
 pub const SAMPLE_RATE: usize = 16_000;
 /// Longer audio is truncated (30 s), as the feature extractor does.
 pub const MAX_SAMPLES: usize = 480_000;

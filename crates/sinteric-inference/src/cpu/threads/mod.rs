@@ -36,7 +36,7 @@ pub struct ThreadBudget {
 }
 
 impl ThreadBudget {
-    pub fn new(nthreads: usize) -> Result<Self> {
+    pub fn try_new(nthreads: usize) -> Result<Self> {
         if nthreads == 0 || nthreads > libc::CPU_SETSIZE as usize {
             return Err(crate::Error::config(
                 "ThreadBudget.nthreads must be in 1..=CPU_SETSIZE",

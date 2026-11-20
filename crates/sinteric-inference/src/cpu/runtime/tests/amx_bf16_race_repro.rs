@@ -42,7 +42,7 @@ fn linear_bf16_src_runs_are_repeatable() {
     if let Ok(name) = std::env::var("AMX_REPRO_ISA") {
         options = options.with_isa_cap(name.parse::<IsaCap>().unwrap());
     }
-    let rt = Runtime::new(options).unwrap();
+    let rt = Runtime::try_new(options).unwrap();
     let hw = rt.backend().unwrap();
     let (n, k) = (2304usize, 768usize);
     let mut weights = vec![0u16; n * k];

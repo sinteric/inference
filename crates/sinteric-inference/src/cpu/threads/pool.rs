@@ -431,7 +431,7 @@ pub fn try_run(nthreads: usize, n: usize, grain: usize, f: &(dyn Fn(usize, usize
 /// execute serially on the current thread.
 ///
 /// The contract the kernels' row helpers rely on
-/// ([`crate::cpu::kernels::parallel`]): `f` is called with ranges that are
+/// ([`RowsMut`](crate::cpu::kernels::RowsMut)): `f` is called with ranges that are
 /// disjoint and together cover `[0, n)`, each exactly once, and `par_for`
 /// returns only after every call has returned.
 pub fn par_for(nthreads: usize, n: usize, grain: usize, f: impl Fn(usize, usize) + Sync) {

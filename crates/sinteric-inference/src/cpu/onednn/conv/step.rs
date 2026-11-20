@@ -14,7 +14,7 @@ use std::ptr;
 use std::sync::Arc;
 
 impl Step {
-    pub(super) fn new(pd: Pd, specs: Vec<(i32, Md, Binding)>) -> Result<Self> {
+    pub(super) fn try_new(pd: Pd, specs: Vec<(i32, Md, Binding)>) -> Result<Self> {
         Self::new_cached(pd, specs, None)
     }
     pub(super) fn new_cached(

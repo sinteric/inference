@@ -1,5 +1,44 @@
 //! FP32 convolution graphs with fixed packed weights, a shape LRU and a checked
 //! liveness arena. Graphs are supplied by model code; no ONNX interpretation.
+//!
+//! The operators: convolution, depthwise and transposed convolution, pooling,
+//! resampling, spatial means, concat, PReLU, reorders, and activation and
+//! binary post-ops, on the model's backend with the runtime's pinned pool and
+//! ISA. Grouped convolution beyond one group or depthwise is unsupported.
+//! Integral nearest upsampling matches ONNX asymmetric/floor; linear
+//! resampling uses half-pixel centres, not align-corners. Spatial means use
+//! fixed FP32 accumulation orders to match ONNX Runtime.
+//!
+//! **Layouts.** Weights use explicit tags fixed by channels and ISA,
+//! independent of height and width. Graph inputs and outputs are NCHW;
+//! activations inside use channel blocks of the ISA's vector width (nChw16c
+//! with AVX-512, nChw8c below it), with plain reorders where an optimized
+//! small-channel convolution, a nonzero-preserving eltwise, a reduction or
+//! PReLU needs them. The block follows the ISA because oneDNN's AVX2
+//! convolutions take only 8-channel blocks: given 16, every convolution fell
+//! to the reference kernel (measured 2026-11-01 on a 32-channel 5x5:
+//! 19 MMAC/s against 74 GMAC/s for the AVX-512 kernel). oneDNN names no
+//! 8-channel transposed-convolution weight layout, so below AVX-512 a
+//! transposed convolution is [`crate::ErrorKind::Unsupported`].
+//!
+//! **Wide padding.** oneDNN 3.13.4's jit convolutions take left padding no
+//! wider than their register block, which shrinks with the ISA's vector
+//! width; wider padding falls to the reference kernel. When the plan sees
+//! that, it zero-pads the input itself and runs the convolution unpadded:
+//! the same sums on a jit kernel. The probe asks oneDNN without the node's
+//! post-ops, so a convolution its post-ops alone send to the reference
+//! kernel is padded for nothing and stays there.
+//!
+//! **Plans and memory.** [`ConvNet::try_new`] takes a positive LRU capacity of
+//! shape plans. A plan is built per input shape and graph identity; plans
+//! share packed weights and immutable memory descriptors, and identical
+//! native descriptors share primitive code. A largest-first liveness arena
+//! borrows the network input; aligned channel concats place their producers
+//! straight into the joined storage when lifetimes permit. Arena plus the
+//! largest scratchpad is refused ([`crate::ErrorKind::TooLarge`]) before any
+//! activation is allocated when it exceeds the backend's workspace limit.
+//! Segments on one backend reuse one aligned arena, scratchpad and stream,
+//! grown to the largest needed. Nothing is cached on disk.
 use crate::cpu::onednn::api::Api;
 use crate::cpu::onednn::cpu::Aligned;
 use crate::cpu::onednn::OnednnCpu;
@@ -349,7 +388,7 @@ pub enum Op {
         weights: Arc<ConvWeights>,
         spatial: Spatial,
     },
-    /// Rearrange [N,4*C,H,W] into [N,C,2*H,2*W] (ONNX CRD order).
+    /// Rearrange `[N, 4*C, H, W]` into `[N, C, 2*H, 2*W]` (ONNX CRD order).
     DepthToSpace2x,
     Pool {
         kind: Pool,
@@ -636,7 +675,7 @@ pub struct ConvNet {
     cpu: Arc<OnednnCpu>,
 }
 impl ConvNet {
-    pub fn new(cpu: Arc<OnednnCpu>, nodes: Vec<Node>, capacity: usize) -> Result<Self> {
+    pub fn try_new(cpu: Arc<OnednnCpu>, nodes: Vec<Node>, capacity: usize) -> Result<Self> {
         check_shape!(
             !nodes.is_empty() && capacity > 0,
             "empty ConvNet or zero plan capacity"
@@ -676,15 +715,15 @@ impl ConvNet {
         self.pointwise_tiles = true;
         self
     }
-    /// Diagnostic execution of a compiled graph prefix (1-based node count).
-    #[doc(hidden)]
-    #[cfg(feature = "debug-dumps")]
+    /// The graph's first `count` nodes as a network of their own, for the
+    /// detector's `dump_means` diagnostic test.
+    #[cfg(all(test, feature = "debug-dumps"))]
     pub fn prefix(&self, count: usize) -> Result<Self> {
         check_shape!(
             count > 0 && count <= self.nodes.len(),
             "invalid graph prefix"
         );
-        let mut net = Self::new(self.cpu.clone(), self.nodes[..count].to_vec(), 1)?;
+        let mut net = Self::try_new(self.cpu.clone(), self.nodes[..count].to_vec(), 1)?;
         net.pointwise_tiles = self.pointwise_tiles;
         Ok(net)
     }
@@ -714,8 +753,8 @@ impl ConvNet {
         if lease.workspace.is_none() {
             let bytes = plan.arena_bytes + plan.scratch_bytes;
             lease.workspace = Some(Workspace {
-                arena: Aligned::new(plan.arena_bytes)?,
-                scratch: Aligned::new(plan.scratch_bytes)?,
+                arena: Aligned::try_new(plan.arena_bytes)?,
+                scratch: Aligned::try_new(plan.scratch_bytes)?,
                 stream: make_stream(&self.cpu)?,
             });
             self.cpu
@@ -742,14 +781,14 @@ impl ConvNet {
         if workspace.arena.bytes() < plan.arena_bytes
             || (trim && workspace.arena.bytes() != plan.arena_bytes)
         {
-            workspace.arena = Aligned::new(0)?;
-            workspace.arena = Aligned::new(plan.arena_bytes)?;
+            workspace.arena = Aligned::try_new(0)?;
+            workspace.arena = Aligned::try_new(plan.arena_bytes)?;
         }
         if workspace.scratch.bytes() < plan.scratch_bytes
             || (trim && workspace.scratch.bytes() != plan.scratch_bytes)
         {
-            workspace.scratch = Aligned::new(0)?;
-            workspace.scratch = Aligned::new(plan.scratch_bytes)?;
+            workspace.scratch = Aligned::try_new(0)?;
+            workspace.scratch = Aligned::try_new(plan.scratch_bytes)?;
         }
         let after = workspace.arena.bytes() + workspace.scratch.bytes();
         let total = &self.cpu.retained.conv_workspace;

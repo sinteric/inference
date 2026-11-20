@@ -66,7 +66,7 @@ fn sweep() {
     {
         options = options.with_isa_cap(name.parse::<IsaCap>().unwrap());
     }
-    let rt = Runtime::new(options).unwrap();
+    let rt = Runtime::try_new(options).unwrap();
     let hw = rt.backend().unwrap();
     if let Some(v) = std::env::var("AMX_REPRO_VERBOSE")
         .ok()

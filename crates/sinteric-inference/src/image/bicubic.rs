@@ -237,10 +237,10 @@ mod tests {
     #[test]
     fn formats_convert_like_pil() {
         let gray = [10u8, 20];
-        let v = ImageView::new(&gray, 2, 1, 2, PixelFormat::Gray8).unwrap();
+        let v = ImageView::try_new(&gray, 2, 1, 2, PixelFormat::Gray8).unwrap();
         assert_eq!(to_rgb(&v).unwrap(), [10, 10, 10, 20, 20, 20]);
         let bgr = [1u8, 2, 3];
-        let v = ImageView::new(&bgr, 1, 1, 3, PixelFormat::Bgr8).unwrap();
+        let v = ImageView::try_new(&bgr, 1, 1, 3, PixelFormat::Bgr8).unwrap();
         assert_eq!(to_rgb(&v).unwrap(), [3, 2, 1]);
     }
 }

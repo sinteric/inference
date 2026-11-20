@@ -91,8 +91,8 @@ oracles under `det/round2`. The Rust tests check the preprocessing bytes/tensors
 probability map gates, one-to-one polygon IoU, and bitwise 1/2/4-thread identity.
 The reference uses thresh=0.2, box_thresh=0.45, unclip=1.4, candidates=1000,
 minimum sides 3/5, clipped page coordinates and Paddle reading order.
-`--features debug-dumps` enables an ignored `dump_means` integration test and
-`Detector::debug_prefix` for intermediate diagnostics against `ort_dump.py`.
+`--features debug-dumps` builds an ignored `dump_means` test that writes the
+detector's intermediate tensors, for diagnostics against `ort_dump.py`.
 
 Round-3 crop and Flat reference (first generate the round-2 detector fixtures):
 

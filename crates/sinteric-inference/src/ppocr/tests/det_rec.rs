@@ -58,7 +58,7 @@ fn crop_pixel_parity() {
         samples += expected.len();
     };
     let bytes = std::fs::read(root.join("round3/crop-oracle.bgr")).unwrap();
-    let image = ImageView::new(&bytes, 63, 47, 63 * 3, PixelFormat::Bgr8).unwrap();
+    let image = ImageView::try_new(&bytes, 63, 47, 63 * 3, PixelFormat::Bgr8).unwrap();
     for (i, c) in json(root.join("round3/crop-oracle.json"))
         .as_array()
         .unwrap()
@@ -99,7 +99,7 @@ fn crop_pixel_parity() {
         let bytes = std::fs::read(root.join("det/round2").join(name).join("page.bgr")).unwrap();
         let w = reference["page_width"].as_u64().unwrap() as u32;
         let h = reference["page_height"].as_u64().unwrap() as u32;
-        let image = ImageView::new(&bytes, w, h, w as usize * 3, PixelFormat::Bgr8).unwrap();
+        let image = ImageView::try_new(&bytes, w, h, w as usize * 3, PixelFormat::Bgr8).unwrap();
         for (i, c) in reference["crops"].as_array().unwrap().iter().enumerate() {
             check(
                 &image,
@@ -142,7 +142,7 @@ fn det_then_rec_parity() {
         eprintln!("skipping det+rec parity: explicit OCR fixtures absent");
         return;
     };
-    let rt = Runtime::new(
+    let rt = Runtime::try_new(
         Options::new()
             .with_threads(1)
             .with_isa_cap(IsaCap::Avx512CoreBf16),
@@ -172,7 +172,7 @@ fn det_then_rec_parity() {
         let bytes = std::fs::read(root.join("det/round2").join(name).join("page.bgr")).unwrap();
         let w = reference["page_width"].as_u64().unwrap() as u32;
         let h = reference["page_height"].as_u64().unwrap() as u32;
-        let image = ImageView::new(&bytes, w, h, w as usize * 3, PixelFormat::Bgr8).unwrap();
+        let image = ImageView::try_new(&bytes, w, h, w as usize * 3, PixelFormat::Bgr8).unwrap();
         let quads = det.detect(&image).unwrap();
         let lines = rec
             .recognize(&image, &quads)

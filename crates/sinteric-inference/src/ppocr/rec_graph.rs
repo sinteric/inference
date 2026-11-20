@@ -105,7 +105,7 @@ impl Graph<'_> {
         Ok(self.push(Op::Binary(Binary::Mul), [n, b]))
     }
     fn finish(self, capacity: usize) -> Result<ConvNet> {
-        ConvNet::new(self.cpu, self.nodes, capacity).map(ConvNet::with_pointwise_tiles)
+        ConvNet::try_new(self.cpu, self.nodes, capacity).map(ConvNet::with_pointwise_tiles)
     }
 }
 fn graph(cpu: Arc<OnednnCpu>, assets: &Assets) -> Graph<'_> {

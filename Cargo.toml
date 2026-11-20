@@ -38,9 +38,19 @@ libc = "0.2"
 [workspace.lints.rust]
 # Every public type prints with `{:?}`, so a host can log what it holds.
 missing_debug_implementations = "warn"
+# Every public item says what it is for: this is a library, read through
+# its rustdoc.
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
+# An allowed lint says why the code is right as it stands.
+allow_attributes_without_reason = "warn"
+# A value the caller drops is a bug when computing it was the call's point,
+# as a builder's `with_*` or a getter (STYLE.md, "`#[must_use]` on
+# functions").
+must_use_candidate = "warn"
+return_self_not_must_use = "warn"
 
 [profile.release]
 lto = "thin"

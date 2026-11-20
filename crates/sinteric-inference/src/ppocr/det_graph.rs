@@ -367,5 +367,5 @@ pub(super) fn build(cpu: Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Re
     g.head(fused)?;
     // The final Sigmoid runs outside the graph as ORT's exact MLAS kernel
     // (`Detector::forward`): DB thresholds compare probabilities directly.
-    ConvNet::new(cpu, g.nodes, capacity)
+    ConvNet::try_new(cpu, g.nodes, capacity)
 }

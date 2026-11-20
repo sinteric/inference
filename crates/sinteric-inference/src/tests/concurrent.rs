@@ -122,7 +122,8 @@ fn jobs(eg2: Option<Arc<EmbeddingGemma2>>, ocr: Option<Arc<Ocr>>) -> Vec<(String
         out.push((
             "ocr-bars".into(),
             Box::new(move || {
-                let image = ImageView::new(&bgr, w, h, w as usize * 3, PixelFormat::Bgr8).unwrap();
+                let image =
+                    ImageView::try_new(&bgr, w, h, w as usize * 3, PixelFormat::Bgr8).unwrap();
                 let quads = m.det.detect(&image).unwrap();
                 let lines = m.rec.recognize(&image, &quads).unwrap();
                 serde_json::to_vec(&(quads, lines)).unwrap()
@@ -147,7 +148,7 @@ fn concurrent_mixed_calls_match_serial() {
     // the others run; results must not change.
     let mut first: Option<Vec<Vec<u8>>> = None;
     for (exec_slots, budget) in [(1, 0), (3, 0), (1, 32 << 20)] {
-        let rt = Runtime::new(
+        let rt = Runtime::try_new(
             Options::new()
                 .with_threads(2)
                 .with_exec_slots(exec_slots)

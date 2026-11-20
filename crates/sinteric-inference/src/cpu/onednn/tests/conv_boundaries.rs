@@ -7,7 +7,7 @@ use crate::cpu::kernels::SpatialMean;
 
 fn cpu(limit: usize) -> Arc<OnednnCpu> {
     OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(1).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(1).unwrap(),
         SessionOptions {
             max_cpu_isa: crate::test_support::env::conv_isa(),
             workspace_limit: limit,
@@ -71,7 +71,7 @@ fn residual_fusion_lifetime_and_spatial_reuse() {
         Node::new(Op::Binary(Binary::Mul), vec![2, 0]),
         Node::new(Op::Concat { axis: 1 }, vec![3, 1, 0]),
     ];
-    let net = ConvNet::new(cpu, nodes, 2).unwrap();
+    let net = ConvNet::try_new(cpu, nodes, 2).unwrap();
     for shape in [[2, 17, 3, 5], [1, 17, 7, 9], [2, 17, 3, 5]] {
         let x = input(shape);
         let (out_shape, output) = net.run(shape, &x).unwrap();
@@ -117,7 +117,7 @@ fn binary_post_ops_broadcast_a_spatial_mean() {
             tensor: 0,
         },
     ];
-    let net = ConvNet::new(
+    let net = ConvNet::try_new(
         cpu.clone(),
         vec![
             Node::new(Op::SpatialMean(SpatialMean::Sequential), vec![0]),
@@ -210,7 +210,7 @@ fn malformed_graphs_weights_and_spatial_options_return_errors() {
     ] {
         let weights =
             ConvWeights::pack(cpu.clone(), Filters::new(1, 1, [3, 3]), &[0.; 9], None).unwrap();
-        let net = ConvNet::new(
+        let net = ConvNet::try_new(
             cpu.clone(),
             vec![Node::new(Op::Conv { weights, spatial }, vec![0])],
             1,
@@ -239,13 +239,13 @@ fn malformed_graphs_weights_and_spatial_options_return_errors() {
             vec![0],
         ),
     ] {
-        if let Ok(net) = ConvNet::new(cpu.clone(), vec![node], 1) {
+        if let Ok(net) = ConvNet::try_new(cpu.clone(), vec![node], 1) {
             assert!(net.warmup([1, 3, 5, 5]).is_err());
         }
     }
     let node = Node::new(Op::Prelu { slopes: vec![0.] }, vec![0]);
-    assert!(ConvNet::new(cpu.clone(), vec![node.clone()], 0).is_err());
-    let net = ConvNet::new(cpu, vec![node], 1).unwrap();
+    assert!(ConvNet::try_new(cpu.clone(), vec![node.clone()], 0).is_err());
+    let net = ConvNet::try_new(cpu, vec![node], 1).unwrap();
     assert!(net
         .warmup([1, 16, 128, 128])
         .is_err_and(|e| e.kind() == crate::ErrorKind::TooLarge));

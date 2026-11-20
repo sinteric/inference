@@ -57,7 +57,7 @@ fn load(root: &Path, threads: usize) -> Unwarper {
         static STARTUP: Mutex<()> = Mutex::new(());
         let _startup = STARTUP.lock().unwrap();
         OnednnCpu::load_with(
-            &crate::cpu::threads::ThreadBudget::new(threads).unwrap(),
+            &crate::cpu::threads::ThreadBudget::try_new(threads).unwrap(),
             SessionOptions {
                 max_cpu_isa: crate::test_support::env::conv_isa(),
                 workspace_limit: 1024 * 1024 * 1024,
@@ -155,7 +155,8 @@ fn uvdoc_matches_onnx_runtime() {
         // `unwarp` is `forward` plus 8-bit packing, from decoded pixels.
         if name != "random" {
             let rgb = packed(&input);
-            let view = ImageView::new(&rgb, w as u32, h as u32, w * 3, PixelFormat::Rgb8).unwrap();
+            let view =
+                ImageView::try_new(&rgb, w as u32, h as u32, w * 3, PixelFormat::Rgb8).unwrap();
             let flat = model.unwarp(&view).unwrap();
             assert_eq!((flat.width, flat.height), (w as u32, h as u32));
             assert_eq!(flat.data, ours, "{name}: unwarp differs from forward");

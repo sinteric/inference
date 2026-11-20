@@ -73,8 +73,8 @@ fn boundary_configs() {
             .max_pixels,
         64 * 1024 * 1024
     );
-    assert!(crate::ppocr::net::Tensor::new(vec![1, 0], vec![]).is_err());
-    assert!(crate::ppocr::net::Tensor::new(vec![usize::MAX, 2], vec![]).is_err());
+    assert!(crate::ppocr::net::Tensor::try_new(vec![1, 0], vec![]).is_err());
+    assert!(crate::ppocr::net::Tensor::try_new(vec![usize::MAX, 2], vec![]).is_err());
 }
 
 #[test]

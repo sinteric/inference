@@ -1,24 +1,33 @@
 //! EmbeddingGemma 2 tuned for CPUs: [`EmbeddingGemma2`], loaded from a
 //! [`Runtime`] and shared across threads.
 //!
-//! ```ignore
+//! ```no_run
 //! use sinteric_inference::{cpu::{Options, Runtime}, embeddinggemma2 as eg2};
-//! let rt = Runtime::new(Options::new())?;
-//! let model = eg2::cpu::EmbeddingGemma2::load(&rt, eg2::cpu::Config::new(dir).with_truncate(true))?;
+//! # fn main() -> sinteric_inference::Result<()> {
+//! let rt = Runtime::try_new(Options::new())?;
+//! let config = eg2::cpu::Config::new("/models/eg2").with_truncate(true);
+//! let model = eg2::cpu::EmbeddingGemma2::load(&rt, config)?;
 //! let vectors = model.embed(["what is sinteric?"], eg2::PromptKind::Query)?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Images and audio are opt-in at load ([`Config::with_image`],
 //! [`Config::with_audio`]) and embed through [`EmbeddingGemma2::embed_parts`]:
 //!
-//! ```ignore
+//! ```no_run
 //! use sinteric_inference::embeddinggemma2::{cpu, ImageView, Part, PixelFormat};
+//! # fn main() -> sinteric_inference::Result<()> {
+//! # let rt = sinteric_inference::cpu::Runtime::try_new(sinteric_inference::cpu::Options::new())?;
+//! # let (dir, rgb, width, height, samples_16k) = ("/models/eg2", vec![0u8; 12], 2u32, 2u32, vec![0f32; 16_000]);
 //! let model = cpu::EmbeddingGemma2::load(&rt, cpu::Config::new(dir).with_image(true).with_audio(true))?;
-//! let photo = ImageView::new(&rgb, width, height, width as usize * 3, PixelFormat::Rgb8)?;
+//! let photo = ImageView::try_new(&rgb, width, height, width as usize * 3, PixelFormat::Rgb8)?;
 //! let vectors = model.embed_parts(
 //!     &[&[Part::Text("a photo of"), Part::Image(photo)], &[Part::Audio(&samples_16k)]],
 //!     None,
 //! )?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::path::PathBuf;
@@ -64,6 +73,7 @@ pub struct Advanced {
 pub struct Config {
     /// Directory with `model.safetensors`, `tokenizer.json`, `config.json`.
     pub model_dir: PathBuf,
+    /// The packed-weight cache. Default: on, next to the weights.
     #[serde(default)]
     pub cache: CacheConfig,
     /// The window: the most tokens one input may have, prompt and special
@@ -85,6 +95,8 @@ pub struct Config {
     /// Explicit pin manifest; `None` uses the embedded model manifest.
     #[serde(default)]
     pub manifest: Option<PathBuf>,
+    /// Check `model.safetensors` against the manifest's SHA-256 at load,
+    /// and pack from it rather than map the cache. Default: false.
     #[serde(default)]
     pub verify_weights: bool,
     /// What this model may keep between calls, in bytes; overrides
@@ -113,6 +125,7 @@ pub struct Config {
 }
 
 impl Config {
+    /// The text model in `model_dir`, every other field at its default.
     pub fn new(model_dir: impl Into<PathBuf>) -> Self {
         Self {
             model_dir: model_dir.into(),
@@ -132,47 +145,68 @@ impl Config {
         }
     }
 
+    /// Sets [`Self::mrl_dim`].
+    #[must_use]
     pub fn with_mrl_dim(mut self, dim: usize) -> Self {
         self.mrl_dim = Some(dim);
         self
     }
+    /// Sets [`Self::max_seq_len`].
+    #[must_use]
     pub fn with_max_seq_len(mut self, n: usize) -> Self {
         self.max_seq_len = Some(n);
         self
     }
+    /// Sets [`Self::truncate`].
+    #[must_use]
     pub fn with_truncate(mut self, yes: bool) -> Self {
         self.truncate = yes;
         self
     }
+    /// Sets [`Self::max_batch`].
+    #[must_use]
     pub fn with_max_batch(mut self, n: usize) -> Self {
         self.max_batch = Some(n);
         self
     }
+    /// Sets [`Self::precision`].
+    #[must_use]
     pub fn with_precision(mut self, precision: Precision) -> Self {
         self.precision = Some(precision);
         self
     }
+    /// Sets [`Self::image`].
+    #[must_use]
     pub fn with_image(mut self, yes: bool) -> Self {
         self.image = yes;
         self
     }
+    /// Sets [`Self::audio`].
+    #[must_use]
     pub fn with_audio(mut self, yes: bool) -> Self {
         self.audio = yes;
         self
     }
+    /// Sets [`Self::image_tokens`].
+    #[must_use]
     pub fn with_image_tokens(mut self, tokens: ImageTokens) -> Self {
         self.image_tokens = Some(tokens);
         self
     }
+    /// Sets [`Self::memory_budget_bytes`].
+    #[must_use]
     pub fn with_memory_budget_bytes(mut self, bytes: usize) -> Self {
         self.memory_budget_bytes = Some(bytes);
         self
     }
+    /// Sets [`Self::cache`].
+    #[must_use]
     pub fn with_cache(mut self, cache: CacheConfig) -> Self {
         self.cache = cache;
         self
     }
     #[doc(hidden)]
+    #[must_use]
     pub fn with_tile(mut self, n: usize) -> Self {
         self.advanced.tile = Some(n);
         self
@@ -182,6 +216,7 @@ impl Config {
     /// Warmup uses the normal execution path; errors
     /// propagate from load. Default: false.
     #[doc(hidden)]
+    #[must_use]
     pub fn with_warmup(mut self, yes: bool) -> Self {
         self.advanced.warmup = yes;
         self
@@ -235,6 +270,7 @@ impl std::fmt::Debug for EmbeddingGemma2 {
 impl EmbeddingGemma2 {
     /// The precisions this model runs on `rt`'s CPU, the one it picks when
     /// a config names none first.
+    #[must_use]
     pub fn precisions(rt: &Runtime) -> &'static [Precision] {
         Precision::on(rt.isa())
     }
@@ -280,6 +316,8 @@ impl EmbeddingGemma2 {
         release_free_memory();
     }
 
+    /// Embed `texts` with `kind`'s retrieval prompt: one L2-normalized row
+    /// per text, in order.
     pub fn embed(
         &self,
         texts: impl IntoIterator<Item = impl AsRef<str>>,
@@ -291,6 +329,8 @@ impl EmbeddingGemma2 {
         self.embed_batch(&batch)
     }
 
+    /// Embed already tokenized rows. `attention_mask` marks each live token
+    /// with 1 and padding with 0; `None` is every token live.
     pub fn embed_ids(
         &self,
         input_ids: Vec<Vec<u32>>,
@@ -307,6 +347,7 @@ impl EmbeddingGemma2 {
         })
     }
 
+    /// Embed a [`Tokenizer::encode`] batch.
     pub fn embed_batch(&self, batch: &Batch) -> Result<Embeddings> {
         let n = batch.input_ids.len();
         self.check_batch(n)?;
@@ -518,11 +559,12 @@ impl EmbeddingGemma2 {
         Ok((ids, media))
     }
 
-    /// Whether [`Part::Image`] / [`Part::Audio`] inputs are loaded.
+    /// Whether [`Part::Image`] inputs are loaded.
     pub fn supports_image(&self) -> bool {
         self.model.has_image()
     }
 
+    /// Whether [`Part::Audio`] inputs are loaded.
     pub fn supports_audio(&self) -> bool {
         self.model.has_audio()
     }
@@ -532,6 +574,7 @@ impl EmbeddingGemma2 {
         &self.tokenizer
     }
 
+    /// Floats per embedding: the MRL width.
     pub fn embedding_dim(&self) -> usize {
         self.mrl_dim
     }

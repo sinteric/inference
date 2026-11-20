@@ -145,7 +145,7 @@ fn reorder(
 ) -> Result<(Md, Aligned)> {
     let raw = Md::tagged(dims, from)?;
     let md = Md::tagged(dims, to)?;
-    let packed = Aligned::new(md.bytes()?)?;
+    let packed = Aligned::try_new(md.bytes()?)?;
     let mut pd = Pd(ptr::null_mut());
     let engine = cpu.conv_engine();
     Api::check(
@@ -164,7 +164,7 @@ fn reorder(
         },
         "weight reorder descriptor",
     )?;
-    let step = Step::new(
+    let step = Step::try_new(
         pd,
         vec![
             (DNNL_ARG_FROM, raw, Binding::External),
@@ -174,7 +174,7 @@ fn reorder(
     let _compute = crate::cpu::threads::compute_lock();
     cpu.conv_api().apply_threads(cpu.threads() as i32)?;
     let stream = make_stream(cpu)?;
-    let scratch = Aligned::new(step.scratch_bytes)?;
+    let scratch = Aligned::try_new(step.scratch_bytes)?;
     let target = Bound {
         ptr: packed.ptr(),
         bytes: packed.bytes(),

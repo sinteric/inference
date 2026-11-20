@@ -21,7 +21,7 @@ fn main() -> Result<()> {
     let w = args[2].parse::<u32>()?;
     let h = args[3].parse::<u32>()?;
     let threads = args[4].parse::<usize>()?;
-    let rt = Runtime::new(Options::new().with_threads(threads))?;
+    let rt = Runtime::try_new(Options::new().with_threads(threads))?;
     // Detector and recognizer on one backend: one convolution arena sized to
     // the larger model.
     let ocr_rt = rt.shared_backend(
@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     let stride = (w as usize)
         .checked_mul(3)
         .context("image stride overflows")?;
-    let image = ImageView::new(&bytes, w, h, stride, PixelFormat::Bgr8)?;
+    let image = ImageView::try_new(&bytes, w, h, stride, PixelFormat::Bgr8)?;
     let quads = det.detect(&image)?;
     let lines = rec.recognize(&image, &quads)?;
     let page = quads

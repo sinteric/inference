@@ -635,7 +635,7 @@ mod tests {
             .collect();
         let qg: Vec<f32> = (0..d).map(|i| 0.9 + i as f32 * 0.01).collect();
         let kg: Vec<f32> = (0..d).map(|i| 1.1 - i as f32 * 0.01).collect();
-        let rope = crate::cpu::kernels::DefaultRope::new(d, s, 10_000.0).unwrap();
+        let rope = crate::cpu::kernels::DefaultRope::try_new(d, s, 10_000.0).unwrap();
         let mut q = vec![0f32; b * nq * s * d];
         let mut k = vec![0f32; b * nkv * s * d];
         let mut v = vec![0f32; k.len()];

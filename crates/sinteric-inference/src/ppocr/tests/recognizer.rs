@@ -10,7 +10,7 @@ fn backend(threads: usize) -> Arc<OnednnCpu> {
     static STARTUP: Mutex<()> = Mutex::new(());
     let _startup = STARTUP.lock().unwrap();
     OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(threads).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(threads).unwrap(),
         SessionOptions {
             max_cpu_isa: crate::test_support::env::conv_isa(),
             workspace_limit: 1024 * 1024 * 1024,

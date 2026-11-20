@@ -84,7 +84,7 @@ fn image_and_geometry_reference() {
             .iter()
             .map(|v| v.as_u64().unwrap() as u8)
             .collect::<Vec<_>>();
-        let image = ImageView::new(&input, w, h, w as usize * 3, PixelFormat::Bgr8).unwrap();
+        let image = ImageView::try_new(&input, w, h, w as usize * 3, PixelFormat::Bgr8).unwrap();
         assert_eq!(
             crate::image::resize_triangle_bgr(
                 &image,
@@ -190,7 +190,7 @@ fn detector_parity() {
         .ocr_threads
         .unwrap_or(1);
     let cpu = OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(threads).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(threads).unwrap(),
         SessionOptions {
             max_cpu_isa: crate::test_support::env::conv_isa(),
             workspace_limit: 1024 * 1024 * 1024,
@@ -261,7 +261,8 @@ fn detector_parity() {
             let w = reference["page_width"].as_u64().unwrap() as u32;
             let h = reference["page_height"].as_u64().unwrap() as u32;
             let bytes = std::fs::read(directory.join("page.bgr")).unwrap();
-            let image = ImageView::new(&bytes, w, h, w as usize * 3, PixelFormat::Bgr8).unwrap();
+            let image =
+                ImageView::try_new(&bytes, w, h, w as usize * 3, PixelFormat::Bgr8).unwrap();
             let prepared = det.preprocess(&image).unwrap();
             assert_eq!(prepared.shape, shape);
             assert_eq!(prepared.values, input, "{name} preprocessing");
@@ -367,7 +368,7 @@ fn dump_means() {
         return;
     };
     let cpu = OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(1).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(1).unwrap(),
         SessionOptions {
             max_cpu_isa: crate::test_support::env::conv_isa(),
             workspace_limit: 1024 * 1024 * 1024,

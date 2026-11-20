@@ -143,7 +143,7 @@ impl Graph<'_> {
         Ok(self.add_relu(b, residual))
     }
     fn finish(self, capacity: usize) -> Result<ConvNet> {
-        ConvNet::new(self.cpu, self.nodes, capacity)
+        ConvNet::try_new(self.cpu, self.nodes, capacity)
     }
 }
 

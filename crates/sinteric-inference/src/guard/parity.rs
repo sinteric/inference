@@ -132,7 +132,7 @@ fn compare(guard: &Guard) -> Gaps {
 
 fn load(cap: IsaCap, precision: Precision) -> Option<(Runtime, Guard)> {
     let dir = model_dir()?;
-    let rt = Runtime::new(Options::new().with_threads(2).with_isa_cap(cap)).unwrap();
+    let rt = Runtime::try_new(Options::new().with_threads(2).with_isa_cap(cap)).unwrap();
     if !Guard::precisions(&rt).contains(&precision) {
         eprintln!("skipping: {precision} does not run on {}", rt.isa());
         return None;

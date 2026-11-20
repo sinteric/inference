@@ -57,6 +57,6 @@ with the per-layer mix multiply. Concurrent `embed` uses a bounded pool of oneDN
 stream+scratch workspaces (`exec_slots`, default 1 = serialized).
 
 `crates/sinteric-inference` is the in-process library API
-(`Runtime::new(RuntimeOptions)`, one module per model with its own `Config`).
+(`Runtime::try_new(RuntimeOptions)`, one module per model with its own `Config`).
 oneDNN 3.13.4 is statically linked (`onednn-sys` cmake). The library never
 reads process env.

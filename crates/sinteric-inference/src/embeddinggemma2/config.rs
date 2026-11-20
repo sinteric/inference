@@ -10,6 +10,7 @@ pub const HEAD_DIM_SLIDING: usize = 256;
 pub const HEAD_DIM_GLOBAL: usize = 512;
 pub const N_LAYERS: usize = 24;
 pub const VOCAB: usize = 262_144;
+/// Width of a full embedding, before MRL truncation.
 pub const EMBED_DIM: usize = 768;
 pub const PLE_WIDTH: usize = 512;
 pub const GLOBAL_EVERY: usize = 6;

@@ -11,7 +11,7 @@ pub struct BgrImage {
 }
 impl BgrImage {
     pub fn view(&self) -> Result<ImageView<'_>> {
-        ImageView::new(
+        ImageView::try_new(
             &self.data,
             self.width,
             self.height,
@@ -318,7 +318,7 @@ pub fn recognizer_crop(
         .clamp(min_width, max_width);
     bounded_pixels(width as u32, 48, max_pixels)?;
     let bytes = resize_bilinear_bgr(&crop.view()?, width as u32, 48)?;
-    let resized = ImageView::new(&bytes, width as u32, 48, width * 3, PixelFormat::Bgr8)?;
+    let resized = ImageView::try_new(&bytes, width as u32, 48, width * 3, PixelFormat::Bgr8)?;
     Ok(RecCrop {
         width,
         values: crate::image::normalize_nchw(&resized, [0.5; 3], [0.5; 3])?,
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn crop_boundaries_and_rotation() {
         let bytes = vec![123; 20 * 30 * 3];
-        let image = ImageView::new(&bytes, 20, 30, 60, PixelFormat::Bgr8).unwrap();
+        let image = ImageView::try_new(&bytes, 20, 30, 60, PixelFormat::Bgr8).unwrap();
         let q = [[0., 0.], [20., 0.], [20., 30.], [0., 30.]];
         let crop = recognizer_crop(&image, q, 16, 1600, 10000).unwrap();
         assert_eq!(crop.width, 72);

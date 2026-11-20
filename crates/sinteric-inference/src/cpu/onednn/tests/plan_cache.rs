@@ -9,7 +9,7 @@ fn creations(cpu: &OnednnCpu) -> u64 {
 fn full_cache_evicts_least_recently_used_plan() {
     crate::test_support::own_process!(full_cache_evicts_least_recently_used_plan);
     let cpu = OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(1).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(1).unwrap(),
         SessionOptions::default(),
     )
     .unwrap();
@@ -49,7 +49,7 @@ fn memory_budget_evicts_plans_without_changing_results() {
     crate::test_support::own_process!(memory_budget_evicts_plans_without_changing_results);
     let load = |memory_budget| {
         OnednnCpu::load_with(
-            &crate::cpu::threads::ThreadBudget::new(1).unwrap(),
+            &crate::cpu::threads::ThreadBudget::try_new(1).unwrap(),
             SessionOptions {
                 memory_budget,
                 ..SessionOptions::default()
@@ -91,7 +91,7 @@ fn memory_budget_evicts_plans_without_changing_results() {
 fn memory_budget_bounds_pooled_buffers() {
     crate::test_support::own_process!(memory_budget_bounds_pooled_buffers);
     let cpu = OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(1).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(1).unwrap(),
         SessionOptions {
             memory_budget: 1 << 20,
             ..SessionOptions::default()

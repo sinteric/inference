@@ -190,7 +190,7 @@ fn main() -> Result<()> {
     }
     let start = Instant::now();
     let cpu = cpu_seconds();
-    let rt = Runtime::new(options)?;
+    let rt = Runtime::try_new(options)?;
     pin(rt.cpus())?;
     let tile: Option<usize> = flags.get("--tile")?;
     let mut config = Config::new(&model_dir).with_warmup(warmup);

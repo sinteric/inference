@@ -15,7 +15,7 @@ pub(super) fn broadcast(a: Shape, b: Shape) -> Result<()> {
     Ok(())
 }
 
-/// `block` is the backend's channel block ([`OnednnCpu::conv_block`]).
+/// `block` is the backend's channel block ([`OnednnCpu::conv_block`](crate::cpu::onednn::OnednnCpu::conv_block)).
 pub(super) fn infer_shape(node: &Node, shapes: &[Shape], block: usize) -> Result<Shape> {
     let s = shapes[node.inputs[0]];
     let unary = !matches!(

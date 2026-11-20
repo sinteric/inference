@@ -45,7 +45,7 @@ pub struct Planes<'a> {
 impl<'a> Planes<'a> {
     /// `data` as `channels` planes of `height x width`, which it must hold
     /// exactly.
-    pub fn new(data: &'a [f32], channels: usize, height: usize, width: usize) -> Result<Self> {
+    pub fn try_new(data: &'a [f32], channels: usize, height: usize, width: usize) -> Result<Self> {
         let plane = checked_size("plane", &[height, width])?;
         crate::check_shape!(
             channels > 0 && data.len() == checked_size("planes", &[channels, plane])?,
@@ -71,7 +71,7 @@ struct Axis {
     d_hi: Vec<f32>,
 }
 impl Axis {
-    fn new(input: usize, output: usize) -> Result<Self> {
+    fn try_new(input: usize, output: usize) -> Result<Self> {
         crate::check_shape!(
             input > 0 && output > 0 && input <= 1 << 24 && output <= 1 << 24,
             "invalid align-corners resize axis {input} -> {output}"
@@ -122,7 +122,10 @@ pub fn resize_linear_align_corners_nchw(
         width,
     } = src;
     let plane = height * width;
-    let (ys, xs) = (Axis::new(height, out_height)?, Axis::new(width, out_width)?);
+    let (ys, xs) = (
+        Axis::try_new(height, out_height)?,
+        Axis::try_new(width, out_width)?,
+    );
     let out_plane = checked_size("resize output plane", &[out_height, out_width])?;
     let mut out = try_vec(checked_size("resize output", &[channels, out_plane])?)?;
     let out_ptr = out.as_mut_ptr() as usize;
@@ -184,8 +187,8 @@ pub fn grid_sample_coarse_align_corners(
         "grid sample dimensions"
     );
     let (ys, xs) = (
-        Axis::new(grid_height, height)?,
-        Axis::new(grid_width, width)?,
+        Axis::try_new(grid_height, height)?,
+        Axis::try_new(grid_width, width)?,
     );
     let mut out = try_vec(checked_size("grid sample output", &[channels, plane])?)?;
     let out_ptr = out.as_mut_ptr() as usize;
@@ -328,17 +331,17 @@ mod tests {
     #[test]
     fn align_corners_resize_keeps_the_corners() {
         let src = [0., 1., 2., 3.];
-        let square = Planes::new(&src, 1, 2, 2).unwrap();
+        let square = Planes::try_new(&src, 1, 2, 2).unwrap();
         let out = resize_linear_align_corners_nchw(square, 3, 3, 1).unwrap();
         assert_eq!(out, [0., 0.5, 1., 1., 1.5, 2., 2., 2.5, 3.]);
         let same = resize_linear_align_corners_nchw(square, 2, 2, 1).unwrap();
         assert_eq!(same, src);
         // A one-pixel axis reads index 0 at weight 0.5 + 0.5.
-        let row = Planes::new(&[4., 6.], 1, 1, 2).unwrap();
+        let row = Planes::try_new(&[4., 6.], 1, 1, 2).unwrap();
         let one = resize_linear_align_corners_nchw(row, 2, 1, 1).unwrap();
         assert_eq!(one, [4., 4.]);
         assert!(resize_linear_align_corners_nchw(square, 0, 3, 1).is_err());
-        assert!(Planes::new(&src[..3], 1, 2, 2).is_err());
+        assert!(Planes::try_new(&src[..3], 1, 2, 2).is_err());
     }
 
     /// The identity grid returns the image; a grid shifted past an edge
@@ -347,21 +350,23 @@ mod tests {
     fn identity_grid_returns_the_image_and_outside_reads_zero() {
         let (h, w) = (4usize, 5usize);
         let values = (0..h * w).map(|v| v as f32).collect::<Vec<_>>();
-        let image = Planes::new(&values, 1, h, w).unwrap();
+        let image = Planes::try_new(&values, 1, h, w).unwrap();
         // A 2x2 corner grid upsampled with align-corners is the identity.
         let grid = [-1., 1., -1., 1., -1., -1., 1., 1.];
-        let out = grid_sample_coarse_align_corners(image, Planes::new(&grid, 2, 2, 2).unwrap(), 2)
-            .unwrap();
+        let out =
+            grid_sample_coarse_align_corners(image, Planes::try_new(&grid, 2, 2, 2).unwrap(), 2)
+                .unwrap();
         for (a, b) in out.iter().zip(&values) {
             assert!((a - b).abs() < 1e-4, "{a} vs {b}");
         }
         // Every x pushed one full width to the right: all outside.
         let grid = [3., 3., 3., 3., -1., -1., 1., 1.];
-        let out = grid_sample_coarse_align_corners(image, Planes::new(&grid, 2, 2, 2).unwrap(), 1)
-            .unwrap();
+        let out =
+            grid_sample_coarse_align_corners(image, Planes::try_new(&grid, 2, 2, 2).unwrap(), 1)
+                .unwrap();
         assert!(out.iter().all(|v| *v == 0.));
-        assert!(Planes::new(&grid[..7], 2, 2, 2).is_err());
-        let one_plane = Planes::new(&grid[..4], 1, 2, 2).unwrap();
+        assert!(Planes::try_new(&grid[..7], 2, 2, 2).is_err());
+        let one_plane = Planes::try_new(&grid[..4], 1, 2, 2).unwrap();
         assert!(grid_sample_coarse_align_corners(image, one_plane, 1).is_err());
     }
 
@@ -369,7 +374,7 @@ mod tests {
     #[test]
     fn reflect_pad_mirrors_about_the_edge() {
         let src = [1., 2., 3., 4., 5., 6.];
-        let src = Planes::new(&src, 1, 2, 3).unwrap();
+        let src = Planes::try_new(&src, 1, 2, 3).unwrap();
         let out = reflect_pad_nchw(src, 1).unwrap();
         assert_eq!(
             out,
@@ -387,7 +392,7 @@ mod tests {
     #[test]
     fn unit_planes_round_trip_through_packing() {
         let bgr = [10u8, 20, 30, 40, 50, 60];
-        let view = ImageView::new(&bgr, 2, 1, 6, PixelFormat::Bgr8).unwrap();
+        let view = ImageView::try_new(&bgr, 2, 1, 6, PixelFormat::Bgr8).unwrap();
         let planes = rgb_unit_nchw_threads(&view, 1).unwrap();
         assert_eq!(planes[0], 30. / 255.);
         assert_eq!(
@@ -399,7 +404,7 @@ mod tests {
             [30, 20, 10, 60, 50, 40]
         );
         let gray = [7u8, 9];
-        let view = ImageView::new(&gray, 2, 1, 2, PixelFormat::Gray8).unwrap();
+        let view = ImageView::try_new(&gray, 2, 1, 2, PixelFormat::Gray8).unwrap();
         let planes = rgb_unit_nchw_threads(&view, 1).unwrap();
         assert_eq!(
             pack_unit_nchw(&planes, 2, 1, PixelFormat::Gray8, 1).unwrap(),

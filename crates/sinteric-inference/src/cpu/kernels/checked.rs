@@ -302,8 +302,8 @@ mod tests {
             rmsnorm_rope_to_bf16(&[0.], &mut [0], usize::MAX, 2, 2, 2, None, 1e-6, None, 1)
                 .is_err()
         );
-        assert!(crate::cpu::kernels::DefaultRope::new(0, 1, 10000.).is_err());
-        assert!(crate::cpu::kernels::DefaultRope::new(2, usize::MAX, 10000.).is_err());
+        assert!(crate::cpu::kernels::DefaultRope::try_new(0, 1, 10000.).is_err());
+        assert!(crate::cpu::kernels::DefaultRope::try_new(2, usize::MAX, 10000.).is_err());
         assert!(crate::cpu::kernels::for_row_tiles(1, 1, 0, 1, |_, _| {}).is_err());
     }
 }

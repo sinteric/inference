@@ -74,7 +74,7 @@ struct Embeddings {
 }
 
 impl Embeddings {
-    fn new(file: TensorFile, vocab: usize, hidden: usize) -> Result<Self> {
+    fn try_new(file: TensorFile, vocab: usize, hidden: usize) -> Result<Self> {
         file.view::<f32>(EMB_NAME, &[vocab, hidden])?;
         Ok(Self {
             file,
@@ -99,7 +99,7 @@ struct Rope {
 impl Rope {
     /// Default (non-scaled) RoPE tables `[len, d/2]`, computed in f32 like
     /// Hugging Face's `ModernBertRotaryEmbedding`.
-    fn new(len: usize, d: usize, theta: f64) -> Result<Self> {
+    fn try_new(len: usize, d: usize, theta: f64) -> Result<Self> {
         let half = d / 2;
         let size = crate::checked_size("RoPE table", &[len, half])?;
         let inv: Vec<f32> = (0..half)
@@ -150,11 +150,13 @@ pub struct Hidden {
 
 impl Hidden {
     /// Number of sequences.
+    #[must_use]
     pub fn rows(&self) -> usize {
         self.lens.len()
     }
 
     /// Hidden states of sequence `i`: `len × hidden` values, padding excluded.
+    #[must_use]
     pub fn row(&self, i: usize) -> &[f32] {
         let start = i * self.seq * self.hidden;
         &self.data[start..start + self.lens[i] * self.hidden]
@@ -171,6 +173,7 @@ impl Hidden {
 /// bounded set of widths keeps every plan cached. Pad keys are masked, so
 /// outputs change only by float reassociation (~1e-6 in FP32).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Padding {
     /// The default: eight widths per power of two, at least 8 apart: lengths
     /// in `(2^k, 2^(k+1)]` round up to a multiple of `max(2^k / 8, 8)` (so up
@@ -217,6 +220,7 @@ pub(crate) fn bucket_width(len: usize, max_len: usize) -> usize {
 
 impl Padding {
     /// Width a batch whose longest row has `len` tokens is padded to.
+    #[must_use]
     pub fn width(self, len: usize, max_len: usize) -> usize {
         match self {
             Self::Buckets => bucket_width(len, max_len),
@@ -225,6 +229,7 @@ impl Padding {
     }
 
     /// Whether every length is its own width.
+    #[must_use]
     pub fn is_exact(self) -> bool {
         matches!(self, Self::Multiple(0 | 1))
     }
@@ -355,9 +360,9 @@ impl Encoder {
         let final_norm = take_norm(&mut small, "model.final_norm.weight", h)?;
         let layers = take_layers(&cfg, &mut linears, &mut small)?;
         let head = InjectionHead::from_tensors(&mut small, h, cfg.eps)?;
-        let embeddings = Embeddings::new(file, cfg.vocab, h)?;
-        let global_rope = Rope::new(max_len, cfg.head_dim, cfg.global_theta)?;
-        let local_rope = Rope::new(max_len, cfg.head_dim, cfg.local_theta)?;
+        let embeddings = Embeddings::try_new(file, cfg.vocab, h)?;
+        let global_rope = Rope::try_new(max_len, cfg.head_dim, cfg.global_theta)?;
+        let local_rope = Rope::try_new(max_len, cfg.head_dim, cfg.local_theta)?;
         let backend_isa = backend.cpu_isa();
         Ok(Self {
             backend,
@@ -773,7 +778,7 @@ mod tests {
 
     #[test]
     fn rope_rotates_by_position_over_theta_powers() {
-        let r = Rope::new(4, 4, 100.0).unwrap();
+        let r = Rope::try_new(4, 4, 100.0).unwrap();
         // Position 0 is the identity; frequencies are 1 and 100^-0.5.
         assert_eq!((r.cos[0], r.sin[0]), (1.0, 0.0));
         assert!((r.sin[2] - 1f32.sin()).abs() < 1e-6, "pos 1, freq 0");

@@ -70,7 +70,7 @@ pub struct Aligned {
 
 impl Aligned {
     /// A zeroed buffer of `bytes` (at least 64).
-    pub fn new(bytes: usize) -> AResult<Self> {
+    pub fn try_new(bytes: usize) -> AResult<Self> {
         let n = bytes.max(64);
         let layout = std::alloc::Layout::from_size_align(n, 64)?;
         // SAFETY: `layout` has a nonzero size (at least 64).
@@ -385,7 +385,7 @@ struct ExecWorkspace {
 }
 
 impl ExecWorkspace {
-    fn new(api: &Api, engine: dnnl_engine_t, threadpool: *mut c_void) -> AResult<Self> {
+    fn try_new(api: &Api, engine: dnnl_engine_t, threadpool: *mut c_void) -> AResult<Self> {
         let mut stream = ptr::null_mut();
         Api::check(
             // SAFETY: `engine` and `threadpool` are live (the backend's own),
@@ -395,9 +395,9 @@ impl ExecWorkspace {
         )?;
         Ok(Self {
             stream,
-            scratch: Aligned::new(64)?,
-            bf16_a: Aligned::new(64)?,
-            bf16_b: Aligned::new(64)?,
+            scratch: Aligned::try_new(64)?,
+            bf16_a: Aligned::try_new(64)?,
+            bf16_b: Aligned::try_new(64)?,
         })
     }
 }
@@ -503,7 +503,7 @@ unsafe impl Sync for OnednnCpu {}
 struct CappedThreadpool(*mut c_void);
 
 impl CappedThreadpool {
-    fn new(n: i32) -> AResult<Self> {
+    fn try_new(n: i32) -> AResult<Self> {
         // SAFETY: no preconditions; the result is owned here, or null.
         let p = unsafe { onednn_sys::sinteric_dnnl_threadpool_create_capped(n) };
         if p.is_null() {
@@ -567,7 +567,7 @@ fn touch_pages<T: Copy>(buf: &mut [T]) {
 fn fill_bf16(buf: &mut Aligned, src: &[f32], nthreads: i32) -> AResult<*mut c_void> {
     let need = crate::checked_size("BF16 conversion", &[src.len(), 2])?.max(64);
     if buf.bytes < need {
-        *buf = Aligned::new(need)?;
+        *buf = Aligned::try_new(need)?;
     }
     f32_slice_to_bf16_nthreads(
         src,
@@ -776,7 +776,7 @@ impl OnednnCpu {
         let threads_i32 = i32::try_from(threads)
             .map_err(|_| crate::Error::config(format!("invalid threads {threads}")))?;
         let capped_threadpool = if threads < budget.nthreads {
-            Some(CappedThreadpool::new(threads_i32)?)
+            Some(CappedThreadpool::try_new(threads_i32)?)
         } else {
             None
         };
@@ -786,7 +786,7 @@ impl OnednnCpu {
         idle.try_reserve_exact(exec_slots)
             .map_err(|_| crate::Error::out_of_memory(slot_bytes))?;
         for _ in 0..exec_slots {
-            idle.push(ExecWorkspace::new(&api, engine, threadpool)?);
+            idle.push(ExecWorkspace::try_new(&api, engine, threadpool)?);
         }
         // SAFETY: no preconditions once the library is loaded (`Api::init`).
         let cpu_isa = unsafe { (api.get_effective_cpu_isa)() as u32 as u64 };

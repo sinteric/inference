@@ -7,10 +7,12 @@
 //! are the one hardware today; [`cpu`] holds the runtime every CPU model
 //! loads from.
 //!
-//! ```ignore
+//! ```no_run
 //! use sinteric_inference::{cpu, embeddinggemma2 as eg2, guard, ppocr};
+//! # fn main() -> sinteric_inference::Result<()> {
+//! # let image: ppocr::ImageView<'_> = unimplemented!();
 //!
-//! let rt = cpu::Runtime::new(cpu::Options::new().with_threads(4))?;
+//! let rt = cpu::Runtime::try_new(cpu::Options::new().with_threads(4))?;
 //!
 //! // The library picks EmbeddingGemma 2's precision for this CPU (BF16
 //! // matmuls where it has BF16 kernels, FP32 on AVX2) and says which.
@@ -23,6 +25,8 @@
 //! let det = ppocr::cpu::Detector::load(&rt, ppocr::cpu::DetConfig::new("/models/ppocr/det"))?;
 //! let rec = ppocr::cpu::Recognizer::load(&rt, ppocr::cpu::RecConfig::new("/models/ppocr/rec"))?;
 //! let lines = rec.recognize(&image, &det.detect(&image)?)?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Build one [`cpu::Runtime`] per process, then load models from it with

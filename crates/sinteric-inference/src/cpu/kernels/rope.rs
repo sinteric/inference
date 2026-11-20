@@ -10,7 +10,7 @@ pub struct DefaultRope {
 }
 
 impl DefaultRope {
-    pub fn new(dim: usize, max: usize, theta: f32) -> crate::Result<Self> {
+    pub fn try_new(dim: usize, max: usize, theta: f32) -> crate::Result<Self> {
         crate::check_shape!(
             dim >= 2 && dim.is_multiple_of(2) && max > 0 && theta.is_finite() && theta > 0.0,
             "RoPE dim {dim}, max {max}, theta {theta}"
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn preserves_l2() {
-        let rope = DefaultRope::new(4, 8, 10_000.0).unwrap();
+        let rope = DefaultRope::try_new(4, 8, 10_000.0).unwrap();
         let mut x = [1.0f32, 0.0, 0.0, 1.0];
         let n0: f32 = x.iter().map(|v| v * v).sum();
         let (c, s) = rope.row(3, 4);
@@ -246,8 +246,8 @@ mod tests {
 
     #[test]
     fn tables_match_head_dim() {
-        let local = DefaultRope::new(256, 16, 10_000.0).unwrap();
-        let global = DefaultRope::new(512, 16, 1_000_000.0).unwrap();
+        let local = DefaultRope::try_new(256, 16, 10_000.0).unwrap();
+        let global = DefaultRope::try_new(512, 16, 1_000_000.0).unwrap();
         assert_eq!(local.cos.len(), 16 * 256);
         assert_eq!(global.sin.len(), 16 * 512);
     }
