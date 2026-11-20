@@ -11,6 +11,8 @@ pub fn amx_tile_state_is_preserved(cpus: &[usize]) -> bool {
         }
         let mut preserved = true;
         for &cpu in cpus {
+            // SAFETY: the CPU reports AMX (checked above), and the probe runs
+            // on a thread of its own, whose affinity it may change.
             let result = std::thread::spawn(move || unsafe { probe_cpu(cpu) })
                 .join()
                 .expect("AMX platform probe");
@@ -35,6 +37,11 @@ pub fn amx_tile_state_is_preserved(cpus: &[usize]) -> bool {
     }
 }
 
+/// Pin the calling thread to `cpu`.
+///
+/// # Safety
+///
+/// `cpu` is below `CPU_SETSIZE`, and the caller owns the thread's affinity.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 unsafe fn pin(cpu: usize) -> Result<(), String> {
     let mut mask: libc::cpu_set_t = std::mem::zeroed();
@@ -49,6 +56,13 @@ unsafe fn pin(cpu: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Load and store one tile 4,096 times on `cpu` beside an integer contender,
+/// and count the stores that came back changed.
+///
+/// # Safety
+///
+/// The CPU supports AMX, and the calling thread is the probe's own: it is
+/// pinned, and its tile configuration is replaced.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 unsafe fn probe_cpu(cpu: usize) -> Result<usize, String> {
     use std::sync::atomic::{AtomicBool, Ordering};

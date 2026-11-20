@@ -290,6 +290,11 @@ pub fn apply_cache(
         Ok(f) => f,
         Err(_) => return Ok(None),
     };
+    // SAFETY: the cache is written whole to a temporary file and renamed into
+    // place (`CacheWriter`), so no writer of ours changes a mapped file; the
+    // caller keeps the cache directory to itself (docs/library.md, "model
+    // files remain immutable while mapped"), and every read below is
+    // bounds-checked and digest-verified.
     let mmap = match unsafe { MmapOptions::new().map(&file) } {
         Ok(m) => m,
         Err(_) => return Ok(None),
@@ -395,6 +400,7 @@ fn advise_unused(map: &Mmap, offset: usize, len: usize) {
         return;
     }
     let page = {
+        // SAFETY: `sysconf` only reads a system constant.
         let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if p > 0 {
             p as usize
@@ -405,6 +411,9 @@ fn advise_unused(map: &Mmap, offset: usize, len: usize) {
     let aligned = offset.saturating_add(page - 1) & !(page - 1);
     let end = (offset.saturating_add(len)) & !(page - 1);
     if end > aligned {
+        // SAFETY: the map is read-only and file-backed, so dropping its pages
+        // only makes the next read fault them back in from the file; the
+        // range is page-aligned and lies inside the map.
         let _ = unsafe {
             map.unchecked_advise_range(UncheckedAdvice::DontNeed, aligned, end - aligned)
         };
@@ -435,13 +444,17 @@ fn le_f32_bytes(data: &[f32]) -> &[u8] {
             "packed cache is little-endian"
         );
     }
+    // SAFETY: the bytes of `data`, borrowed for as long as it is; any bit
+    // pattern is a valid `u8`.
     unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), data.len().saturating_mul(4)) }
 }
 
 fn f32s_from_le(bytes: &[u8]) -> Result<Vec<f32>> {
-    check_shape!(bytes.len() % 4 == 0, "raw tensor bytes");
+    check_shape!(bytes.len().is_multiple_of(4), "raw tensor bytes");
     let n = bytes.len() / 4;
     let mut data = crate::try_vec::<f32>(n)?;
+    // SAFETY: `data` holds `n` floats, exactly `bytes.len()` bytes, and any
+    // bit pattern is a valid `f32`.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_mut_ptr().cast(), bytes.len());
     }

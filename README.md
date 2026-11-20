@@ -149,7 +149,9 @@ elsewhere.
 ## Contributing
 
 Rust follows the Google Rust Style Guide, with the changes and exclusions in
-[`STYLE.md`](STYLE.md). Format with `python3 scripts/fmt.py` (a pinned nightly
+[`STYLE.md`](STYLE.md), which also says which rules CI holds (formatting,
+lints, function and file sizes, doc examples) and which only review does.
+Format with `python3 scripts/fmt.py` (a pinned nightly
 rustfmt; CI runs it with `--check`); the compiler is the stable toolchain in
 `rust-toolchain.toml`.
 

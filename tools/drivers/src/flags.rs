@@ -47,6 +47,7 @@ impl Flags {
     }
 
     /// Whether `--name` was given.
+    #[must_use]
     pub fn switch(&self, name: &str) -> bool {
         self.switches.iter().any(|s| s == name)
     }

@@ -23,8 +23,7 @@ A host that runs these models behind a server needs these more than speed.
   OCR models through a TOML manifest, the guard through a SHA-256 field.
 - **Hot reload.** Swapping a model under load and unloading the old one after it
   drains is left to each host.
-- **Docs and versioning.** Doctests are `ignore`, so drift does not fail the
-  build; switch them to `no_run`. The crate is 0.1.0 with no tags.
+- **Versioning.** The crate is 0.1.0 with no tags, so a caller pins a commit.
 
 ## Numerics
 

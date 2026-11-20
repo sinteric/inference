@@ -1,16 +1,8 @@
-//! EmbeddingGemma 2 text tower on [`OnednnCpu`].
-//!
-//! [`Precision::Bf16`] (default): matmuls are BF16×BF16 with FP32
-//! accumulation; RMSNorm, softmax, RoPE, the residual stream, pooling and L2
-//! stay in FP32. [`Precision::Fp32`] runs its own graph ([`fp32`]) with f32
-//! activations into every matmul. Token embeddings are a zero-copy mmap of
-//! the safetensors BF16 table.
+//! EmbeddingGemma 2 text tower on [`OnednnCpu`]: one graph per
+//! [`Precision`] ([`bf16`], [`fp32`]) over the same weights. Token embeddings
+//! are a zero-copy mmap of the safetensors BF16 table.
 
-use crate::cpu::kernels::{
-    add_rmsnorm, bf16_bits_to_f32, f32_slice_to_bf16_nthreads, for_ranges, for_row_tiles,
-    rmsnorm_rope_to_bf16, rmsnorm_to_bf16, row_mut, row_ref, scale_inplace, DefaultRope,
-    SQRT_512_BF16,
-};
+use crate::cpu::kernels::{bf16_bits_to_f32, for_row_tiles, DefaultRope, RowsMut, SQRT_512_BF16};
 use crate::cpu::onednn::{cache_path_with, CacheOptions, OnednnCpu, PackedWeight};
 use crate::cpu::runtime::{BackendStats, Isa, LoadReport, PackedWeights, WeightSource};
 use crate::tensor_file::Mapped;
@@ -21,13 +13,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::embeddinggemma2::config::{
-    head_dim, is_global, n_kv, ATTN_SCALE, EMBED_DIM, HIDDEN, N_LAYERS, N_QUERY_HEADS, PLE_WIDTH,
-    RMS_EPS, SLIDING_WINDOW, VOCAB,
-};
+use crate::embeddinggemma2::config::{HIDDEN, VOCAB};
 use crate::embeddinggemma2::frontend::Batch;
 
 mod audio;
+mod bf16;
 mod fp32;
 mod load;
 mod tower;
@@ -97,70 +87,13 @@ impl Model {
             .linears
             .get(name)
             .with_context(|| format!("linear {name}"))?;
-        check_shape!(x.len() % l.weight.k() == 0, "linear matrix {name}");
+        check_shape!(x.len().is_multiple_of(l.weight.k()), "linear matrix {name}");
         let mut y = self.backend.buffer(crate::checked_size(
             "activation elements",
             &[x.len() / l.weight.k(), l.weight.n()],
         )?)?;
         self.backend.linear_bf16(x, &l.weight, &mut y, false)?;
         Ok(y)
-    }
-
-    fn linear_src(&self, x: &[u16], name: &str) -> Result<Vec<f32>> {
-        let l = self
-            .linears
-            .get(name)
-            .with_context(|| format!("linear {name}"))?;
-        check_shape!(x.len() % l.weight.k() == 0, "linear matrix {name}");
-        let mut y = self.backend.buffer(crate::checked_size(
-            "activation elements",
-            &[x.len() / l.weight.k(), l.weight.n()],
-        )?)?;
-        self.backend.linear_bf16_src(x, &l.weight, &mut y, false)?;
-        Ok(y)
-    }
-
-    fn to_bf16(&self, x: &[f32]) -> Result<Vec<u16>> {
-        let mut y = self.backend.buffer_u16(x.len())?;
-        f32_slice_to_bf16_nthreads(x, &mut y, self.backend.threads())?;
-        Ok(y)
-    }
-
-    fn rms(&self, x: &[f32], name: &str, width: usize) -> Result<Vec<f32>> {
-        let scale = self
-            .norms
-            .get(name)
-            .with_context(|| format!("norm {name}"))?;
-        check_shape!(x.len() % width == 0 && scale.len() == width, "rms {name}");
-        self.backend
-            .rmsnorm(x.len() / width, width, x, Some(scale), RMS_EPS)
-    }
-
-    fn rms_bf16(&self, x: &[f32], name: &str, width: usize) -> Result<Vec<u16>> {
-        let scale = self
-            .norms
-            .get(name)
-            .with_context(|| format!("norm {name}"))?;
-        check_shape!(x.len() % width == 0 && scale.len() == width, "rms {name}");
-        let mut y = self.backend.buffer_u16(x.len())?;
-        let t = Instant::now();
-        rmsnorm_to_bf16(
-            x,
-            width,
-            Some(scale),
-            RMS_EPS,
-            &mut y,
-            self.backend.threads(),
-        )?;
-        self.backend.add_category("glue", t.elapsed().as_secs_f64());
-        Ok(y)
-    }
-
-    /// Residual rows rounded to the AMX tile / 4-tile block (shape+ISA
-    /// only, including `M<16→16`). Pad rows are zeroed so glue and GEMM
-    /// never see stale pool data.
-    fn work_rows(&self, live: usize) -> usize {
-        self.backend.residual_rows(live)
     }
 
     /// Scaled token embeddings in `m_pad >= b * s` rows; pad rows are zero.
@@ -184,20 +117,20 @@ impl Model {
             "activation elements",
             &[m_pad, HIDDEN],
         )?)?;
-        let x_p = x.as_mut_ptr() as usize;
         let ids: Vec<u32> = batch.input_ids.iter().flatten().copied().collect();
-        let table = self.embeddings.as_slice().as_ptr() as usize;
+        let table = self.embeddings.as_slice();
+        let rows = RowsMut::new(&mut x, HIDDEN);
         for_row_tiles(
             self.backend.threads(),
             ntok,
             self.backend.residual_row_tile(ntok),
             8,
             |lo, hi| {
-                for t in lo..hi {
-                    let id = ids[t] as usize;
-                    let src = unsafe { row_ref(table as *const u16, id, HIDDEN) };
-                    let dst = unsafe { row_mut(x_p as *mut f32, t, HIDDEN) };
-                    embed_row(src, dst, SQRT_512_BF16);
+                // SAFETY: `for_row_tiles` hands out disjoint ranges, each once.
+                let dst = unsafe { rows.range(lo, hi) };
+                for (&id, dst) in ids[lo..hi].iter().zip(dst.as_chunks_mut::<HIDDEN>().0) {
+                    let id = id as usize;
+                    embed_row(&table[id * HIDDEN..(id + 1) * HIDDEN], dst, SQRT_512_BF16);
                 }
             },
         )?;
@@ -216,103 +149,6 @@ impl Model {
             }
         }
         Ok(x)
-    }
-
-    fn to_heads(&self, src: &[f32], b: usize, s: usize, nh: usize, d: usize) -> Result<Vec<f32>> {
-        self.to_heads_strided(src, b, s, nh, d, nh * d, 0)
-    }
-
-    fn to_heads_strided(
-        &self,
-        src: &[f32],
-        b: usize,
-        s: usize,
-        nh: usize,
-        d: usize,
-        stride: usize,
-        off: usize,
-    ) -> Result<Vec<f32>> {
-        let mut out = self
-            .backend
-            .buffer(crate::checked_size("activation elements", &[b, nh, s, d])?)?;
-        let ntok = b * s;
-        let src_p = src.as_ptr() as usize;
-        let dst_p = out.as_mut_ptr() as usize;
-        for_ranges(self.backend.threads(), ntok, 8, |lo, hi| {
-            for idx in lo..hi {
-                let bi = idx / s;
-                let p = idx % s;
-                for h in 0..nh {
-                    let so = (bi * s + p) * stride + off + h * d;
-                    let dst = ((bi * nh + h) * s + p) * d;
-                    let src = unsafe { row_ref(src_p as *const f32, so / d, d) };
-                    let dst = unsafe { row_mut(dst_p as *mut f32, dst / d, d) };
-                    dst.copy_from_slice(src);
-                }
-            }
-        });
-        Ok(out)
-    }
-
-    fn split_qkv_heads(
-        &self,
-        fused: &[f32],
-        b: usize,
-        s: usize,
-        nq: usize,
-        nkv: usize,
-        d: usize,
-    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-        let qn = nq * d;
-        let kn = nkv * d;
-        let stride = qn + kn + kn;
-        check_shape!(
-            fused.len() >= b * s * stride && fused.len().is_multiple_of(stride),
-            "fused qkv width"
-        );
-        // Projection rows include the residual pad; keys and queries must
-        // contain only live tokens so pad rows cannot enter attention.
-        let fused = &fused[..b * s * stride];
-        let mut q = self
-            .backend
-            .buffer(crate::checked_size("activation elements", &[b, nq, s, d])?)?;
-        let mut k = self
-            .backend
-            .buffer(crate::checked_size("activation elements", &[b, nkv, s, d])?)?;
-        let mut v = self
-            .backend
-            .buffer(crate::checked_size("activation elements", &[b, nkv, s, d])?)?;
-        let ntok = b * s;
-        let src_p = fused.as_ptr() as usize;
-        let q_p = q.as_mut_ptr() as usize;
-        let k_p = k.as_mut_ptr() as usize;
-        let v_p = v.as_mut_ptr() as usize;
-        for_ranges(self.backend.threads(), ntok, 8, |lo, hi| {
-            for idx in lo..hi {
-                let bi = idx / s;
-                let p = idx % s;
-                let base = (bi * s + p) * stride;
-                for h in 0..nq {
-                    let so = base + h * d;
-                    let dst = ((bi * nq + h) * s + p) * d;
-                    let src = unsafe { row_ref(src_p as *const f32, so / d, d) };
-                    let dst = unsafe { row_mut(q_p as *mut f32, dst / d, d) };
-                    dst.copy_from_slice(src);
-                }
-                for h in 0..nkv {
-                    let ks = base + qn + h * d;
-                    let vs = base + qn + kn + h * d;
-                    let dst = ((bi * nkv + h) * s + p) * d;
-                    let ksrc = unsafe { row_ref(src_p as *const f32, ks / d, d) };
-                    let vsrc = unsafe { row_ref(src_p as *const f32, vs / d, d) };
-                    let kdst = unsafe { row_mut(k_p as *mut f32, dst / d, d) };
-                    let vdst = unsafe { row_mut(v_p as *mut f32, dst / d, d) };
-                    kdst.copy_from_slice(ksrc);
-                    vdst.copy_from_slice(vsrc);
-                }
-            }
-        });
-        Ok((q, k, v))
     }
 
     pub fn forward(&self, batch: &Batch) -> Result<Vec<Vec<f32>>> {
@@ -369,335 +205,6 @@ impl Model {
             i = j;
         }
         Ok(out)
-    }
-
-    fn forward_dense(&self, batch: &Batch, splices: &[Splice]) -> Result<Vec<Vec<f32>>> {
-        let b = batch.input_ids.len();
-        let s = batch.input_ids[0].len();
-        check_shape!(s > 0 && s <= self.max, "sequence length");
-        check_shape!(
-            batch.attention_mask.len() == b
-                && batch
-                    .input_ids
-                    .iter()
-                    .zip(&batch.attention_mask)
-                    .all(|(ids, m)| ids.len() == s && m.len() == s),
-            "dense batch"
-        );
-        if self.precision == Precision::Fp32 {
-            return self.forward_dense_fp32(batch, b, s, splices);
-        }
-        self.backend.begin_shape(b, s);
-        let tokens = crate::checked_size("EG2 tokens", &[b, s])?;
-        crate::checked_size(
-            "EG2 workspace",
-            &[
-                tokens
-                    .checked_add(64)
-                    .ok_or(crate::Error::size_overflow("padded rows"))?,
-                N_LAYERS,
-                PLE_WIDTH,
-                4,
-            ],
-        )?;
-        let m_pad = self.work_rows(tokens);
-        // These are the existing reservation counts; sum before allocating any.
-        let row_bytes = HIDDEN * 4 * 4
-            + 2048 * 3 * 4
-            + 3072 * 2 * 4
-            + PLE_WIDTH * 3 * 4
-            + N_LAYERS * PLE_WIDTH * 2 * 4
-            + HIDDEN * 3 * 2
-            + HIDDEN * 2 * 4;
-        let planned = crate::checked_size("EG2 reserved activations", &[m_pad, row_bytes])?
-            .checked_add(crate::checked_size(
-                "EG2 reserved BF16 heads",
-                &[tokens, N_QUERY_HEADS, 512, 5, 2],
-            )?)
-            .ok_or(crate::Error::size_overflow("EG2 workspace"))?;
-        self.backend.validate_workspace(planned)?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, HIDDEN])?,
-            4,
-        )?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, 2048])?,
-            3,
-        )?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, 3072])?,
-            2,
-        )?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, PLE_WIDTH])?,
-            3,
-        )?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, N_LAYERS, PLE_WIDTH])?,
-            2,
-        )?;
-        self.backend.reserve_u16(
-            crate::checked_size("activation elements", &[m_pad, HIDDEN])?,
-            3,
-        )?;
-        self.backend.reserve_u16(
-            crate::checked_size("activation elements", &[tokens, N_QUERY_HEADS, 512])?,
-            3,
-        )?;
-        self.backend.reserve_u16(
-            crate::checked_size("activation elements", &[tokens, N_QUERY_HEADS, 512])?,
-            2,
-        )?;
-        self.backend.reserve(
-            crate::checked_size("activation elements", &[m_pad, HIDDEN])?,
-            2,
-        )?;
-
-        let mut x = self.embed(batch, b, s, m_pad, splices)?;
-        let mut ple_raw = self.linear(&x, "language_model.ple.per_layer_model_projection")?;
-        let scale = (HIDDEN as f32).powf(-0.5);
-        scale_inplace(&mut ple_raw, scale, self.backend.threads());
-        let ple = self.rms(
-            &ple_raw,
-            "language_model.ple.per_layer_projection_norm.weight",
-            PLE_WIDTH,
-        )?;
-        self.backend.recycle(ple_raw);
-
-        let padding: Vec<Vec<usize>> = batch
-            .attention_mask
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .filter_map(|(i, &v)| (v == 0).then_some(i))
-                    .collect()
-            })
-            .collect();
-
-        for layer in 0..N_LAYERS {
-            let base = format!("language_model.layers.{layer}");
-            let global = is_global(layer);
-            let d = head_dim(layer);
-            let nkv = n_kv(layer);
-            let nq = N_QUERY_HEADS;
-
-            let residual = x;
-            let h_bf =
-                self.rms_bf16(&residual, &format!("{base}.input_layernorm.weight"), HIDDEN)?;
-            let qkv_name = format!("{base}.self_attn.qkv_proj");
-            let (q, k, v) = if self.linears.contains_key(&qkv_name) {
-                let fused = self.linear_src(&h_bf, &qkv_name)?;
-                let qkv = self.split_qkv_heads(&fused, b, s, nq, nkv, d)?;
-                self.backend.recycle(fused);
-                qkv
-            } else {
-                let q_flat = self.linear_src(&h_bf, &format!("{base}.self_attn.q_proj"))?;
-                let k_flat = self.linear_src(&h_bf, &format!("{base}.self_attn.k_proj"))?;
-                let v_flat = self.linear_src(&h_bf, &format!("{base}.self_attn.v_proj"))?;
-                let q = self.to_heads(&q_flat, b, s, nq, d)?;
-                let k = self.to_heads(&k_flat, b, s, nkv, d)?;
-                let v = self.to_heads(&v_flat, b, s, nkv, d)?;
-                self.backend.recycle(q_flat);
-                self.backend.recycle(k_flat);
-                self.backend.recycle(v_flat);
-                (q, k, v)
-            };
-            self.backend.recycle_u16(h_bf);
-            let q_scale = self
-                .norms
-                .get(&format!("{base}.self_attn.q_norm.weight"))
-                .with_context(|| format!("{base}.self_attn.q_norm.weight"))?;
-            let k_scale = self
-                .norms
-                .get(&format!("{base}.self_attn.k_norm.weight"))
-                .with_context(|| format!("{base}.self_attn.k_norm.weight"))?;
-            let rope = if global {
-                &self.global_rope
-            } else {
-                &self.local_rope
-            };
-            let mut q_bf = self.backend.buffer_u16(q.len())?;
-            let mut k_bf = self.backend.buffer_u16(k.len())?;
-            let mut v_bf = self.backend.buffer_u16(v.len())?;
-            let threads = self.backend.threads();
-            // Row-major [b,nh,s,d] so each pass streams contiguous head rows.
-            let t_glue = Instant::now();
-            rmsnorm_rope_to_bf16(
-                &q,
-                &mut q_bf,
-                b,
-                s,
-                nq,
-                d,
-                Some(q_scale),
-                RMS_EPS,
-                Some((&rope.cos, &rope.sin)),
-                threads,
-            )?;
-            rmsnorm_rope_to_bf16(
-                &k,
-                &mut k_bf,
-                b,
-                s,
-                nkv,
-                d,
-                Some(k_scale),
-                RMS_EPS,
-                Some((&rope.cos, &rope.sin)),
-                threads,
-            )?;
-            rmsnorm_to_bf16(&v, d, None, RMS_EPS, &mut v_bf, threads)?;
-            self.backend
-                .add_category("glue", t_glue.elapsed().as_secs_f64());
-            self.backend.recycle(q);
-            self.backend.recycle(k);
-            self.backend.recycle(v);
-
-            let attn = self.backend.attention_gqa_src(
-                &q_bf,
-                &k_bf,
-                &v_bf,
-                b,
-                s,
-                nq,
-                nkv,
-                d,
-                self.tile,
-                !global,
-                SLIDING_WINDOW,
-                ATTN_SCALE,
-                &padding,
-            )?;
-            self.backend.recycle_u16(q_bf);
-            self.backend.recycle_u16(k_bf);
-            self.backend.recycle_u16(v_bf);
-            check_shape!(attn.len() == m_pad * nq * d, "attn residual rows");
-
-            let o = self.linear(&attn, &format!("{base}.self_attn.o_proj"))?;
-            self.backend.recycle(attn);
-            let post_attn = self
-                .norms
-                .get(&format!("{base}.post_attention_layernorm.weight"))
-                .with_context(|| format!("{base}.post_attention_layernorm.weight"))?;
-            let mut h = residual;
-            check_shape!(h.len() == o.len(), "attn residual");
-            let t_glue = Instant::now();
-            add_rmsnorm(
-                &mut h,
-                &o,
-                HIDDEN,
-                Some(post_attn),
-                1.0,
-                RMS_EPS,
-                self.backend.threads(),
-            )?;
-            self.backend
-                .add_category("glue", t_glue.elapsed().as_secs_f64());
-            self.backend.recycle(o);
-
-            let residual = h;
-            let pre_bf = self.rms_bf16(
-                &residual,
-                &format!("{base}.pre_feedforward_layernorm.weight"),
-                HIDDEN,
-            )?;
-            let up = self.linear_src(&pre_bf, &format!("{base}.mlp.up_proj"))?;
-            let gate_w = &self
-                .linears
-                .get(&format!("{base}.mlp.gate_proj"))
-                .with_context(|| format!("{base}.mlp.gate_proj"))?
-                .weight;
-            let gated = self.backend.gated_linear_tanh_src(&pre_bf, gate_w, &up)?;
-            self.backend.recycle_u16(pre_bf);
-            self.backend.recycle(up);
-            let down = self.linear(&gated, &format!("{base}.mlp.down_proj"))?;
-            self.backend.recycle(gated);
-            let post_ff = self
-                .norms
-                .get(&format!("{base}.post_feedforward_layernorm.weight"))
-                .with_context(|| format!("{base}.post_feedforward_layernorm.weight"))?;
-            let mut h = residual;
-            let t_glue = Instant::now();
-            add_rmsnorm(
-                &mut h,
-                &down,
-                HIDDEN,
-                Some(post_ff),
-                1.0,
-                RMS_EPS,
-                self.backend.threads(),
-            )?;
-            self.backend
-                .add_category("glue", t_glue.elapsed().as_secs_f64());
-            self.backend.recycle(down);
-
-            let residual = h;
-            let res_bf = self.to_bf16(&residual)?;
-            let gate =
-                self.linear_src(&res_bf, &format!("{base}.ple_block.per_layer_input_gate"))?;
-            self.backend.recycle_u16(res_bf);
-            let mut mixed = self.backend.buffer(gate.len())?;
-            let ple_off = layer * PLE_WIDTH;
-            let threads = self.backend.threads();
-            let gate_p = gate.as_ptr() as usize;
-            let ple_p = ple.as_ptr() as usize;
-            let mix_p = mixed.as_mut_ptr() as usize;
-            let mix_rows = gate.len() / PLE_WIDTH;
-            for_row_tiles(
-                threads,
-                mix_rows,
-                self.backend.residual_row_tile(tokens),
-                8,
-                |lo, hi| {
-                    for ti in lo..hi {
-                        let src = unsafe { row_ref(gate_p as *const f32, ti, PLE_WIDTH) };
-                        let p = unsafe {
-                            row_ref(
-                                (ple_p as *const f32).add(ti * (N_LAYERS * PLE_WIDTH) + ple_off),
-                                0,
-                                PLE_WIDTH,
-                            )
-                        };
-                        let row = unsafe { row_mut(mix_p as *mut f32, ti, PLE_WIDTH) };
-                        unsafe { crate::cpu::kernels::gelu_tanh_mul_unchecked(src, p, row) };
-                    }
-                },
-            )?;
-            self.backend.recycle(gate);
-            let proj = self.linear(&mixed, &format!("{base}.ple_block.per_layer_projection"))?;
-            self.backend.recycle(mixed);
-            let ple_norm = self
-                .norms
-                .get(&format!(
-                    "{base}.ple_block.post_per_layer_input_norm.weight"
-                ))
-                .with_context(|| format!("{base}.ple_block.post_per_layer_input_norm.weight"))?;
-            x = residual;
-            let t_glue = Instant::now();
-            add_rmsnorm(
-                &mut x,
-                &proj,
-                HIDDEN,
-                Some(ple_norm),
-                self.scalars[layer],
-                RMS_EPS,
-                self.backend.threads(),
-            )?;
-            self.backend
-                .add_category("glue", t_glue.elapsed().as_secs_f64());
-            self.backend.recycle(proj);
-        }
-        self.backend.recycle(ple);
-
-        let x_bf = self.rms_bf16(&x, "language_model.norm.weight", HIDDEN)?;
-        self.backend.recycle(x);
-        let proj = self.linear_src(&x_bf, "language_model.embedding_projection")?;
-        self.backend.recycle_u16(x_bf);
-        // Pool only the live prefix, using the original attention mask.
-        let pooled = mean_pool(&proj[..tokens * EMBED_DIM], batch, b, s, EMBED_DIM);
-        self.backend.recycle(proj);
-        Ok(l2_rows(pooled, EMBED_DIM))
     }
 
     /// Load the image and/or audio towers next to the text tower. Each keeps
@@ -863,10 +370,12 @@ impl Model {
 }
 
 fn embed_row(src: &[u16], dst: &mut [f32], scale: f32) {
-    debug_assert_eq!(src.len(), dst.len());
+    assert_eq!(src.len(), dst.len(), "embedding row length");
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bf16") {
+            // SAFETY: the CPU has both features (checked just above) and the
+            // lengths are checked above.
             unsafe {
                 embed_row_avx512(src, dst, scale);
             }
@@ -878,6 +387,9 @@ fn embed_row(src: &[u16], dst: &mut [f32], scale: f32) {
     }
 }
 
+/// # Safety
+/// The CPU must support AVX-512F and AVX512_BF16, and `dst` must be as long
+/// as `src`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bf16")]
 unsafe fn embed_row_avx512(src: &[u16], dst: &mut [f32], scale: f32) {
@@ -895,6 +407,20 @@ unsafe fn embed_row_avx512(src: &[u16], dst: &mut [f32], scale: f32) {
         *dst.get_unchecked_mut(i) = bf16_bits_to_f32(*src.get_unchecked(i)) * scale;
         i += 1;
     }
+}
+
+/// The shape of one dense forward.
+struct Dense<'a> {
+    /// Rows in the batch.
+    b: usize,
+    /// Tokens per row.
+    s: usize,
+    /// `b * s`.
+    tokens: usize,
+    /// Rows the workspace holds, `tokens` padded up (`Model::work_rows`).
+    m_pad: usize,
+    /// Each row's padded positions, which attention skips.
+    padding: &'a [Vec<usize>],
 }
 
 fn dense_uniform(batch: &Batch) -> bool {

@@ -8,6 +8,7 @@ mod linear_rows;
 mod plan_cache;
 mod thread_cap;
 
+use super::cpu::Operand;
 use super::strategy::{
     attn_amx_fold_remainder, attn_score_max_query_rows, AMX_BF16_TILE_BLOCK, AMX_BF16_TILE_ROWS,
 };
@@ -225,7 +226,7 @@ fn pad_and_ranges_are_shape_only() {
 
 #[test]
 fn primitives_match_reference_within_1e6() {
-    let budget = ThreadBudget::new(1).unwrap();
+    let budget = ThreadBudget::try_new(1).unwrap();
     let hw = match OnednnCpu::load(&budget) {
         Ok(hw) => hw,
         Err(e) if e.to_string().contains("process-global") => return,
@@ -239,7 +240,7 @@ fn primitives_match_reference_within_1e6() {
                                          // so B is row-major [K,N] = [[1,-1],[2,1],[0,2]]
                                          // A is [M,K] = [[1,2,3],[-1,0,1]]
                                          // C = A @ B = [[5,7],[-1,3]]
-    let out = hw.mm(1, 2, 2, 3, 0, 3, 0, 2, false, &a, &b).unwrap();
+    let out = hw.mm(Gemm::nn(1, 2, 2, 3, 0, 0), &a, &b).unwrap();
     let expected = [5f32, 7., -1., 3.];
     for (x, y) in out.iter().zip(&expected) {
         assert!((x - y).abs() < 1e-6, "{x} vs {y}");
@@ -297,7 +298,7 @@ fn primitives_match_reference_within_1e6() {
 
 #[test]
 fn bf16_linear_tracks_fp32() {
-    let budget = ThreadBudget::new(1).unwrap();
+    let budget = ThreadBudget::try_new(1).unwrap();
     let hw = match OnednnCpu::load(&budget) {
         Ok(hw) => hw,
         Err(e) if e.to_string().contains("process-global") => return,
@@ -373,21 +374,8 @@ fn bf16_linear_tracks_fp32() {
     let b_g: Vec<f32> = (0..g * k_a * n_a)
         .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
         .collect();
-    let out_mm_f = hw
-        .mm(
-            g,
-            m_a,
-            n_a,
-            k_a,
-            m_a * k_a,
-            k_a,
-            k_a * n_a,
-            n_a,
-            false,
-            &a_g,
-            &b_g,
-        )
-        .unwrap();
+    let gemm = Gemm::nn(g, m_a, n_a, k_a, m_a * k_a, k_a * n_a);
+    let out_mm_f = hw.mm(gemm, &a_g, &b_g).unwrap();
     let a_bf: Vec<u16> = a_g
         .iter()
         .map(|&x| crate::cpu::kernels::f32_to_bf16_bits(x))
@@ -396,22 +384,10 @@ fn bf16_linear_tracks_fp32() {
         .iter()
         .map(|&x| crate::cpu::kernels::f32_to_bf16_bits(x))
         .collect();
-    let out_mm_b = match hw.mm_bf16_src(
-        g,
-        m_a,
-        n_a,
-        k_a,
-        m_a * k_a,
-        k_a,
-        k_a * n_a,
-        n_a,
-        false,
-        &a_bf,
-        &b_bf,
-    ) {
+    let out_mm_b = match hw.mm_bf16(gemm, Operand::Bf16(&a_bf), &b_bf) {
         Ok(v) => v,
         Err(e) if e.to_string().contains("status 3") => return,
-        Err(e) => panic!("mm_bf16_src short M: {e}"),
+        Err(e) => panic!("mm_bf16 short M: {e}"),
     };
     for (f, b) in out_mm_f.iter().zip(&out_mm_b) {
         assert!((f - b).abs() < 0.25, "attn short-M fp32 {f} bf16 {b}");
@@ -422,7 +398,7 @@ fn bf16_linear_tracks_fp32() {
 /// (exactly widened) weights as f32 gives, for plain and gated matmuls.
 #[test]
 fn bf16_stored_fp32_matmuls_match_f32_weights() {
-    let budget = ThreadBudget::new(1).unwrap();
+    let budget = ThreadBudget::try_new(1).unwrap();
     let hw = match OnednnCpu::load(&budget) {
         Ok(hw) => hw,
         Err(e) if e.to_string().contains("process-global") => return,
@@ -474,7 +450,7 @@ fn bf16_stored_fp32_matmuls_match_f32_weights() {
 /// sliding windows, padding and multi-tile query ranges.
 #[test]
 fn attention_gqa_f32_matches_reference() {
-    let budget = ThreadBudget::new(2).unwrap_or_else(|_| ThreadBudget::new(1).unwrap());
+    let budget = ThreadBudget::try_new(2).unwrap_or_else(|_| ThreadBudget::try_new(1).unwrap());
     let hw = match OnednnCpu::load(&budget) {
         Ok(hw) => hw,
         Err(e) if e.to_string().contains("process-global") => return,
@@ -500,11 +476,18 @@ fn attention_gqa_f32_matches_reference() {
         if b > 1 {
             padding[1] = vec![s - 2, s - 1];
         }
-        let got = hw
-            .attention_gqa_f32(
-                &q, &k, &v, b, s, nq, nkv, d, tile, local, radius, 1.0, &padding,
-            )
-            .unwrap();
+        let shape = Attention {
+            batch: b,
+            seq: s,
+            q_heads: nq,
+            kv_heads: nkv,
+            head_dim: d,
+            tile,
+            window: local.then_some(radius),
+            scale: 1.0,
+            padding: &padding,
+        };
+        let got = hw.attention_gqa_f32(&shape, &q, &k, &v).unwrap();
         assert_eq!(got.len(), b * s * nq * d);
         let groups = nq / nkv;
         for bi in 0..b {
@@ -568,7 +551,7 @@ fn gemm_cosine(a: &[f32], b: &[f32]) -> f32 {
 /// packed weight format there (`pack_bf16` returns unimplemented). On a
 /// CPU that has it, an unimplemented pack fails the test.
 fn packed_bf16_rows(threads: usize, ms: &[usize], pinned: bool) -> Option<Vec<(usize, Vec<f32>)>> {
-    let budget = ThreadBudget::new(threads).unwrap();
+    let budget = ThreadBudget::try_new(threads).unwrap();
     let opts = SessionOptions {
         max_cpu_isa: if pinned {
             CpuIsaCap::Avx512CoreBf16
@@ -692,10 +675,12 @@ fn packed_bf16_matches_across_thread_counts() {
                 continue;
             }
         }
-        let mut references: Vec<(usize, Vec<(usize, Vec<f32>)>)> = Vec::new();
+        // Per thread count, each case's output: (threads, [(case, values)]).
+        type Outputs = Vec<(usize, Vec<f32>)>;
+        let mut references: Vec<(usize, Outputs)> = Vec::new();
         let mut min_cross = 1.0f32;
         for t in [1usize, 2, 4, 8] {
-            if ThreadBudget::new(t).is_err() {
+            if ThreadBudget::try_new(t).is_err() {
                 eprintln!("skip t={t}: not enough physical cores");
                 continue;
             }

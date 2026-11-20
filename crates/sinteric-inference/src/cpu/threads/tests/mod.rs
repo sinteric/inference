@@ -23,13 +23,13 @@ fn pin_thread(cpu: usize) {
 
 #[test]
 fn rejects_zero() {
-    assert!(ThreadBudget::new(0).is_err());
+    assert!(ThreadBudget::try_new(0).is_err());
 }
 
 #[test]
 fn accepts_any_positive_count() {
     for n in [1usize, 2, 3, 5, 7, 8] {
-        let b = ThreadBudget::new(n).unwrap();
+        let b = ThreadBudget::try_new(n).unwrap();
         assert_eq!(b.nthreads, n);
         assert_eq!(b.cpus.len(), n);
     }
@@ -43,7 +43,7 @@ fn physical_ids_are_unique_by_default() {
     seen.dedup();
     assert_eq!(phys.len(), seen.len());
     if phys.len() >= 2 {
-        let b = ThreadBudget::new(2).unwrap();
+        let b = ThreadBudget::try_new(2).unwrap();
         // Default 2-thread budget uses two *physical* cores when they exist,
         // not SMT siblings 0 and 1 of the same core.
         assert_eq!(b.cpus, phys[..2].to_vec());
@@ -83,9 +83,12 @@ fn cpu_selection_stays_inside_the_affinity_mask() {
     std::thread::spawn(move || {
         pin_thread(last);
         assert_eq!(physical_cpu_ids().unwrap(), vec![last]);
-        assert_eq!(ThreadBudget::new(2).unwrap().cpus, vec![last, last]);
+        assert_eq!(ThreadBudget::try_new(2).unwrap().cpus, vec![last, last]);
         if last > 0 {
-            let err = ThreadBudget::new(1).unwrap().with_cpuset("0").unwrap_err();
+            let err = ThreadBudget::try_new(1)
+                .unwrap()
+                .with_cpuset("0")
+                .unwrap_err();
             assert_eq!(err.kind(), crate::ErrorKind::Config, "{err}");
         }
     })
@@ -103,7 +106,7 @@ fn explicit_cpuset_is_honoured() {
     // "0,2" was refused on a two-CPU CI runner, whose mask is {0, 1}.
     let allowed = allowed_cpus().unwrap_or_else(|| vec![0, 2]);
     let (first, last) = (allowed[0], allowed[allowed.len() - 1]);
-    let b = ThreadBudget::new(2)
+    let b = ThreadBudget::try_new(2)
         .unwrap()
         .with_cpuset(format!("{first},{last}"))
         .unwrap();
@@ -112,7 +115,7 @@ fn explicit_cpuset_is_honoured() {
 
 #[test]
 fn does_not_read_env_for_nthreads() {
-    let b = ThreadBudget::new(3).unwrap();
+    let b = ThreadBudget::try_new(3).unwrap();
     assert_eq!(b.nthreads, 3);
 }
 
@@ -120,7 +123,7 @@ fn does_not_read_env_for_nthreads() {
 fn installing_the_pool_does_not_set_env() {
     crate::test_support::own_process!(installing_the_pool_does_not_set_env);
     let before = crate::test_support::env::thread_environment_snapshot();
-    let b = ThreadBudget::new(2).unwrap();
+    let b = ThreadBudget::try_new(2).unwrap();
     b.install_library_workers().unwrap();
     assert_eq!(
         crate::test_support::env::thread_environment_snapshot(),

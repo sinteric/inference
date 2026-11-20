@@ -34,13 +34,22 @@ jobs:
       # The pinned nightly rustfmt; scripts/fmt.py names it (CLAUDE.md).
       - name: fmt
         run: python3 scripts/fmt.py --check
+      - name: file sizes (STYLE.md, "A unit fits in one read")
+        run: python3 scripts/check_file_sizes.py
       - name: clippy
         run: |
           cargo clippy --locked --workspace --all-targets -- -D warnings
           # The OCR gate's ONNX Runtime reference (downloads ONNX Runtime).
           cargo clippy --locked -p drivers --features ort --all-targets -- -D warnings
+          # No function past clippy.toml's 100 lines outside tests (STYLE.md,
+          # "Keep functions short").
+          cargo clippy --locked --workspace --lib --bins --examples -- -D warnings -D clippy::too_many_lines
       - name: asset-free tests (tests that need model files skip)
         run: cargo test --locked --workspace --lib --bins --tests -- --test-threads=4
+      - name: doc examples compile (no_run; they need model files to run)
+        run: cargo test --locked --workspace --doc
+      - name: doc links resolve (private items too, where the internals are documented)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace --document-private-items
       - name: noexecstack
         run: scripts/check-noexecstack.sh target/debug/eg2-onednn target/debug/ppocr-onednn
       - name: qualification skip (oracle is private)

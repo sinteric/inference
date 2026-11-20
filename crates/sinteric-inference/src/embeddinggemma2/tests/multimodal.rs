@@ -78,7 +78,7 @@ fn view(h: usize, w: usize, c: usize, px: &[u8]) -> ImageView<'_> {
     } else {
         PixelFormat::Rgb8
     };
-    ImageView::new(px, w as u32, h as u32, w * c, format).unwrap()
+    ImageView::try_new(px, w as u32, h as u32, w * c, format).unwrap()
 }
 
 fn floats(v: &Value) -> Vec<f64> {
@@ -184,7 +184,7 @@ fn parity(precision: Precision, gate: f32) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    let rt = Runtime::new(Options::new().with_threads(threads)).unwrap();
+    let rt = Runtime::try_new(Options::new().with_threads(threads)).unwrap();
     if !EmbeddingGemma2::precisions(&rt).contains(&precision) {
         eprintln!("skipping: {precision} does not run on {}", rt.isa());
         return;
@@ -281,7 +281,7 @@ fn text_only_load_rejects_media() {
     let Some(dir) = asset_dir() else {
         return;
     };
-    let rt = Runtime::new(Options::new().with_threads(1)).unwrap();
+    let rt = Runtime::try_new(Options::new().with_threads(1)).unwrap();
     let model = EmbeddingGemma2::load(&rt, Config::new(&dir)).unwrap();
     assert!(!model.supports_image() && !model.supports_audio());
     let px = image_pixels(48, 48, 3);

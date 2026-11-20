@@ -3,7 +3,7 @@
 //! in `tools/drivers`). Behind the `reference` feature and hidden from the
 //! docs, because it is not a supported API: it changes with the gate.
 //!
-//! Each step is the one [`super::Detector`] and [`super::Recognizer`] run, at
+//! Each step is the one [`super::cpu::Detector`] and [`super::cpu::Recognizer`] run, at
 //! one thread, so the reference and the library differ only in the networks.
 
 use std::path::Path;
@@ -45,11 +45,13 @@ impl Steps {
     }
 
     /// The largest page the detector accepts, in pixels.
+    #[must_use]
     pub fn max_pixels(&self) -> usize {
         self.det.max_pixels
     }
 
     /// The most crops one recognizer call takes.
+    #[must_use]
     pub fn max_batch(&self) -> usize {
         self.rec.max_batch
     }
@@ -82,6 +84,7 @@ impl Steps {
     }
 
     /// CTC steps the recognizer emits for a crop `width` pixels wide.
+    #[must_use]
     pub fn ctc_steps(&self, width: usize) -> usize {
         rec::ctc_steps(width)
     }
@@ -95,7 +98,7 @@ impl Steps {
         lengths: &[usize],
     ) -> Result<Vec<(String, f32)>> {
         let lines = rec::decode(
-            &Tensor::new(shape, prob)?,
+            &Tensor::try_new(shape, prob)?,
             &self.dictionary,
             Some(lengths),
             1,

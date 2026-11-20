@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     let threads = args.next().map_or(Ok(4), |t| t.parse())?;
     let query = args.next().unwrap_or_else(|| "what is sinteric?".into());
 
-    let rt = Runtime::new(Options::new().with_threads(threads))?;
+    let rt = Runtime::try_new(Options::new().with_threads(threads))?;
     // Long inputs are cut to the window, as Sentence Transformers cuts them.
     let model = EmbeddingGemma2::load(&rt, Config::new(model).with_truncate(true))?;
     let rows = model.embed([query.as_str()], PromptKind::Query)?;

@@ -14,7 +14,7 @@ fn values(n: usize, mut seed: u32) -> Vec<f32> {
 
 fn backend(pool: usize, threads: usize) -> std::sync::Arc<OnednnCpu> {
     OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(pool).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(pool).unwrap(),
         SessionOptions {
             max_cpu_isa: CpuIsaCap::Avx512CoreBf16,
             workspace_limit: 1 << 28,

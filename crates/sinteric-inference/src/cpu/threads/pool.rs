@@ -165,8 +165,6 @@ struct Slot {
     f: Option<&'static (dyn Fn(usize, usize) + Sync)>,
 }
 
-unsafe impl Send for Slot {}
-
 struct Inner {
     lock: Mutex<Slot>,
     work_cv: Condvar,
@@ -188,6 +186,9 @@ static CPUS: OnceLock<Vec<usize>> = OnceLock::new();
 
 fn pin_to(cpu: usize) {
     #[cfg(target_os = "linux")]
+    // SAFETY: an all-zero `cpu_set_t` is a valid empty set, `cpu` is below
+    // `CPU_SETSIZE` (pool CPUs come from `allowed_cpus`), and the call only
+    // reads the set it is given.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
@@ -428,6 +429,11 @@ pub fn try_run(nthreads: usize, n: usize, grain: usize, f: &(dyn Fn(usize, usize
 /// Parallel-for over `[0, n)`. Uses the pinned pool when installed, otherwise
 /// `std::thread::scope`. Nested calls (oneDNN GEMM or glue already running)
 /// execute serially on the current thread.
+///
+/// The contract the kernels' row helpers rely on
+/// ([`RowsMut`](crate::cpu::kernels::RowsMut)): `f` is called with ranges that are
+/// disjoint and together cover `[0, n)`, each exactly once, and `par_for`
+/// returns only after every call has returned.
 pub fn par_for(nthreads: usize, n: usize, grain: usize, f: impl Fn(usize, usize) + Sync) {
     if n == 0 {
         return;
@@ -539,6 +545,8 @@ mod tests {
             if nested {
                 enter_parallel();
             }
+            // SAFETY: `callback` reads `ctx` as the `hits` vector, which
+            // outlives the call.
             unsafe {
                 sinteric_tp_parallel_for(7, Some(callback), &hits as *const _ as *mut c_void);
             }
@@ -579,7 +587,7 @@ mod tests {
 
     #[test]
     fn par_for_covers_without_pool() {
-        let mut hits = vec![0u32; 20];
+        let mut hits = [0u32; 20];
         let hits = std::sync::Mutex::new(&mut hits[..]);
         par_for(4, 20, 1, |lo, hi| {
             let mut g = hits.lock().unwrap();
@@ -593,7 +601,7 @@ mod tests {
     #[test]
     fn nested_par_for_is_serial() {
         enter_parallel();
-        let mut hits = vec![0u32; 8];
+        let mut hits = [0u32; 8];
         let hits = std::sync::Mutex::new(&mut hits[..]);
         par_for(4, 8, 1, |lo, hi| {
             let mut g = hits.lock().unwrap();

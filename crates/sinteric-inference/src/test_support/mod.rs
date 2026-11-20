@@ -14,7 +14,7 @@ const OWN_PROCESS: &str = "SINTERIC_TEST_OWN_PROCESS";
 /// that child, waits for it, fails if the child failed, and returns `false`.
 ///
 /// A test needs its own process when it sets process-global state: the
-/// oneDNN ISA cap, the thread pool or [`crate::Runtime::new`]. Before the
+/// oneDNN ISA cap, the thread pool or [`crate::Runtime::try_new`]. Before the
 /// crates were folded into one, each such test was an integration test
 /// binary of its own; this keeps that isolation. `path` is the test's
 /// `module_path!()` and name, as [`own_process!`] passes it.

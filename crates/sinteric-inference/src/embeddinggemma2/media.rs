@@ -28,18 +28,25 @@ pub const IMAGE_TOKEN_BUDGETS: [usize; 5] = [70, 140, 280, 560, 1120];
 #[serde(try_from = "usize", into = "usize")]
 #[non_exhaustive]
 pub enum ImageTokens {
+    /// 70 soft tokens.
     T70,
+    /// 140 soft tokens.
     T140,
     /// The processor default.
     #[default]
     T280,
+    /// 560 soft tokens.
     T560,
+    /// 1,120 soft tokens.
     T1120,
 }
 
 impl ImageTokens {
+    /// Every budget, smallest first.
     pub const ALL: [Self; 5] = [Self::T70, Self::T140, Self::T280, Self::T560, Self::T1120];
 
+    /// The soft-token count.
+    #[must_use]
     pub const fn count(self) -> usize {
         match self {
             Self::T70 => 70,
@@ -68,6 +75,7 @@ impl TryFrom<usize> for ImageTokens {
     }
 }
 
+/// Audio samples per second the audio tower takes: mono at 16 kHz.
 pub const SAMPLE_RATE: usize = 16_000;
 /// Longer audio is truncated (30 s), as the feature extractor does.
 pub const MAX_SAMPLES: usize = 480_000;
@@ -153,6 +161,10 @@ fn pixel_lut() -> &'static [f32; 256] {
     LUT.get_or_init(|| {
         let mut t = [0f32; 256];
         for (i, v) in t.iter_mut().enumerate() {
+            #[expect(
+                clippy::excessive_precision,
+                reason = "the processor's rescale factor as its config writes it"
+            )]
             let p = i as f32 * 0.003_921_568_627_451_f32;
             *v = 2.0 * (p - 0.5);
         }
@@ -163,7 +175,9 @@ fn pixel_lut() -> &'static [f32; 256] {
 /// Patches of a packed RGB image whose sides are multiples of [`PATCH`].
 pub fn patchify(rgb: &[u8], width: usize, height: usize) -> Result<ImagePatches> {
     check_shape!(
-        width % PATCH == 0 && height % PATCH == 0 && rgb.len() == width * height * 3,
+        width.is_multiple_of(PATCH)
+            && height.is_multiple_of(PATCH)
+            && rgb.len() == width * height * 3,
         "patchify {width}x{height} with {} bytes",
         rgb.len()
     );

@@ -1,5 +1,44 @@
 //! FP32 convolution graphs with fixed packed weights, a shape LRU and a checked
 //! liveness arena. Graphs are supplied by model code; no ONNX interpretation.
+//!
+//! The operators: convolution, depthwise and transposed convolution, pooling,
+//! resampling, spatial means, concat, PReLU, reorders, and activation and
+//! binary post-ops, on the model's backend with the runtime's pinned pool and
+//! ISA. Grouped convolution beyond one group or depthwise is unsupported.
+//! Integral nearest upsampling matches ONNX asymmetric/floor; linear
+//! resampling uses half-pixel centres, not align-corners. Spatial means use
+//! fixed FP32 accumulation orders to match ONNX Runtime.
+//!
+//! **Layouts.** Weights use explicit tags fixed by channels and ISA,
+//! independent of height and width. Graph inputs and outputs are NCHW;
+//! activations inside use channel blocks of the ISA's vector width (nChw16c
+//! with AVX-512, nChw8c below it), with plain reorders where an optimized
+//! small-channel convolution, a nonzero-preserving eltwise, a reduction or
+//! PReLU needs them. The block follows the ISA because oneDNN's AVX2
+//! convolutions take only 8-channel blocks: given 16, every convolution fell
+//! to the reference kernel (measured 2026-11-01 on a 32-channel 5x5:
+//! 19 MMAC/s against 74 GMAC/s for the AVX-512 kernel). oneDNN names no
+//! 8-channel transposed-convolution weight layout, so below AVX-512 a
+//! transposed convolution is [`crate::ErrorKind::Unsupported`].
+//!
+//! **Wide padding.** oneDNN 3.13.4's jit convolutions take left padding no
+//! wider than their register block, which shrinks with the ISA's vector
+//! width; wider padding falls to the reference kernel. When the plan sees
+//! that, it zero-pads the input itself and runs the convolution unpadded:
+//! the same sums on a jit kernel. The probe asks oneDNN without the node's
+//! post-ops, so a convolution its post-ops alone send to the reference
+//! kernel is padded for nothing and stays there.
+//!
+//! **Plans and memory.** [`ConvNet::try_new`] takes a positive LRU capacity of
+//! shape plans. A plan is built per input shape and graph identity; plans
+//! share packed weights and immutable memory descriptors, and identical
+//! native descriptors share primitive code. A largest-first liveness arena
+//! borrows the network input; aligned channel concats place their producers
+//! straight into the joined storage when lifetimes permit. Arena plus the
+//! largest scratchpad is refused ([`crate::ErrorKind::TooLarge`]) before any
+//! activation is allocated when it exceeds the backend's workspace limit.
+//! Segments on one backend reuse one aligned arena, scratchpad and stream,
+//! grown to the largest needed. Nothing is cached on disk.
 use crate::cpu::onednn::api::Api;
 use crate::cpu::onednn::cpu::Aligned;
 use crate::cpu::onednn::OnednnCpu;
@@ -40,39 +79,70 @@ fn dimensions(d: &[usize]) -> Result<Vec<i64>> {
         .collect()
 }
 
+/// An owned oneDNN handle, destroyed on drop. `shared` marks a handle that is
+/// immutable once created, so any thread may use or share it; `owned` marks
+/// one a single thread uses at a time, which may still move between threads.
+/// A handle with neither stays on the thread that made it.
 macro_rules! handle {
     ($name:ident, $ty:ty, $destroy:path) => {
         struct $name($ty);
         impl Drop for $name {
             fn drop(&mut self) {
                 if !self.0.is_null() {
+                    // SAFETY: the handle is non-null, this value owns it, and
+                    // nothing uses it after this drop.
                     unsafe {
                         $destroy(self.0);
                     }
                 }
             }
         }
-        // Descriptors and primitives are immutable after construction. Execute
-        // creates separate memory handles/stream/scratch for every invocation.
+    };
+    ($name:ident, $ty:ty, $destroy:path,shared) => {
+        handle!($name, $ty, $destroy);
+        // SAFETY: oneDNN memory descriptors, primitive descriptors and
+        // primitives are immutable after creation and documented as safe to
+        // use from several threads at once; each execute brings its own
+        // memories, stream and scratchpad.
         unsafe impl Send for $name {}
+        // SAFETY: as for `Send` above; no method mutates the handle.
         unsafe impl Sync for $name {}
     };
+    ($name:ident, $ty:ty, $destroy:path,owned) => {
+        handle!($name, $ty, $destroy);
+        // SAFETY: a oneDNN stream is not tied to the thread that created it;
+        // the workspace that owns it is taken under a mutex, so one thread
+        // uses it at a time.
+        unsafe impl Send for $name {}
+    };
 }
-handle!(MdOwner, dnnl_memory_desc_t, dnnl_memory_desc_destroy);
+handle!(
+    MdOwner,
+    dnnl_memory_desc_t,
+    dnnl_memory_desc_destroy,
+    shared
+);
 #[derive(Clone)]
 struct Md(Arc<MdOwner>);
-handle!(Pd, dnnl_primitive_desc_t, dnnl_primitive_desc_destroy);
-handle!(Primitive, dnnl_primitive_t, dnnl_primitive_destroy);
+handle!(
+    Pd,
+    dnnl_primitive_desc_t,
+    dnnl_primitive_desc_destroy,
+    shared
+);
+handle!(Primitive, dnnl_primitive_t, dnnl_primitive_destroy, shared);
 handle!(Attr, dnnl_primitive_attr_t, dnnl_primitive_attr_destroy);
 handle!(Posts, dnnl_post_ops_t, dnnl_post_ops_destroy);
 handle!(Memory, dnnl_memory_t, dnnl_memory_destroy);
-handle!(Stream, dnnl_stream_t, dnnl_stream_destroy);
+handle!(Stream, dnnl_stream_t, dnnl_stream_destroy, owned);
 
 impl Md {
     fn tagged(dims: &[usize], tag: i32) -> Result<Self> {
         let d = dimensions(dims)?;
         let mut md = ptr::null_mut();
         Api::check(
+            // SAFETY: `d` holds `d.len()` dimensions (at most 12, checked by
+            // `dimensions`), and `md` is a valid out-pointer.
             unsafe {
                 dnnl_memory_desc_create_with_tag(&mut md, d.len() as i32, d.as_ptr(), dnnl_f32, tag)
             },
@@ -84,6 +154,7 @@ impl Md {
         self.0 .0
     }
     fn bytes(&self) -> Result<usize> {
+        // SAFETY: `self` owns a live descriptor.
         let n = unsafe { dnnl_memory_desc_get_size(self.raw()) };
         check_shape!(
             n > 0 && n <= isize::MAX as usize && n % 4 == 0,
@@ -93,16 +164,53 @@ impl Md {
     }
 }
 
+/// The shape of a convolution's weights: `output` filters, each `kernel`
+/// (height, width) over `input / groups` channels. Deconvolution weights keep
+/// the same logical order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Filters {
+    /// Output channels.
+    pub output: usize,
+    /// Input channels.
+    pub input: usize,
+    /// Kernel height and width.
+    pub kernel: [usize; 2],
+    /// 1, or the channel count for depthwise filters.
+    pub groups: usize,
+    /// Deconvolution (transposed convolution) filters.
+    pub transpose: bool,
+}
+impl Filters {
+    /// Dense `k x k` filters from `input` to `output` channels.
+    pub fn square(output: usize, input: usize, k: usize) -> Self {
+        Self::new(output, input, [k, k])
+    }
+    /// Dense `kernel` filters from `input` to `output` channels.
+    pub fn new(output: usize, input: usize, kernel: [usize; 2]) -> Self {
+        Self {
+            output,
+            input,
+            kernel,
+            groups: 1,
+            transpose: false,
+        }
+    }
+    /// One `k x k` filter per channel.
+    pub fn depthwise(channels: usize, k: usize) -> Self {
+        Self {
+            groups: channels,
+            ..Self::square(channels, channels, k)
+        }
+    }
+}
+
 /// Immutable, spatial-shape-independent convolution weights. Source layout is
 /// OIHW (GOIHW for groups); deconvolution also uses logical OIHW dimensions.
 pub struct ConvWeights {
     md: Md,
     data: Aligned,
     bias: Option<Vec<f32>>,
-    output: usize,
-    input: usize,
-    kernel: [usize; 2],
-    transpose: bool,
+    filters: Filters,
     // Own the engine until the last weight/primitive is released.
     cpu: Arc<OnednnCpu>,
     tag: i32,
@@ -112,16 +220,20 @@ impl Drop for ConvWeights {
     fn drop(&mut self) {
         self.cpu
             .conv_weight_bytes
-            .fetch_sub(self.data.bytes, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(self.data.bytes(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 /// Spatial convolution/pool parameters, using ONNX dilation (1 = no dilation).
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Spatial {
+    /// Step between windows, per axis.
     pub strides: [usize; 2],
+    /// Spacing between kernel taps, per axis (1 = adjacent).
     pub dilations: [usize; 2],
+    /// Zero padding before the first row and column.
     pub pads_begin: [usize; 2],
+    /// Zero padding after the last row and column.
     pub pads_end: [usize; 2],
 }
 impl Default for Spatial {
@@ -135,6 +247,15 @@ impl Default for Spatial {
     }
 }
 impl Spatial {
+    /// The same stride, dilation and padding on both axes and both sides.
+    pub fn square(stride: usize, dilation: usize, pad: usize) -> Self {
+        Self {
+            strides: [stride; 2],
+            dilations: [dilation; 2],
+            pads_begin: [pad; 2],
+            pads_end: [pad; 2],
+        }
+    }
     fn arrays(&self) -> Result<[[i64; 2]; 4]> {
         check_shape!(
             !self.strides.contains(&0) && !self.dilations.contains(&0),
@@ -267,7 +388,7 @@ pub enum Op {
         weights: Arc<ConvWeights>,
         spatial: Spatial,
     },
-    /// Rearrange [N,4*C,H,W] into [N,C,2*H,2*W] (ONNX CRD order).
+    /// Rearrange `[N, 4*C, H, W]` into `[N, C, 2*H, 2*W]` (ONNX CRD order).
     DepthToSpace2x,
     Pool {
         kind: Pool,
@@ -336,6 +457,23 @@ enum Binding {
     Bias(Arc<ConvWeights>),
     Slopes(Arc<Vec<f32>>),
     External,
+}
+/// A buffer a step binds: where it starts, and how many bytes from there
+/// the step may read or write through it.
+#[derive(Clone, Copy)]
+struct Bound {
+    ptr: *mut c_void,
+    bytes: usize,
+}
+
+impl Bound {
+    /// A buffer the step only reads.
+    fn of(v: &[f32]) -> Self {
+        Self {
+            ptr: v.as_ptr().cast_mut().cast(),
+            bytes: std::mem::size_of_val(v),
+        }
+    }
 }
 #[derive(Clone, Copy)]
 struct PointwiseTile {
@@ -424,7 +562,7 @@ pub(crate) struct Workspace {
 }
 impl Workspace {
     pub(crate) fn bytes(&self) -> (usize, usize) {
-        (self.arena.bytes, self.scratch.bytes)
+        (self.arena.bytes(), self.scratch.bytes())
     }
 }
 
@@ -458,7 +596,7 @@ impl Workspaces {
             // Outside a job take the largest workspace, inside one the
             // smallest: only one grows to the largest input (the detector's
             // page) instead of each in turn.
-            let bytes = |w: &Workspace| w.arena.bytes + w.scratch.bytes;
+            let bytes = |w: &Workspace| w.arena.bytes() + w.scratch.bytes();
             let pick = if parallel {
                 set.idle.iter().enumerate().min_by_key(|(_, w)| bytes(w))
             } else {
@@ -537,7 +675,7 @@ pub struct ConvNet {
     cpu: Arc<OnednnCpu>,
 }
 impl ConvNet {
-    pub fn new(cpu: Arc<OnednnCpu>, nodes: Vec<Node>, capacity: usize) -> Result<Self> {
+    pub fn try_new(cpu: Arc<OnednnCpu>, nodes: Vec<Node>, capacity: usize) -> Result<Self> {
         check_shape!(
             !nodes.is_empty() && capacity > 0,
             "empty ConvNet or zero plan capacity"
@@ -577,15 +715,15 @@ impl ConvNet {
         self.pointwise_tiles = true;
         self
     }
-    /// Diagnostic execution of a compiled graph prefix (1-based node count).
-    #[doc(hidden)]
-    #[cfg(feature = "debug-dumps")]
+    /// The graph's first `count` nodes as a network of their own, for the
+    /// detector's `dump_means` diagnostic test.
+    #[cfg(all(test, feature = "debug-dumps"))]
     pub fn prefix(&self, count: usize) -> Result<Self> {
         check_shape!(
             count > 0 && count <= self.nodes.len(),
             "invalid graph prefix"
         );
-        let mut net = Self::new(self.cpu.clone(), self.nodes[..count].to_vec(), 1)?;
+        let mut net = Self::try_new(self.cpu.clone(), self.nodes[..count].to_vec(), 1)?;
         net.pointwise_tiles = self.pointwise_tiles;
         Ok(net)
     }
@@ -615,8 +753,8 @@ impl ConvNet {
         if lease.workspace.is_none() {
             let bytes = plan.arena_bytes + plan.scratch_bytes;
             lease.workspace = Some(Workspace {
-                arena: Aligned::new(plan.arena_bytes)?,
-                scratch: Aligned::new(plan.scratch_bytes)?,
+                arena: Aligned::try_new(plan.arena_bytes)?,
+                scratch: Aligned::try_new(plan.scratch_bytes)?,
                 stream: make_stream(&self.cpu)?,
             });
             self.cpu
@@ -630,29 +768,29 @@ impl ConvNet {
             .ok_or_else(|| Error::internal("conv workspace missing"))?;
         let retained = workspace
             .arena
-            .bytes
+            .bytes()
             .max(plan.arena_bytes)
-            .checked_add(workspace.scratch.bytes.max(plan.scratch_bytes))
+            .checked_add(workspace.scratch.bytes().max(plan.scratch_bytes))
             .ok_or(Error::size_overflow("retained convolution workspace"))?;
         // Over the backend's memory budget the arena is cut back to this
         // request's size instead of staying at the largest page seen.
         let trim = retained > self.cpu.conv_limit() || self.cpu.over_budget();
-        let before = workspace.arena.bytes + workspace.scratch.bytes;
+        let before = workspace.arena.bytes() + workspace.scratch.bytes();
         // Release the old buffer before allocating its replacement so a
         // growing arena never holds both (peak RSS would be old + new).
-        if workspace.arena.bytes < plan.arena_bytes
-            || (trim && workspace.arena.bytes != plan.arena_bytes)
+        if workspace.arena.bytes() < plan.arena_bytes
+            || (trim && workspace.arena.bytes() != plan.arena_bytes)
         {
-            workspace.arena = Aligned::new(0)?;
-            workspace.arena = Aligned::new(plan.arena_bytes)?;
+            workspace.arena = Aligned::try_new(0)?;
+            workspace.arena = Aligned::try_new(plan.arena_bytes)?;
         }
-        if workspace.scratch.bytes < plan.scratch_bytes
-            || (trim && workspace.scratch.bytes != plan.scratch_bytes)
+        if workspace.scratch.bytes() < plan.scratch_bytes
+            || (trim && workspace.scratch.bytes() != plan.scratch_bytes)
         {
-            workspace.scratch = Aligned::new(0)?;
-            workspace.scratch = Aligned::new(plan.scratch_bytes)?;
+            workspace.scratch = Aligned::try_new(0)?;
+            workspace.scratch = Aligned::try_new(plan.scratch_bytes)?;
         }
-        let after = workspace.arena.bytes + workspace.scratch.bytes;
+        let after = workspace.arena.bytes() + workspace.scratch.bytes();
         let total = &self.cpu.retained.conv_workspace;
         if after > before {
             total.fetch_add(after - before, std::sync::atomic::Ordering::Relaxed);
@@ -660,12 +798,7 @@ impl ConvNet {
             total.fetch_sub(before - after, std::sync::atomic::Ordering::Relaxed);
             self.cpu.note_released(before - after);
         }
-        let arena = unsafe {
-            std::slice::from_raw_parts_mut(
-                workspace.arena.ptr().cast::<f32>(),
-                plan.arena_bytes / 4,
-            )
-        };
+        let arena = &mut workspace.arena.as_f32_mut()[..plan.arena_bytes / 4];
         // Zero reused padded lanes before producers use a liveness alias.
         // Dense tensors are fully written by their producers before any read.
         for &(start, bytes) in &plan.zero {
@@ -676,34 +809,46 @@ impl ConvNet {
         self.cpu
             .conv_api()
             .apply_threads(self.cpu.threads() as i32)?;
+        // Every step binds tensors through this one pointer, so that none
+        // of them outlives a later borrow of the arena.
+        let (base, arena_len) = (arena.as_mut_ptr(), arena.len());
+        let scratch = Bound {
+            ptr: workspace.scratch.ptr(),
+            bytes: workspace.scratch.bytes(),
+        };
         for step in &plan.steps {
-            let mut pointers = Vec::with_capacity(step.specs.len());
+            let mut bufs = Vec::with_capacity(step.specs.len());
             for (_, _, b) in &step.specs {
-                pointers.push(match b {
-                    Binding::Tensor(0) => input.as_ptr() as *mut c_void,
-                    Binding::Tensor(id) => unsafe {
-                        arena
-                            .as_mut_ptr()
-                            .cast::<u8>()
-                            .add(plan.offsets[*id])
-                            .cast()
+                bufs.push(match b {
+                    // The graph input: no step writes tensor 0, which no node
+                    // produces.
+                    Binding::Tensor(0) => Bound::of(input),
+                    Binding::Tensor(id) => {
+                        let at = plan.offsets.get(*id).map_or(usize::MAX, |&o| o);
+                        check_shape!(
+                            at % 4 == 0 && at / 4 <= arena_len,
+                            "conv tensor offset {at}"
+                        );
+                        // SAFETY: `at / 4` is at most the arena's length
+                        // (checked just above).
+                        let ptr = unsafe { base.add(at / 4) }.cast();
+                        Bound {
+                            ptr,
+                            bytes: (arena_len - at / 4) * 4,
+                        }
+                    }
+                    Binding::Weights(w) => Bound {
+                        ptr: w.data.ptr(),
+                        bytes: w.data.bytes(),
                     },
-                    Binding::Weights(w) => w.data.ptr(),
-                    Binding::Bias(w) => w
-                        .bias
-                        .as_ref()
-                        .ok_or_else(|| Error::missing("conv bias"))?
-                        .as_ptr() as *mut c_void,
-                    Binding::Slopes(s) => s.as_ptr() as *mut c_void,
+                    Binding::Bias(w) => {
+                        Bound::of(w.bias.as_ref().ok_or_else(|| Error::missing("conv bias"))?)
+                    }
+                    Binding::Slopes(s) => Bound::of(s),
                     Binding::External => return Err(Error::internal("external binding in graph")),
                 });
             }
-            step.execute(
-                &self.cpu,
-                &workspace.stream,
-                &pointers,
-                workspace.scratch.ptr(),
-            )?;
+            step.execute(&self.cpu, &workspace.stream, &bufs, scratch)?;
         }
         let last = plan.offsets.len() - 1;
         let len = checked_size("conv output", &plan.output_shape)?;

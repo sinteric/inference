@@ -9,6 +9,7 @@
 //!
 //! Env: EG2_REPRO_THREADS (4), EG2_REPRO_CALLS (300 per op and shape),
 //! EG2_REPRO_NO_PROBE (AMX unguarded). Statistical, so ignored.
+use crate::cpu::onednn::Attention;
 use crate::cpu::runtime::{Options, Runtime};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -46,7 +47,7 @@ fn eg2_bf16_ops_are_repeatable_under_load() {
     }
     let threads = env("EG2_REPRO_THREADS", 4);
     let calls = env("EG2_REPRO_CALLS", 300);
-    let rt = Runtime::new(Options::new().with_threads(threads)).unwrap();
+    let rt = Runtime::try_new(Options::new().with_threads(threads)).unwrap();
     let hw = rt.backend().unwrap();
     let tile = crate::embeddinggemma2::config::attn_tile(rt.cpu_isa());
     let stop = AtomicBool::new(false);
@@ -107,10 +108,18 @@ fn eg2_bf16_ops_are_repeatable_under_load() {
                 let k = bf16(&random(nkv * s * d, 4, 2.0));
                 let v = bf16(&random(nkv * s * d, 5, 2.0));
                 let pad = vec![vec![]];
-                let run = || {
-                    hw.attention_gqa_src(&q, &k, &v, 1, s, nq, nkv, d, tile, local, 512, 1.0, &pad)
-                        .unwrap()
+                let shape = Attention {
+                    batch: 1,
+                    seq: s,
+                    q_heads: nq,
+                    kv_heads: nkv,
+                    head_dim: d,
+                    tile,
+                    window: local.then_some(512),
+                    scale: 1.0,
+                    padding: &pad,
                 };
+                let run = || hw.attention_gqa_src(&shape, &q, &k, &v).unwrap();
                 let first = run();
                 let bad = (0..calls).filter(|_| run() != first).count();
                 eprintln!("RESULT {name:<20} s={s:<4} nq={nq} nkv={nkv} d={d:<4}: {bad}/{calls}");

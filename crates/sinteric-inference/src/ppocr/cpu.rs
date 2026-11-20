@@ -5,8 +5,14 @@
 //! (stage order, score threshold, when to keep an unwarped page, reading
 //! order) is the caller's job.
 //!
-//! ```ignore
-//! use sinteric_inference::ppocr::cpu::{DetConfig, Detector, RecConfig, Recognizer};
+//! ```no_run
+//! use sinteric_inference::cpu::{self, Options, Runtime};
+//! use sinteric_inference::ppocr::cpu::{
+//!     DetConfig, Detector, RecConfig, Recognizer, Unwarper, UvdocConfig,
+//! };
+//! # fn main() -> sinteric_inference::Result<()> {
+//! # let (image, photo): (sinteric_inference::ppocr::ImageView<'_>, sinteric_inference::ppocr::ImageView<'_>) = unimplemented!();
+//! let rt = Runtime::try_new(Options::new())?;
 //! let det = Detector::load(&rt, DetConfig::new("/models/ppocr/det"))?;
 //! let rec = Recognizer::load(&rt, RecConfig::new("/models/ppocr/rec"))?;
 //! let quads = det.detect(&image)?;
@@ -22,6 +28,8 @@
 //! )?;
 //! let det = Detector::load(&ocr_rt, DetConfig::new("/models/ppocr/det"))?;
 //! let rec = Recognizer::load(&ocr_rt, RecConfig::new("/models/ppocr/rec"))?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! A [`Detector`] or [`Recognizer`] loaded on a plain [`Runtime`] owns its
@@ -68,8 +76,11 @@ macro_rules! model_config {
             /// loading through [`Runtime::shared_backend`].
             #[serde(default)]
             pub memory_budget_bytes: Option<usize>,
+            /// What the model does with its input and output.
             #[serde(default)]
             pub options: $options,
+            /// Check the weights against the manifest's SHA-256 at load.
+            /// Default: false (their sizes are always checked).
             #[serde(default)]
             pub verify_weights: bool,
             /// Explicit pin manifest; `None` uses the embedded PP-OCR manifest.
@@ -78,6 +89,7 @@ macro_rules! model_config {
         }
 
         impl $name {
+            /// The model in `model_dir`, every other field at its default.
             pub fn new(model_dir: impl Into<PathBuf>) -> Self {
                 Self {
                     model_dir: model_dir.into(),
@@ -88,10 +100,14 @@ macro_rules! model_config {
                     manifest: None,
                 }
             }
+            /// Sets [`Self::workspace_limit_bytes`].
+            #[must_use]
             pub fn with_workspace_limit_bytes(mut self, bytes: usize) -> Self {
                 self.workspace_limit_bytes = Some(bytes);
                 self
             }
+            /// Sets [`Self::memory_budget_bytes`].
+            #[must_use]
             pub fn with_memory_budget_bytes(mut self, bytes: usize) -> Self {
                 self.memory_budget_bytes = Some(bytes);
                 self
@@ -107,18 +123,27 @@ macro_rules! model_config {
                         .with_memory_budget_bytes(self.memory_budget_bytes),
                 )
             }
+            /// Sets [`Self::options`].
+            #[must_use]
             pub fn with_options(mut self, options: $options) -> Self {
                 self.options = options;
                 self
             }
+            /// Sets [`Self::verify_weights`].
+            #[must_use]
             pub fn with_verify_weights(mut self, verify: bool) -> Self {
                 self.verify_weights = verify;
                 self
             }
+            /// Sets [`Self::manifest`].
+            #[must_use]
             pub fn with_manifest(mut self, manifest: impl Into<PathBuf>) -> Self {
                 self.manifest = Some(manifest.into());
                 self
             }
+            /// Check the config without loading anything:
+            /// [`crate::ErrorKind::Config`] on a zero workspace limit or an
+            /// out-of-range option.
             pub fn validate(&self) -> Result<()> {
                 if self.workspace_limit_bytes == Some(0) {
                     return Err(Error::config(

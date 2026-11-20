@@ -4,21 +4,20 @@
 use crate::image::ImageView;
 use crate::{Error, Result};
 
-#[allow(unused_imports)] // named in docs
-use super::MAX_SAMPLES;
-
 /// Flat embedding matrix: `data.len() == n * dim`, row-major.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Embeddings {
+    /// Floats per row.
     pub dim: usize,
+    /// Every row, one after another.
     pub data: Vec<f32>,
 }
 
 impl Embeddings {
     /// Rows of `dim` floats; `data.len()` must be a multiple of `dim`.
-    pub fn new(dim: usize, data: Vec<f32>) -> Result<Self> {
-        if dim == 0 || data.len() % dim != 0 {
+    pub fn try_new(dim: usize, data: Vec<f32>) -> Result<Self> {
+        if dim == 0 || !data.len().is_multiple_of(dim) {
             return Err(Error::invalid_input(format!(
                 "{} floats do not form rows of {dim}",
                 data.len()
@@ -27,10 +26,13 @@ impl Embeddings {
         Ok(Self { dim, data })
     }
 
+    /// The number of rows.
+    #[must_use]
     pub fn n(&self) -> usize {
         self.data.len().checked_div(self.dim).unwrap_or(0)
     }
 
+    /// Row `i`.
     pub fn row(&self, i: usize) -> Result<&[f32]> {
         let n = self.n();
         if i >= n {
@@ -40,6 +42,7 @@ impl Embeddings {
         Ok(&self.data[start..start + self.dim])
     }
 
+    /// Every row, in order.
     pub fn rows(&self) -> impl Iterator<Item = &[f32]> {
         let dim = self.dim;
         self.data
@@ -47,6 +50,8 @@ impl Embeddings {
             .take(if dim == 0 { 0 } else { self.n() })
     }
 
+    /// The flat row-major floats.
+    #[must_use]
     pub fn into_inner(self) -> Vec<f32> {
         self.data
     }
@@ -57,11 +62,12 @@ impl Embeddings {
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub enum Part<'a> {
+    /// Text, tokenized as is.
     Text(&'a str),
-    /// Any [`PixelFormat`]; resized to the model's
+    /// Any [`PixelFormat`](super::PixelFormat); resized to the model's
     /// [`cpu::Config::image_tokens`](super::cpu::Config::image_tokens).
     Image(ImageView<'a>),
-    /// 16 kHz mono samples; past 30 s ([`MAX_SAMPLES`]) is truncated.
+    /// 16 kHz mono samples; past 30 s ([`MAX_SAMPLES`](super::MAX_SAMPLES)) is truncated.
     Audio(&'a [f32]),
 }
 
@@ -88,7 +94,7 @@ mod tests {
         assert!(empty.row(0).is_err());
         assert_eq!(empty.rows().count(), 0);
         assert_eq!(
-            Embeddings::new(3, vec![0.; 4]).unwrap_err().kind(),
+            Embeddings::try_new(3, vec![0.; 4]).unwrap_err().kind(),
             crate::ErrorKind::InvalidInput
         );
     }

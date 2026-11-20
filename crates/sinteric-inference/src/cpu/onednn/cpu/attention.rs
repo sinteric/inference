@@ -3,198 +3,233 @@
 //! GEMMs over query tiles; the mask and the output scatter run on the pool.
 
 use super::*;
+use crate::cpu::kernels::{for_rows, RowsMut};
 
-/// Validate attention tensors once before any row-parallel work or pointer use.
-pub(super) fn validate_attention<T>(
-    q: &[T],
-    k: &[T],
-    v: &[T],
-    b: usize,
-    s: usize,
-    nq: usize,
-    nkv: usize,
-    d: usize,
-    tile: usize,
-    radius: usize,
-    padding: &[Vec<usize>],
-) -> Result<()> {
-    crate::check_shape!(
-        b > 0 && s > 0 && nq > 0 && nkv > 0 && nq.is_multiple_of(nkv) && d > 0 && tile > 0,
-        "attention shape [{b}, {nq}/{nkv}, {s}, {d}], tile {tile}"
-    );
-    let qn = crate::checked_size("attention queries", &[b, nq, s, d])?;
-    let kn = crate::checked_size("attention keys", &[b, nkv, s, d])?;
-    crate::check_shape!(
-        q.len() == qn && k.len() == kn && v.len() == kn,
-        "attention tensor lengths {}/{}/{}, expected {qn}/{kn}/{kn}",
-        q.len(),
-        k.len(),
-        v.len()
-    );
-    crate::check_shape!(
-        padding.len() == b && padding.iter().all(|r| r.iter().all(|&p| p < s)),
-        "attention padding indices outside batch {b}, sequence {s}"
-    );
-    s.checked_add(radius)
-        .and_then(|n| n.checked_add(1))
-        .ok_or(crate::Error::size_overflow("attention radius"))?;
-    crate::checked_size("attention score bytes", &[b, nq, s, s.min(tile), 4])?;
-    Ok(())
+/// One attention call: the shape of Q, K and V (`[batch, heads, seq,
+/// head_dim]`, head-major), which keys each query sees, and the scale on Q.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Attention<'a> {
+    /// Sequences in the batch.
+    pub(crate) batch: usize,
+    /// Positions per sequence, the same for queries and keys.
+    pub(crate) seq: usize,
+    pub(crate) q_heads: usize,
+    /// Key and value heads; each serves `q_heads / kv_heads` query heads.
+    pub(crate) kv_heads: usize,
+    pub(crate) head_dim: usize,
+    /// Query rows per tile, before the backend clamps it to the shape.
+    pub(crate) tile: usize,
+    /// `Some(r)`: each query sees the keys within `r` positions of it.
+    /// `None`: every key.
+    pub(crate) window: Option<usize>,
+    /// Multiplies Q before QK; 1.0 leaves Q as given.
+    pub(crate) scale: f32,
+    /// Per sequence, the key positions no query sees (padding).
+    pub(crate) padding: &'a [Vec<usize>],
 }
 
-/// FP32 attention: tiled QK and PV GEMMs and oneDNN softmax, with a
-/// threaded mask (`+= f32::MIN`) and output scatter.
+/// One query tile: queries `[start, start + n)` against keys `[ks, ke)`.
+#[derive(Clone, Copy, Debug)]
+struct Tile {
+    start: usize,
+    n: usize,
+    ks: usize,
+    ke: usize,
+}
+
+impl Tile {
+    fn keys(&self) -> usize {
+        self.ke - self.ks
+    }
+}
+
+impl Attention<'_> {
+    fn local(&self) -> bool {
+        self.window.is_some()
+    }
+
+    fn radius(&self) -> usize {
+        self.window.unwrap_or(0)
+    }
+
+    fn groups(&self) -> usize {
+        self.q_heads / self.kv_heads
+    }
+
+    /// Validate the tensors once, before any row-parallel work.
+    fn validate<T>(&self, q: &[T], k: &[T], v: &[T]) -> Result<()> {
+        let (b, s, nq, nkv, d, tile) = (
+            self.batch,
+            self.seq,
+            self.q_heads,
+            self.kv_heads,
+            self.head_dim,
+            self.tile,
+        );
+        crate::check_shape!(
+            b > 0 && s > 0 && nq > 0 && nkv > 0 && nq.is_multiple_of(nkv) && d > 0 && tile > 0,
+            "attention shape [{b}, {nq}/{nkv}, {s}, {d}], tile {tile}"
+        );
+        let qn = crate::checked_size("attention queries", &[b, nq, s, d])?;
+        let kn = crate::checked_size("attention keys", &[b, nkv, s, d])?;
+        crate::check_shape!(
+            q.len() == qn && k.len() == kn && v.len() == kn,
+            "attention tensor lengths {}/{}/{}, expected {qn}/{kn}/{kn}",
+            q.len(),
+            k.len(),
+            v.len()
+        );
+        crate::check_shape!(
+            self.padding.len() == b && self.padding.iter().all(|r| r.iter().all(|&p| p < s)),
+            "attention padding indices outside batch {b}, sequence {s}"
+        );
+        s.checked_add(self.radius())
+            .and_then(|n| n.checked_add(1))
+            .ok_or(crate::Error::size_overflow("attention radius"))?;
+        crate::checked_size("attention score bytes", &[b, nq, s, s.min(tile), 4])?;
+        Ok(())
+    }
+
+    /// The tile of queries `[start, start + n)` and the keys they can see.
+    fn tile_at(&self, start: usize, n: usize) -> Tile {
+        let (ks, ke) = match self.window {
+            Some(radius) => (
+                start.saturating_sub(radius),
+                (start + n + radius).min(self.seq),
+            ),
+            None => (0, self.seq),
+        };
+        Tile { start, n, ks, ke }
+    }
+
+    /// Per sequence, the excluded keys inside the tile's key span, counted
+    /// from its first key.
+    fn blocked_in(&self, t: &Tile) -> Vec<Vec<usize>> {
+        self.padding
+            .iter()
+            .map(|pad| {
+                pad.iter()
+                    .copied()
+                    // Filter before subtracting: then_some eagerly evaluates
+                    // p - ks and underflows in debug builds for earlier keys.
+                    .filter(|&p| p >= t.ks && p < t.ke)
+                    .map(|p| p - t.ks)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The query tiles' bounds for the grouped (GQA) kernels.
+    fn query_ranges(&self, strategy: crate::cpu::onednn::IsaStrategy) -> Vec<(usize, usize)> {
+        let tile = crate::cpu::onednn::clamp_attn_tile(
+            self.tile,
+            self.seq,
+            self.local(),
+            self.radius(),
+            self.batch,
+            self.q_heads,
+        );
+        strategy.attn_query_ranges(
+            self.seq,
+            tile,
+            self.batch,
+            self.q_heads,
+            self.kv_heads,
+            self.local(),
+        )
+    }
+}
+
+/// FP32 multi-head attention (`q_heads == kv_heads`, no scale): tiled QK and
+/// PV GEMMs and oneDNN softmax, with a threaded mask (`+= f32::MIN`) and
+/// output scatter.
 pub(super) fn attention_fp32(
     hw: &OnednnCpu,
+    a: &Attention,
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    b: usize,
-    s: usize,
-    nh: usize,
-    d: usize,
-    tile: usize,
-    local: bool,
-    radius: usize,
-    padding: &[Vec<usize>],
 ) -> Result<Vec<f32>> {
-    validate_attention(q, k, v, b, s, nh, nh, d, tile, radius, padding)?;
+    a.validate(q, k, v)?;
+    crate::check_shape!(
+        a.q_heads == a.kv_heads && a.scale == 1.0,
+        "multi-head attention takes one K/V head per query head and no scale"
+    );
+    let (b, s, nh, d) = (a.batch, a.seq, a.q_heads, a.head_dim);
     let g = b * nh;
     let threads = hw.threads.max(1) as usize;
     let mut out = hw.buffer(crate::checked_size("activation elements", &[b, s, nh, d])?)?;
-    let tile = tile.min(s).max(1);
+    let tile = a.tile.min(s).max(1);
     for start in (0..s).step_by(tile) {
-        let n = tile.min(s - start);
-        let ks = if local {
-            start.saturating_sub(radius)
-        } else {
-            0
-        };
-        let ke = if local {
-            (start + n + radius).min(s)
-        } else {
-            s
-        };
-        let nk = ke - ks;
-        let mut scores = hw.mm(
-            g,
-            n,
-            nk,
-            d,
-            s * d,
-            d,
-            s * d,
-            d,
-            true,
-            &q[start * d..],
-            &k[ks * d..],
-        )?;
-        let scores_p = scores.as_mut_ptr() as usize;
-        let rows = g * n;
-        for_ranges(threads, rows, 4, |rlo, rhi| {
-            for row_i in rlo..rhi {
-                let gi = row_i / n;
-                let qi = row_i % n;
-                let excluded = &padding[gi / nh];
-                if !local && excluded.is_empty() {
-                    continue;
-                }
-                let row = unsafe { row_mut(scores_p as *mut f32, row_i, nk) };
-                let lo = if local {
-                    (start + qi).saturating_sub(radius).saturating_sub(ks)
-                } else {
-                    0
-                };
-                let hi = if local {
-                    (start + qi + radius + 1).min(ke) - ks
-                } else {
-                    nk
-                };
-                for score in &mut row[..lo] {
-                    *score += f32::MIN;
-                }
-                for score in &mut row[hi..] {
-                    *score += f32::MIN;
-                }
-                for &pos in excluded {
-                    if pos >= ks + lo && pos < ks + hi {
-                        row[pos - ks] += f32::MIN;
-                    }
-                }
-            }
-        });
+        let t = a.tile_at(start, tile.min(s - start));
+        let (n, nk) = (t.n, t.keys());
+        let qk = Gemm::nt(g, n, nk, d, s * d, s * d);
+        let mut scores = hw.mm(qk, &q[start * d..], &k[t.ks * d..])?;
+        mask_fp32(threads, a, &t, &mut scores);
         // oneDNN's softmax: a small slice of the attention time, and the
         // rounding the models' references were checked against.
         let probs = hw.softmax(g * n, nk, &scores)?;
         hw.recycle(scores);
-        let y = hw.mm(
-            g,
-            n,
-            d,
-            nk,
-            n * nk,
-            nk,
-            s * d,
-            d,
-            false,
-            &probs,
-            &v[ks * d..],
-        )?;
+        let pv = Gemm::nn(g, n, d, nk, n * nk, s * d);
+        let y = hw.mm(pv, &probs, &v[t.ks * d..])?;
         hw.recycle(probs);
-        {
-            let y_p = y.as_ptr() as usize;
-            let out_p = out.as_mut_ptr() as usize;
-            let rows = b * n;
-            for_ranges(threads, rows, 8, |lo, hi| {
-                for idx in lo..hi {
-                    let bi = idx / n;
-                    let qi = idx % n;
-                    for head in 0..nh {
-                        let src = ((bi * nh + head) * n + qi) * d;
-                        let dst = (bi * s + start + qi) * (nh * d) + head * d;
-                        let src = unsafe { row_ref(y_p as *const f32, src / d, d) };
-                        let dst = unsafe { row_mut(out_p as *mut f32, dst / d, d) };
-                        dst.copy_from_slice(src);
-                    }
-                }
-            });
-        }
+        scatter_heads(threads, a, &t, &y, &mut out);
         hw.recycle(y);
     }
     Ok(out)
 }
 
+/// Adds `f32::MIN` to every score a query may not see: keys outside its
+/// window and excluded keys.
+fn mask_fp32(threads: usize, a: &Attention, t: &Tile, scores: &mut [f32]) {
+    let (n, nk, local, radius) = (t.n, t.keys(), a.local(), a.radius());
+    for_rows(threads, 4, scores, nk, |rlo, rhi, rows| {
+        for (row_i, row) in (rlo..rhi).zip(rows.chunks_exact_mut(nk)) {
+            let gi = row_i / n;
+            let qi = row_i % n;
+            let excluded = &a.padding[gi / a.q_heads];
+            if !local && excluded.is_empty() {
+                continue;
+            }
+            let (lo, hi) = if local {
+                (
+                    (t.start + qi).saturating_sub(radius).saturating_sub(t.ks),
+                    (t.start + qi + radius + 1).min(t.ke) - t.ks,
+                )
+            } else {
+                (0, nk)
+            };
+            for score in &mut row[..lo] {
+                *score += f32::MIN;
+            }
+            for score in &mut row[hi..] {
+                *score += f32::MIN;
+            }
+            for &pos in excluded {
+                if pos >= t.ks + lo && pos < t.ks + hi {
+                    row[pos - t.ks] += f32::MIN;
+                }
+            }
+        }
+    });
+}
+
+/// BF16 GQA attention from f32 Q, K and V: scales Q, converts all three to
+/// BF16, then runs [`attention_gqa_from_bf16`].
 pub(super) fn attention_gqa_bf16(
     hw: &OnednnCpu,
+    a: &Attention,
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    b: usize,
-    s: usize,
-    nq: usize,
-    nkv: usize,
-    d: usize,
-    tile: usize,
-    local: bool,
-    radius: usize,
-    scale: f32,
-    padding: &[Vec<usize>],
 ) -> Result<Vec<f32>> {
-    validate_attention(q, k, v, b, s, nq, nkv, d, tile, radius, padding)?;
-    if nq == 0 || nkv == 0 || !nq.is_multiple_of(nkv) {
-        return Err(crate::Error::internal("GQA head grouping"));
-    }
+    a.validate(q, k, v)?;
     let threads = hw.threads.max(1) as usize;
-    let q_scale = if (scale - 1.0).abs() > 0.0 {
+    let q_scale = if (a.scale - 1.0).abs() > 0.0 {
         let mut qs = hw.buffer(q.len())?;
-        let q_p = q.as_ptr() as usize;
-        let qs_p = qs.as_mut_ptr() as usize;
-        let n = q.len();
-        for_ranges(threads, n, 4096, |lo, hi| {
-            let q = unsafe { rows_ref(q_p as *const f32, lo, hi, 1) };
-            let qs = unsafe { rows_mut(qs_p as *mut f32, lo, hi, 1) };
-            for (dst, &src) in qs.iter_mut().zip(q.iter()) {
-                *dst = src * scale;
+        for_rows(threads, 4096, &mut qs, 1, |lo, hi, qs| {
+            for (dst, &src) in qs.iter_mut().zip(&q[lo..hi]) {
+                *dst = src * a.scale;
             }
         });
         qs
@@ -213,40 +248,27 @@ pub(super) fn attention_gqa_bf16(
     if !q_scale.is_empty() {
         hw.recycle(q_scale);
     }
-    let out = attention_gqa_from_bf16(
-        hw, &q_bf, &k_bf, &v_bf, b, s, nq, nkv, d, tile, local, radius, padding,
-    );
+    let out = attention_gqa_from_bf16(hw, a, &q_bf, &k_bf, &v_bf);
     hw.recycle_u16(q_bf);
     hw.recycle_u16(k_bf);
     hw.recycle_u16(v_bf);
     out
 }
 
-/// Main's tiled QK → softmax → PV (oneshot oneDNN, f32 P, AMX short-M PV pad).
-/// Preconverted BF16 Q/K/V skip the f32→bf16 convert.
+/// Main's tiled QK → softmax → PV (oneshot oneDNN, f32 P, AMX short-M PV
+/// pad) on BF16 Q, K and V, which it takes as already scaled.
 pub(super) fn attention_gqa_from_bf16(
     hw: &OnednnCpu,
+    a: &Attention,
     q_bf: &[u16],
     k_bf: &[u16],
     v_bf: &[u16],
-    b: usize,
-    s: usize,
-    nq: usize,
-    nkv: usize,
-    d: usize,
-    tile: usize,
-    local: bool,
-    radius: usize,
-    padding: &[Vec<usize>],
 ) -> Result<Vec<f32>> {
-    validate_attention(q_bf, k_bf, v_bf, b, s, nq, nkv, d, tile, radius, padding)?;
-    if nq == 0 || nkv == 0 || !nq.is_multiple_of(nkv) {
-        return Err(crate::Error::internal("GQA head grouping"));
-    }
-    let groups = nq / nkv;
+    a.validate(q_bf, k_bf, v_bf)?;
+    let (s, nq, d) = (a.seq, a.q_heads, a.head_dim);
     let threads = hw.threads.max(1) as usize;
-    let g_kv = b * nkv;
-    let live_rows = b * s;
+    let g_kv = a.batch * a.kv_heads;
+    let live_rows = a.batch * s;
     let mut out = hw.buffer(crate::checked_size(
         "activation elements",
         &[hw.strategy.residual_rows(live_rows), nq, d],
@@ -259,164 +281,126 @@ pub(super) fn attention_gqa_from_bf16(
     // AMX folds a starving last window from shape only (777 → 256+256+265).
     // B1/B4×300 keep step_by (rem=44 pad waste 8/88). AVX-512 is always
     // step_by(tile). Thread count does not change the split.
-    let tile = crate::cpu::onednn::clamp_attn_tile(tile, s, local, radius, b, nq);
-    let q_ranges = hw.strategy.attn_query_ranges(s, tile, b, nq, nkv, local);
-    let q_max = q_ranges.iter().map(|&(_, n)| n).max().unwrap_or(1);
-    let mut q_tile = if q_max < s {
-        hw.buffer_u16(crate::checked_size(
-            "activation elements",
-            &[g_kv, groups, q_max, d],
-        )?)?
-    } else {
-        Vec::new()
-    };
+    let q_ranges = a.query_ranges(hw.strategy);
+    let mut q_tile = query_tile_buffer(&q_ranges, a, |n| hw.buffer_u16(n))?;
     for (start, n) in q_ranges {
-        let ks = if local {
-            start.saturating_sub(radius)
-        } else {
-            0
-        };
-        let ke = if local {
-            (start + n + radius).min(s)
-        } else {
-            s
-        };
-        let nk = ke - ks;
-        let m = groups * n;
+        let t = a.tile_at(start, n);
+        let (nk, m) = (t.keys(), a.groups() * n);
         let (q_ptr, q_ab): (&[u16], usize) = if start == 0 && n == s {
-            (q_bf, groups * s * d)
+            (q_bf, a.groups() * s * d)
         } else {
-            gather_q_tile(q_bf, &mut q_tile, b, nkv, groups, s, d, start, n, threads);
+            gather_q_tile(q_bf, &mut q_tile, a, &t, threads);
             (&q_tile[..g_kv * m * d], m * d)
         };
         let t_qk = Instant::now();
-        let mut scores = hw.mm_bf16_src(
-            g_kv,
-            m,
-            nk,
-            d,
-            q_ab,
-            d,
-            s * d,
-            d,
-            true,
-            q_ptr,
-            &k_bf[ks * d..],
-        )?;
+        let qk = Gemm::nt(g_kv, m, nk, d, q_ab, s * d);
+        let scores = hw.mm_bf16(qk, Operand::Bf16(q_ptr), &k_bf[t.ks * d..])?;
         hw.add_category("attn_qk", t_qk.elapsed().as_secs_f64());
-        let blocked_by_batch: Vec<Vec<usize>> = padding
-            .iter()
-            .map(|pad| {
-                pad.iter()
-                    .copied()
-                    // Filter before subtracting: then_some eagerly evaluates
-                    // p - ks and underflows in debug builds for earlier keys.
-                    .filter(|&p| p >= ks && p < ke)
-                    .map(|p| p - ks)
-                    .collect()
-            })
-            .collect();
         let t_sm = Instant::now();
-        let probs = if local {
-            let scores_p = scores.as_mut_ptr() as usize;
-            let rows = g_kv * m;
-            for_ranges(threads, rows, 4, |rlo, rhi| {
-                for row_i in rlo..rhi {
-                    let gi = row_i / m;
-                    let rest = row_i % m;
-                    let qi = rest % n;
-                    let bi = gi / nkv;
-                    let row = unsafe { row_mut(scores_p as *mut f32, row_i, nk) };
-                    let qpos = start + qi;
-                    let lo = qpos.saturating_sub(radius).saturating_sub(ks);
-                    let hi = (qpos + radius + 1).min(ke) - ks;
-                    softmax_window(row, lo, hi, &blocked_by_batch[bi]);
-                }
-            });
-            scores
-        } else {
-            if blocked_by_batch.iter().any(|p| !p.is_empty()) {
-                let scores_p = scores.as_mut_ptr() as usize;
-                let rows = g_kv * m;
-                for_ranges(threads, rows, 4, |rlo, rhi| {
-                    for row_i in rlo..rhi {
-                        let row = unsafe { row_mut(scores_p as *mut f32, row_i, nk) };
-                        let bi = (row_i / m) / nkv;
-                        for &pos in &blocked_by_batch[bi] {
-                            row[pos] = f32::NEG_INFINITY;
-                        }
-                    }
-                });
-            }
-            if g_kv * m >= 512 && nk >= 256 {
-                let probs = hw.softmax(g_kv * m, nk, &scores)?;
-                hw.recycle(scores);
-                probs
-            } else {
-                softmax_rows_nthreads(&mut scores, nk, threads)?;
-                scores
-            }
-        };
+        let probs = softmax_bf16_tile(hw, threads, a, &t, scores)?;
         hw.add_category("attn_softmax", t_sm.elapsed().as_secs_f64());
         let t_pv = Instant::now();
-        let y = if hw.strategy.attn_pad_m(m) == m {
-            let mut y = hw.buffer(crate::checked_size("activation elements", &[g_kv, m, d])?)?;
-            hw.run_ex(
-                Key {
-                    kind: 0,
-                    g: g_kv,
-                    m,
-                    n: d,
-                    k: nk,
-                    ab: m * nk,
-                    ar: nk,
-                    bb: s * d,
-                    br: d,
-                    trans: false,
-                    param: 0,
-                    sum: false,
-                    weight: 0,
-                    dt: MatDt::Bf16,
-                },
-                &probs,
-                None,
-                None,
-                Some(&v_bf[ks * d..]),
-                None,
-                &mut y,
-                None,
-            )?;
-            y
-        } else {
-            hw.attn_pv_inner(g_kv, m, d, nk, &probs, &v_bf[ks * d..], s * d, d)?
-        };
+        let y = pv_bf16(hw, a, &t, &probs, v_bf)?;
         hw.add_category("attn_pv", t_pv.elapsed().as_secs_f64());
         hw.recycle(probs);
-        {
-            let y_p = y.as_ptr() as usize;
-            let out_p = out.as_mut_ptr() as usize;
-            let rows = b * n;
-            for_ranges(threads, rows, 8, |lo, hi| {
-                for idx in lo..hi {
-                    let bi = idx / n;
-                    let qi = idx % n;
-                    for kvh in 0..nkv {
-                        for grp in 0..groups {
-                            let qh = kvh * groups + grp;
-                            let src = (((bi * nkv + kvh) * groups + grp) * n + qi) * d;
-                            let dst = (bi * s + start + qi) * (nq * d) + qh * d;
-                            let src = unsafe { row_ref(y_p as *const f32, src / d, d) };
-                            let dst = unsafe { row_mut(out_p as *mut f32, dst / d, d) };
-                            dst.copy_from_slice(src);
-                        }
-                    }
-                }
-            });
-        }
+        scatter_heads(threads, a, &t, &y, &mut out);
         hw.recycle(y);
     }
     hw.recycle_u16(q_tile);
     Ok(out)
+}
+
+/// A buffer for the largest gathered query tile, or none when one tile
+/// covers the whole sequence.
+fn query_tile_buffer<T>(
+    q_ranges: &[(usize, usize)],
+    a: &Attention,
+    buffer: impl Fn(usize) -> Result<Vec<T>>,
+) -> Result<Vec<T>> {
+    let q_max = q_ranges.iter().map(|&(_, n)| n).max().unwrap_or(1);
+    if q_max < a.seq {
+        buffer(crate::checked_size(
+            "activation elements",
+            &[a.batch * a.kv_heads, a.groups(), q_max, a.head_dim],
+        )?)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Softmax of one tile's BF16-path scores: per row inside the window when
+/// local; otherwise excluded keys at −∞, then oneDNN's softmax for large
+/// tiles and the pool's for small ones.
+fn softmax_bf16_tile(
+    hw: &OnednnCpu,
+    threads: usize,
+    a: &Attention,
+    t: &Tile,
+    mut scores: Vec<f32>,
+) -> Result<Vec<f32>> {
+    let blocked = a.blocked_in(t);
+    let (nk, m) = (t.keys(), a.groups() * t.n);
+    if a.local() {
+        softmax_local(threads, a, t, &blocked, &mut scores);
+        return Ok(scores);
+    }
+    if blocked.iter().any(|p| !p.is_empty()) {
+        for_rows(threads, 4, &mut scores, nk, |rlo, rhi, rows| {
+            for (row_i, row) in (rlo..rhi).zip(rows.chunks_exact_mut(nk)) {
+                let bi = (row_i / m) / a.kv_heads;
+                for &pos in &blocked[bi] {
+                    row[pos] = f32::NEG_INFINITY;
+                }
+            }
+        });
+    }
+    let rows = a.batch * a.kv_heads * m;
+    if rows >= 512 && nk >= 256 {
+        let probs = hw.softmax(rows, nk, &scores)?;
+        hw.recycle(scores);
+        Ok(probs)
+    } else {
+        softmax_rows_nthreads(&mut scores, nk, threads)?;
+        Ok(scores)
+    }
+}
+
+/// Softmax of each score row over the keys inside its query's window, with
+/// the excluded keys at −∞ and everything outside the window 0.
+fn softmax_local(
+    threads: usize,
+    a: &Attention,
+    t: &Tile,
+    blocked: &[Vec<usize>],
+    scores: &mut [f32],
+) {
+    let (nk, m, radius) = (t.keys(), a.groups() * t.n, a.radius());
+    for_rows(threads, 4, scores, nk, |rlo, rhi, rows| {
+        for (row_i, row) in (rlo..rhi).zip(rows.chunks_exact_mut(nk)) {
+            let gi = row_i / m;
+            let qi = (row_i % m) % t.n;
+            let bi = gi / a.kv_heads;
+            let qpos = t.start + qi;
+            let lo = qpos.saturating_sub(radius).saturating_sub(t.ks);
+            let hi = (qpos + radius + 1).min(t.ke) - t.ks;
+            softmax_window(row, lo, hi, &blocked[bi]);
+        }
+    });
+}
+
+/// PV for one tile of the BF16 path: probabilities in f32 (converted on
+/// the way in) against BF16 V.
+fn pv_bf16(
+    hw: &OnednnCpu,
+    a: &Attention,
+    t: &Tile,
+    probs: &[f32],
+    v_bf: &[u16],
+) -> Result<Vec<f32>> {
+    let (s, d) = (a.seq, a.head_dim);
+    let (nk, m, g_kv) = (t.keys(), a.groups() * t.n, a.batch * a.kv_heads);
+    let pv = Gemm::nn(g_kv, m, d, nk, m * nk, s * d);
+    hw.mm_bf16(pv, Operand::F32(probs), &v_bf[t.ks * d..])
 }
 
 /// FP32 GQA attention: per KV head, the `groups` query heads that share it
@@ -424,147 +408,56 @@ pub(super) fn attention_gqa_from_bf16(
 /// Output is exactly `[b * s, nq * d]`, token-major, with no residual pad.
 pub(super) fn attention_gqa_f32(
     hw: &OnednnCpu,
+    a: &Attention,
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    b: usize,
-    s: usize,
-    nq: usize,
-    nkv: usize,
-    d: usize,
-    tile: usize,
-    local: bool,
-    radius: usize,
-    scale: f32,
-    padding: &[Vec<usize>],
 ) -> Result<Vec<f32>> {
-    validate_attention(q, k, v, b, s, nq, nkv, d, tile, radius, padding)?;
-    let groups = nq / nkv;
+    a.validate(q, k, v)?;
+    let (s, nq, d) = (a.seq, a.q_heads, a.head_dim);
     let threads = hw.threads.max(1) as usize;
-    let g_kv = b * nkv;
-    let q_scaled = if (scale - 1.0).abs() > 0.0 {
+    let g_kv = a.batch * a.kv_heads;
+    let q_scaled = if (a.scale - 1.0).abs() > 0.0 {
         let mut qs = hw.buffer(q.len())?;
         for (dst, &src) in qs.iter_mut().zip(q) {
-            *dst = src * scale;
+            *dst = src * a.scale;
         }
         qs
     } else {
         Vec::new()
     };
     let q: &[f32] = if q_scaled.is_empty() { q } else { &q_scaled };
-    let mut out = hw.buffer(crate::checked_size("activation elements", &[b * s, nq, d])?)?;
-    let tile = crate::cpu::onednn::clamp_attn_tile(tile, s, local, radius, b, nq);
+    let mut out = hw.buffer(crate::checked_size(
+        "activation elements",
+        &[a.batch * s, nq, d],
+    )?)?;
     // f32 runs on AVX-512 FMA on every host, so AMX tail folding never applies.
-    let q_ranges =
-        crate::cpu::onednn::IsaStrategy::Avx512.attn_query_ranges(s, tile, b, nq, nkv, local);
-    let q_max = q_ranges.iter().map(|&(_, n)| n).max().unwrap_or(1);
-    let mut q_tile = if q_max < s {
-        hw.buffer(crate::checked_size(
-            "activation elements",
-            &[g_kv, groups, q_max, d],
-        )?)?
-    } else {
-        Vec::new()
-    };
+    let q_ranges = a.query_ranges(crate::cpu::onednn::IsaStrategy::Avx512);
+    let mut q_tile = query_tile_buffer(&q_ranges, a, |n| hw.buffer(n))?;
     for (start, n) in q_ranges {
-        let ks = if local {
-            start.saturating_sub(radius)
-        } else {
-            0
-        };
-        let ke = if local {
-            (start + n + radius).min(s)
-        } else {
-            s
-        };
-        let nk = ke - ks;
-        let m = groups * n;
+        let t = a.tile_at(start, n);
+        let (nk, m) = (t.keys(), a.groups() * n);
         let (q_ptr, q_ab): (&[f32], usize) = if start == 0 && n == s {
-            (q, groups * s * d)
+            (q, a.groups() * s * d)
         } else {
-            gather_q_tile(q, &mut q_tile, b, nkv, groups, s, d, start, n, threads);
+            gather_q_tile(q, &mut q_tile, a, &t, threads);
             (&q_tile[..g_kv * m * d], m * d)
         };
         let t_qk = Instant::now();
-        let mut scores = hw.mm(g_kv, m, nk, d, q_ab, d, s * d, d, true, q_ptr, &k[ks * d..])?;
+        let mut scores = hw.mm(Gemm::nt(g_kv, m, nk, d, q_ab, s * d), q_ptr, &k[t.ks * d..])?;
         hw.add_category("attn_qk", t_qk.elapsed().as_secs_f64());
-        let blocked_by_batch: Vec<Vec<usize>> = padding
-            .iter()
-            .map(|pad| {
-                pad.iter()
-                    .copied()
-                    .filter(|&p| p >= ks && p < ke)
-                    .map(|p| p - ks)
-                    .collect()
-            })
-            .collect();
         let t_sm = Instant::now();
-        let scores_p = scores.as_mut_ptr() as usize;
-        let rows = g_kv * m;
-        if local {
-            for_ranges(threads, rows, 4, |rlo, rhi| {
-                for row_i in rlo..rhi {
-                    let gi = row_i / m;
-                    let qi = (row_i % m) % n;
-                    let bi = gi / nkv;
-                    let row = unsafe { row_mut(scores_p as *mut f32, row_i, nk) };
-                    let qpos = start + qi;
-                    let lo = qpos.saturating_sub(radius).saturating_sub(ks);
-                    let hi = (qpos + radius + 1).min(ke) - ks;
-                    softmax_window(row, lo, hi, &blocked_by_batch[bi]);
-                }
-            });
-        } else {
-            let blocked = blocked_by_batch.iter().any(|p| !p.is_empty());
-            for_ranges(threads, rows, 4, |rlo, rhi| {
-                for row_i in rlo..rhi {
-                    let row = unsafe { row_mut(scores_p as *mut f32, row_i, nk) };
-                    if blocked {
-                        let bi = (row_i / m) / nkv;
-                        softmax_window(row, 0, nk, &blocked_by_batch[bi]);
-                    } else {
-                        crate::cpu::kernels::softmax_inplace(row);
-                    }
-                }
-            });
-        }
+        softmax_f32_tile(threads, a, &t, &mut scores);
         hw.add_category("attn_softmax", t_sm.elapsed().as_secs_f64());
         let t_pv = Instant::now();
         let y = hw.mm(
-            g_kv,
-            m,
-            d,
-            nk,
-            m * nk,
-            nk,
-            s * d,
-            d,
-            false,
+            Gemm::nn(g_kv, m, d, nk, m * nk, s * d),
             &scores,
-            &v[ks * d..],
+            &v[t.ks * d..],
         )?;
         hw.add_category("attn_pv", t_pv.elapsed().as_secs_f64());
         hw.recycle(scores);
-        {
-            let y_p = y.as_ptr() as usize;
-            let out_p = out.as_mut_ptr() as usize;
-            for_ranges(threads, b * n, 8, |lo, hi| {
-                for idx in lo..hi {
-                    let bi = idx / n;
-                    let qi = idx % n;
-                    for kvh in 0..nkv {
-                        for grp in 0..groups {
-                            let qh = kvh * groups + grp;
-                            let src = (((bi * nkv + kvh) * groups + grp) * n + qi) * d;
-                            let dst = (bi * s + start + qi) * (nq * d) + qh * d;
-                            let src = unsafe { row_ref(y_p as *const f32, src / d, d) };
-                            let dst = unsafe { row_mut(out_p as *mut f32, dst / d, d) };
-                            dst.copy_from_slice(src);
-                        }
-                    }
-                }
-            });
-        }
+        scatter_heads(threads, a, &t, &y, &mut out);
         hw.recycle(y);
     }
     hw.recycle(q_tile);
@@ -574,24 +467,66 @@ pub(super) fn attention_gqa_f32(
     Ok(out)
 }
 
-fn gather_q_tile<T: Copy>(
+/// Softmax of one tile's FP32-path scores, on the pool: inside each query's
+/// window when local, else over every key with the excluded ones at −∞.
+fn softmax_f32_tile(threads: usize, a: &Attention, t: &Tile, scores: &mut [f32]) {
+    let blocked = a.blocked_in(t);
+    if a.local() {
+        softmax_local(threads, a, t, &blocked, scores);
+        return;
+    }
+    let (nk, m) = (t.keys(), a.groups() * t.n);
+    let any_blocked = blocked.iter().any(|p| !p.is_empty());
+    for_rows(threads, 4, scores, nk, |rlo, rhi, rows| {
+        for (row_i, row) in (rlo..rhi).zip(rows.chunks_exact_mut(nk)) {
+            if any_blocked {
+                let bi = (row_i / m) / a.kv_heads;
+                softmax_window(row, 0, nk, &blocked[bi]);
+            } else {
+                crate::cpu::kernels::softmax_inplace(row);
+            }
+        }
+    });
+}
+
+/// Copies the tile's per-head results `y` (`[b, kv_heads, groups, n, d]`)
+/// into `out`'s token-major rows (`[b, s, q_heads, d]`).
+fn scatter_heads(threads: usize, a: &Attention, t: &Tile, y: &[f32], out: &mut [f32]) {
+    let (s, nq, nkv, d, n, groups) = (a.seq, a.q_heads, a.kv_heads, a.head_dim, t.n, a.groups());
+    let out = RowsMut::new(out, d);
+    for_ranges(threads, a.batch * n, 8, |lo, hi| {
+        for idx in lo..hi {
+            let bi = idx / n;
+            let qi = idx % n;
+            for kvh in 0..nkv {
+                for grp in 0..groups {
+                    let qh = kvh * groups + grp;
+                    let src = (((bi * nkv + kvh) * groups + grp) * n + qi) * d;
+                    // SAFETY: query `(bi, qi)` alone writes row
+                    // `(bi * s + start + qi) * nq + qh`, one per head `qh`,
+                    // and `for_ranges` hands each query to one call.
+                    let dst = unsafe { out.row((bi * s + t.start + qi) * nq + qh) };
+                    dst.copy_from_slice(&y[src..src + d]);
+                }
+            }
+        }
+    });
+}
+
+/// Gathers the tile's queries into `dst` as `[b, kv_heads, groups, n, d]`,
+/// so the query heads that share a K/V head form one matmul.
+fn gather_q_tile<T: Copy + Send + Sync>(
     q: &[T],
     dst: &mut [T],
-    b: usize,
-    nkv: usize,
-    groups: usize,
-    s: usize,
-    d: usize,
-    start: usize,
-    n: usize,
+    a: &Attention,
+    t: &Tile,
     nthreads: usize,
 ) {
-    let nq = nkv * groups;
-    let rows = b * nkv * groups * n;
-    let q_p = q.as_ptr() as usize;
-    let d_p = dst.as_mut_ptr() as usize;
-    for_ranges(nthreads, rows, 16, |lo, hi| {
-        for idx in lo..hi {
+    let (s, nq, nkv, d, n, groups) = (a.seq, a.q_heads, a.kv_heads, a.head_dim, t.n, a.groups());
+    let rows = a.batch * nkv * groups * n;
+    // Row `idx` of `dst` is `((bi * nkv + kvh) * groups + grp) * n + qi`.
+    for_rows(nthreads, 16, &mut dst[..rows * d], d, |lo, hi, dst| {
+        for (idx, dst) in (lo..hi).zip(dst.chunks_exact_mut(d)) {
             let qi = idx % n;
             let rest = idx / n;
             let grp = rest % groups;
@@ -599,184 +534,65 @@ fn gather_q_tile<T: Copy>(
             let kvh = rest % nkv;
             let bi = rest / nkv;
             let qh = kvh * groups + grp;
-            let src = ((bi * nq + qh) * s + start + qi) * d;
-            let off = (((bi * nkv + kvh) * groups + grp) * n + qi) * d;
-            let src = unsafe { row_ref(q_p as *const T, src / d, d) };
-            let dst = unsafe { row_mut(d_p as *mut T, off / d, d) };
-            dst.copy_from_slice(src);
+            let src = ((bi * nq + qh) * s + t.start + qi) * d;
+            dst.copy_from_slice(&q[src..src + d]);
         }
     });
 }
 
 impl OnednnCpu {
-    /// Attention PV: `probs[g,M,K] @ V[g,K,D]`. Query `M` uses the same
-    /// shape+ISA pad as packed linear (see [`crate::cpu::onednn::IsaStrategy`]).
-    /// `nk` is the live KV span.
-    fn attn_pv_inner(
-        &self,
-        g: usize,
-        m: usize,
-        d: usize,
-        nk: usize,
-        probs: &[f32],
-        v: &[u16],
-        v_bb: usize,
-        v_br: usize,
-    ) -> AResult<Vec<f32>> {
-        check_shape!(probs.len() >= g * m * nk, "pv probs shape");
-        let m_pad = self.strategy.attn_pad_m(m);
-        let key = |rows: usize| Key {
-            kind: 0,
-            g,
-            m: rows,
-            n: d,
-            k: nk,
-            ab: rows * nk,
-            ar: nk,
-            bb: v_bb,
-            br: v_br,
-            trans: false,
-            param: 0,
-            sum: false,
-            weight: 0,
-            dt: MatDt::Bf16,
-        };
-        if m_pad == m {
-            let mut y = self.buffer(crate::checked_size("activation elements", &[g, m, d])?)?;
-            self.run_ex(key(m), probs, None, None, Some(v), None, &mut y, None)?;
-            return Ok(y);
-        }
-        let mut a_pad =
-            self.buffer(crate::checked_size("activation elements", &[g, m_pad, nk])?)?;
-        for gi in 0..g {
-            let src = gi * m * nk;
-            let dst = gi * m_pad * nk;
-            a_pad[dst..dst + m * nk].copy_from_slice(&probs[src..src + m * nk]);
-            a_pad[dst + m * nk..dst + m_pad * nk].fill(0.0);
-        }
-        let mut dst = self.buffer(crate::checked_size("activation elements", &[g, m_pad, d])?)?;
-        let rc = self.run_ex(
-            key(m_pad),
-            &a_pad,
-            None,
-            None,
-            Some(v),
-            None,
-            &mut dst,
-            None,
-        );
-        self.recycle(a_pad);
-        rc?;
-        let mut y = self.buffer(crate::checked_size("activation elements", &[g, m, d])?)?;
-        for gi in 0..g {
-            let src = gi * m_pad * d;
-            let dst_o = gi * m * d;
-            y[dst_o..dst_o + m * d].copy_from_slice(&dst[src..src + m * d]);
-        }
-        self.recycle(dst);
-        Ok(y)
-    }
-
+    /// FP32 grouped-query attention ([`attention_gqa_f32`]).
     pub(crate) fn attention_gqa_f32(
         &self,
+        a: &Attention,
         q: &[f32],
         k: &[f32],
         v: &[f32],
-        b: usize,
-        s: usize,
-        nq: usize,
-        nkv: usize,
-        d: usize,
-        tile: usize,
-        local: bool,
-        radius: usize,
-        scale: f32,
-        padding: &[Vec<usize>],
     ) -> Result<Vec<f32>> {
-        attention_gqa_f32(
-            self, q, k, v, b, s, nq, nkv, d, tile, local, radius, scale, padding,
-        )
+        attention_gqa_f32(self, a, q, k, v)
     }
 
+    /// BF16 grouped-query attention from f32 Q, K and V
+    /// ([`attention_gqa_bf16`]).
     pub(crate) fn attention_gqa(
         &self,
+        a: &Attention,
         q: &[f32],
         k: &[f32],
         v: &[f32],
-        b: usize,
-        s: usize,
-        nq: usize,
-        nkv: usize,
-        d: usize,
-        tile: usize,
-        local: bool,
-        radius: usize,
-        scale: f32,
-        padding: &[Vec<usize>],
     ) -> Result<Vec<f32>> {
-        attention_gqa_bf16(
-            self, q, k, v, b, s, nq, nkv, d, tile, local, radius, scale, padding,
-        )
+        attention_gqa_bf16(self, a, q, k, v)
     }
 
+    /// BF16 grouped-query attention from BF16 Q, K and V. A scale other than
+    /// 1.0 widens them to f32 and takes the [`attention_gqa_bf16`] path, which
+    /// scales Q before rounding it back.
     pub(crate) fn attention_gqa_src(
         &self,
+        a: &Attention,
         q: &[u16],
         k: &[u16],
         v: &[u16],
-        b: usize,
-        s: usize,
-        nq: usize,
-        nkv: usize,
-        d: usize,
-        tile: usize,
-        local: bool,
-        radius: usize,
-        scale: f32,
-        padding: &[Vec<usize>],
     ) -> Result<Vec<f32>> {
-        if (scale - 1.0).abs() > 0.0 {
+        if (a.scale - 1.0).abs() > 0.0 {
             let up = |x: &[u16]| -> Vec<f32> {
                 x.iter()
                     .map(|&b| f32::from_bits((b as u32) << 16))
                     .collect()
             };
-            return attention_gqa_bf16(
-                self,
-                &up(q),
-                &up(k),
-                &up(v),
-                b,
-                s,
-                nq,
-                nkv,
-                d,
-                tile,
-                local,
-                radius,
-                scale,
-                padding,
-            );
+            return attention_gqa_bf16(self, a, &up(q), &up(k), &up(v));
         }
-        attention_gqa_from_bf16(
-            self, q, k, v, b, s, nq, nkv, d, tile, local, radius, padding,
-        )
+        attention_gqa_from_bf16(self, a, q, k, v)
     }
 
+    /// FP32 multi-head attention ([`attention_fp32`]).
     pub(crate) fn attention(
         &self,
+        a: &Attention,
         q: &[f32],
         k: &[f32],
         v: &[f32],
-        b: usize,
-        s: usize,
-        nh: usize,
-        d: usize,
-        tile: usize,
-        local: bool,
-        radius: usize,
-        padding: &[Vec<usize>],
     ) -> Result<Vec<f32>> {
-        attention_fp32(self, q, k, v, b, s, nh, d, tile, local, radius, padding)
+        attention_fp32(self, a, q, k, v)
     }
 }

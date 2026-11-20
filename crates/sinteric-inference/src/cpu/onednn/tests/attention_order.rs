@@ -2,7 +2,7 @@
 //! `crate::cpu::kernels::seq_matmul_*` instead of per-shape oneDNN primitives. That
 //! keeps results only if oneDNN's f32 matmul also sums each output as one
 //! FMA chain in ascending k for these shapes (8 heads of width 15, t >= 2).
-use crate::cpu::onednn::{CpuIsaCap, OnednnCpu, SessionOptions};
+use crate::cpu::onednn::{CpuIsaCap, Gemm, OnednnCpu, SessionOptions};
 
 fn values(n: usize, mut seed: u32) -> Vec<f32> {
     (0..n)
@@ -22,7 +22,7 @@ fn onednn_attention_matmuls_are_sequential_fma_chains() {
     crate::test_support::own_process!(onednn_attention_matmuls_are_sequential_fma_chains);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
     let cpu = OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(threads).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(threads).unwrap(),
         SessionOptions {
             max_cpu_isa: CpuIsaCap::Avx512CoreBf16,
             workspace_limit: 1 << 28,
@@ -45,12 +45,12 @@ fn onednn_attention_matmuls_are_sequential_fma_chains() {
                 .map(|x| x.abs())
                 .collect::<Vec<_>>();
             let want = cpu
-                .mm(g, t, t, 15, t * 15, 15, t * 15, 15, true, &q, &k)
+                .mm(Gemm::nt(g, t, t, 15, t * 15, t * 15), &q, &k)
                 .unwrap();
             let got = crate::cpu::kernels::seq_matmul_nt(g, t, 15, t, &q, &k, threads).unwrap();
             assert!(same(&want, &got), "scores differ at batch={batch} t={t}");
             let want = cpu
-                .mm(g, t, 15, t, t * t, t, t * 15, 15, false, &p, &v)
+                .mm(Gemm::nn(g, t, 15, t, t * t, t * 15), &p, &v)
                 .unwrap();
             let got = crate::cpu::kernels::seq_matmul_nn(g, t, t, 15, &p, &v, threads).unwrap();
             assert!(same(&want, &got), "context differs at batch={batch} t={t}");

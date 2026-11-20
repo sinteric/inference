@@ -1,5 +1,21 @@
 //! Korean PP-OCRv5 mobile: PPLCNetV3, two SVTR blocks and greedy CTC.
-use crate::cpu::onednn::{OnednnCpu, PackedWeight};
+//!
+//! The network runs as four convolution segments (FP32 oneDNN convolution,
+//! matmul, layer norm, softmax and SiLU) and returns `[N, T, 11947]`
+//! probabilities. Each segment's shape LRU holds [`RecOptions::plan_capacity`]
+//! plans, and the recognizer raises its backend's matmul plan cache to eight
+//! times that (at least 256). Pointwise convolutions reuse code across widths
+//! through independent spatial tiles (powers of two, 16 to 512 positions),
+//! each keeping its scalar and channel fusions on the primitive; spatial
+//! convolutions, global means and attention keep their exact shapes, so
+//! padding never reaches a convolution edge in [`Batching::Exact`]. The CTC
+//! argmax runs independent lanes and keeps the first-index tie rule.
+//!
+//! [`Batching::Bucketed`] zero-pads normalized pixels, masks the padded keys
+//! in both attention blocks and cuts CTC to each crop's true span, but the
+//! padding still reaches convolution edges: on the four-page qualification
+//! set it kept 426 of 437 texts exact, so `Exact` is the default.
+use crate::cpu::onednn::{Gemm, OnednnCpu, PackedWeight};
 use crate::image::{ImageView, Quad, RecCrop};
 use crate::ppocr::net::{self, OcrNet, Tensor};
 use crate::ppocr::rec_graph::{self, Segments};
@@ -12,23 +28,34 @@ use std::time::Instant;
 
 pub const DICTIONARY_ENTRIES: usize = 11945;
 pub const CTC_CLASSES: usize = DICTIONARY_ENTRIES + 2;
+/// How [`Recognizer`] groups line crops of different widths into batches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Batching {
+    /// Group only crops of the same width; each keeps its exact width.
     #[default]
     Exact,
+    /// Pad each crop to a width bucket (multiples of 32 up to 320, then
+    /// steps of a quarter) so more crops share a batch.
     Bucketed,
 }
+/// How [`Recognizer`] crops and batches lines. The defaults are PP-OCR's.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
 pub struct RecOptions {
+    /// Line height in pixels; the model takes only 48.
     pub height: usize,
+    /// Narrowest line crop, at least 16 pixels (default 16).
     pub min_width: usize,
+    /// Widest line crop, at most 1,600 pixels (default 1,600).
     pub max_width: usize,
+    /// How crops of different widths share a batch.
     pub batching: Batching,
+    /// Input shapes whose plans stay cached (default 512).
     pub plan_capacity: usize,
+    /// The most crops in one batch, 1 to 16 (default 16).
     pub max_batch: usize,
     /// Bound the page and each warped line crop in
     /// [`Recognizer::recognize`] before allocating.
@@ -48,6 +75,7 @@ impl Default for RecOptions {
     }
 }
 impl RecOptions {
+    /// [`crate::ErrorKind::Config`] outside the ranges each field states.
     pub fn validate(&self) -> Result<()> {
         if self.height != 48
             || self.min_width < 16
@@ -143,16 +171,19 @@ impl Linear {
                 dst.copy_from_slice(&dst_padded[..m * n]);
             }
         }
-        let p = y.as_mut_ptr() as usize;
-        crate::cpu::kernels::for_ranges(cpu.threads(), rows, ROW_GRAIN.div_ceil(n), |lo, hi| {
-            // SAFETY: workers receive disjoint row ranges of `y`.
-            let y = unsafe { crate::cpu::kernels::rows_mut(p as *mut f32, lo, hi, n) };
-            for row in y.chunks_exact_mut(n) {
-                for (v, b) in row.iter_mut().zip(&self.bias) {
-                    *v += b;
+        crate::cpu::kernels::for_rows(
+            cpu.threads(),
+            ROW_GRAIN.div_ceil(n),
+            &mut y,
+            n,
+            |_, _, y| {
+                for row in y.chunks_exact_mut(n) {
+                    for (v, b) in row.iter_mut().zip(&self.bias) {
+                        *v += b;
+                    }
                 }
-            }
-        });
+            },
+        );
         Ok(y)
     }
 }
@@ -230,7 +261,7 @@ impl Block {
         let mut logits = if t > 1 {
             crate::cpu::kernels::seq_matmul_nt(g, t, 15, t, &q, &k, threads)?
         } else {
-            cpu.mm(g, t, t, 15, t * 15, 15, t * 15, 15, true, &q, &k)?
+            cpu.mm(Gemm::nt(g, t, t, 15, t * 15, t * 15), &q, &k)?
         };
         for b in 0..batch {
             if lengths[b] < t {
@@ -247,7 +278,7 @@ impl Block {
         let context = if t > 1 {
             crate::cpu::kernels::seq_matmul_nn(g, t, t, 15, &prob, &v, threads)?
         } else {
-            cpu.mm(g, t, 15, t, t * t, t, t * 15, 15, false, &prob, &v)?
+            cpu.mm(Gemm::nn(g, t, 15, t, t * t, t * 15), &prob, &v)?
         };
         let mut joined = try_vec(rows * 120)?;
         for b in 0..batch {
@@ -343,6 +374,7 @@ impl Recognizer {
             execute: Mutex::new(()),
         })
     }
+    /// The options it was loaded with.
     pub fn options(&self) -> &RecOptions {
         &self.options
     }
@@ -442,9 +474,9 @@ impl Recognizer {
             all_par(self.cpu.threads(), &probabilities, f32::is_finite),
             "nonfinite recognizer output"
         );
-        Tensor::new(vec![batch, t, CTC_CLASSES], probabilities)
+        Tensor::try_new(vec![batch, t, CTC_CLASSES], probabilities)
     }
-    /// [`Recognizer::forward_padded`] then [`Recognizer::decode`] with each
+    /// [`Recognizer::forward_padded`] then greedy CTC with each
     /// line's valid length, without keeping the whole probability tensor:
     /// the CTC head, softmax and argmax run in blocks of up to `CHUNK_ROWS`
     /// time steps (rows padded to `ROW_TILE`), keeping one class id and its
@@ -486,22 +518,14 @@ impl Recognizer {
             let chunk = self.cpu.softmax(tile, CTC_CLASSES, &logits)?;
             drop(logits);
             let ok = AtomicBool::new(true);
-            let (pi, pp) = (
-                ids[start..].as_mut_ptr() as usize,
-                probs[start..].as_mut_ptr() as usize,
-            );
-            crate::cpu::kernels::for_ranges(
+            crate::cpu::kernels::for_rows2(
                 threads,
-                m,
                 ROW_GRAIN.div_ceil(CTC_CLASSES),
-                |lo, hi| {
-                    // SAFETY: workers receive disjoint row ranges of `ids` and `probs`.
-                    let (ids, probs) = unsafe {
-                        (
-                            crate::cpu::kernels::rows_mut(pi as *mut usize, lo, hi, 1),
-                            crate::cpu::kernels::rows_mut(pp as *mut f32, lo, hi, 1),
-                        )
-                    };
+                &mut ids[start..start + m],
+                1,
+                &mut probs[start..start + m],
+                1,
+                |lo, hi, ids, probs| {
                     for ((i, id), p) in (lo..hi).zip(ids).zip(probs) {
                         let row = &chunk[i * CTC_CLASSES..(i + 1) * CTC_CLASSES];
                         if !row.iter().all(|v| v.is_finite() && (0. ..=1.).contains(v)) {
@@ -541,19 +565,6 @@ impl Recognizer {
             self.cpu.threads(),
         )
     }
-    #[cfg(feature = "debug-dumps")]
-    #[doc(hidden)]
-    pub(crate) fn debug_backbone(
-        &self,
-        count: usize,
-        shape: [usize; 4],
-        input: &[f32],
-    ) -> Result<Tensor> {
-        self.validate_shape(&shape)?;
-        net::validate(&shape, input.len())?;
-        let (s, v) = self.segments.backbone.prefix(count)?.run(shape, input)?;
-        Tensor::new(s.to_vec(), v)
-    }
 }
 impl Recognizer {
     /// Read the text in each of `quads` on `image`: warp and resize every
@@ -573,128 +584,18 @@ impl Recognizer {
             .execute
             .lock()
             .map_err(|_| Error::poisoned("recognizer execution"))?;
-        let rec = &self.options;
-        let threads = self.cpu.threads();
         let crop_start = Instant::now();
-        let mut slots = Vec::new();
-        slots.try_reserve_exact(quads.len()).map_err(|_| {
-            Error::out_of_memory(
-                quads
-                    .len()
-                    .saturating_mul(std::mem::size_of::<OnceLock<Result<RecCrop>>>()),
-            )
-        })?;
-        slots.resize_with(quads.len(), OnceLock::new);
-        // Each crop is independent. Fixed single-crop tasks preserve all pixel
-        // operation orders and reading order at every thread count.
-        crate::cpu::threads::par_for(threads, quads.len(), 1, |lo, hi| {
-            for i in lo..hi {
-                let crop = crate::image::recognizer_crop(
-                    image,
-                    quads[i],
-                    rec.min_width,
-                    rec.max_width,
-                    rec.max_pixels,
-                );
-                let _ = slots[i].set(crop);
-            }
-        });
-        let mut crops = Vec::new();
-        crops.try_reserve_exact(quads.len()).map_err(|_| {
-            Error::out_of_memory(quads.len().saturating_mul(std::mem::size_of::<RecCrop>()))
-        })?;
-        for slot in slots {
-            crops.push(
-                slot.into_inner()
-                    .ok_or_else(|| Error::internal("missing OCR crop task"))??,
-            );
-        }
+        let crops = self.crops(image, quads)?;
         let crop_ms = ms_since(crop_start);
         let rec_start = Instant::now();
-        let mut order = (0..crops.len()).collect::<Vec<_>>();
-        order.sort_by_key(|&i| {
-            std::cmp::Reverse(batch_width(crops[i].width, rec.batching, rec.max_width))
-        });
-        // Width groups, widest first: [start, end) of `order` and the width.
-        let mut groups = Vec::new();
-        let mut start = 0;
-        while start < order.len() {
-            let width = batch_width(crops[order[start]].width, rec.batching, rec.max_width);
-            let mut end = start + 1;
-            let max_batch = rec.max_batch.min(GROUP_COLUMNS / width).max(1);
-            while end < order.len()
-                && end - start < max_batch
-                && batch_width(crops[order[end]].width, rec.batching, rec.max_width) == width
-            {
-                end += 1;
-            }
-            groups.push((start, end, width));
-            start = end;
-        }
+        let (order, groups) = width_groups(&crops, &self.options);
         let widths = crops.iter().map(|c| c.width).collect::<Vec<_>>();
         let values = crops
             .into_iter()
             .map(|c| Mutex::new(c.values))
             .collect::<Vec<_>>();
-        let run = |&(start, end, width): &(usize, usize, usize)| -> Result<Batch> {
-            let batch = end - start;
-            let pack_start = Instant::now();
-            let plane = 48 * width;
-            let mut input = try_vec(checked_size("OCR crop batch", &[batch, 3, plane])?)?;
-            let mut valid = Vec::with_capacity(batch);
-            for (b, &i) in order[start..end].iter().enumerate() {
-                let w = widths[i];
-                valid.push(w);
-                let crop = std::mem::take(
-                    &mut *values[i].lock().map_err(|_| Error::poisoned("OCR crop"))?,
-                );
-                for c in 0..3 {
-                    for y in 0..48 {
-                        input[(b * 3 + c) * plane + y * width..(b * 3 + c) * plane + y * width + w]
-                            .copy_from_slice(&crop[(c * 48 + y) * w..(c * 48 + y + 1) * w]);
-                    }
-                }
-            }
-            let forward_start = Instant::now();
-            let pack_ms = ms_since(pack_start);
-            let lines = self.recognize_padded(&[batch, 3, 48, width], &input, &valid)?;
-            Ok(Batch {
-                lines,
-                pack_ms,
-                forward_ms: ms_since(forward_start),
-            })
-        };
-        // Groups run one per worker, each worker taking the next group
-        // when it finishes: small batches barely scale across threads, so
-        // running several side by side uses the cores they leave idle. Each
-        // batch's arithmetic is unchanged; only its threading differs. The
-        // workers hold the compute lock throughout, so once another model in
-        // the process waits for it they stop taking groups, and the rest run
-        // one at a time across every thread, interleaving with that model's
-        // calls as before, until it has gone quiet.
-        let results = groups
-            .iter()
-            .map(|_| OnceLock::new())
-            .collect::<Vec<OnceLock<Result<Batch>>>>();
-        let contended = || crate::cpu::threads::compute_contended(CONTENTION_WINDOW);
-        let mut next_group = 0;
-        while next_group < groups.len() {
-            if threads < 2 || contended() {
-                let _ = results[next_group].set(run(&groups[next_group]));
-                next_group += 1;
-                continue;
-            }
-            let next = AtomicUsize::new(next_group);
-            crate::cpu::threads::par_for(threads, threads, 1, |_, _| {
-                while !contended() {
-                    let k = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(group) = groups.get(k) else { break };
-                    let _ = results[k].set(run(group));
-                }
-            });
-            // Every group taken below the end has run.
-            next_group = next.into_inner().min(groups.len());
-        }
+        let run = |group: &Group| self.run_group(group, &order, &widths, &values);
+        let results = self.run_groups(&groups, &run);
         let mut decoded = try_vec::<Option<DecodedLine>>(quads.len())?;
         let mut timings = RecTimings {
             crop_ms,
@@ -718,6 +619,154 @@ impl Recognizer {
             .ok_or_else(|| Error::internal("missing recognized line"))?;
         Ok((lines, timings))
     }
+
+    /// Each of `quads` warped and resized to a 48-pixel line, in `quads`
+    /// order.
+    fn crops(&self, image: &ImageView<'_>, quads: &[Quad]) -> Result<Vec<RecCrop>> {
+        let rec = &self.options;
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(quads.len()).map_err(|_| {
+            Error::out_of_memory(
+                quads
+                    .len()
+                    .saturating_mul(std::mem::size_of::<OnceLock<Result<RecCrop>>>()),
+            )
+        })?;
+        slots.resize_with(quads.len(), OnceLock::new);
+        // Each crop is independent. Fixed single-crop tasks preserve all pixel
+        // operation orders and reading order at every thread count.
+        crate::cpu::threads::par_for(self.cpu.threads(), quads.len(), 1, |lo, hi| {
+            for i in lo..hi {
+                let crop = crate::image::recognizer_crop(
+                    image,
+                    quads[i],
+                    rec.min_width,
+                    rec.max_width,
+                    rec.max_pixels,
+                );
+                let _ = slots[i].set(crop);
+            }
+        });
+        let mut crops = Vec::new();
+        crops.try_reserve_exact(quads.len()).map_err(|_| {
+            Error::out_of_memory(quads.len().saturating_mul(std::mem::size_of::<RecCrop>()))
+        })?;
+        for slot in slots {
+            crops.push(
+                slot.into_inner()
+                    .ok_or_else(|| Error::internal("missing OCR crop task"))??,
+            );
+        }
+        Ok(crops)
+    }
+
+    /// One width group packed into a batch and recognized. `order` maps
+    /// the group's positions to crops; each crop's pixels are taken from
+    /// `values`.
+    fn run_group(
+        &self,
+        &(start, end, width): &Group,
+        order: &[usize],
+        widths: &[usize],
+        values: &[Mutex<Vec<f32>>],
+    ) -> Result<Batch> {
+        let batch = end - start;
+        let pack_start = Instant::now();
+        let plane = 48 * width;
+        let mut input = try_vec(checked_size("OCR crop batch", &[batch, 3, plane])?)?;
+        let mut valid = Vec::with_capacity(batch);
+        for (b, &i) in order[start..end].iter().enumerate() {
+            let w = widths[i];
+            valid.push(w);
+            let crop =
+                std::mem::take(&mut *values[i].lock().map_err(|_| Error::poisoned("OCR crop"))?);
+            for c in 0..3 {
+                for y in 0..48 {
+                    input[(b * 3 + c) * plane + y * width..(b * 3 + c) * plane + y * width + w]
+                        .copy_from_slice(&crop[(c * 48 + y) * w..(c * 48 + y + 1) * w]);
+                }
+            }
+        }
+        let forward_start = Instant::now();
+        let pack_ms = ms_since(pack_start);
+        let lines = self.recognize_padded(&[batch, 3, 48, width], &input, &valid)?;
+        Ok(Batch {
+            lines,
+            pack_ms,
+            forward_ms: ms_since(forward_start),
+        })
+    }
+
+    /// Every group through `run`, one result per group in `groups` order.
+    ///
+    /// Groups run one per worker, each worker taking the next group when it
+    /// finishes: small batches barely scale across threads, so running
+    /// several side by side uses the cores they leave idle. Each batch's
+    /// arithmetic is unchanged; only its threading differs. The workers hold
+    /// the compute lock throughout, so once another model in the process
+    /// waits for it they stop taking groups, and the rest run one at a time
+    /// across every thread, interleaving with that model's calls as before,
+    /// until it has gone quiet.
+    fn run_groups(
+        &self,
+        groups: &[Group],
+        run: &(impl Fn(&Group) -> Result<Batch> + Sync),
+    ) -> Vec<OnceLock<Result<Batch>>> {
+        let threads = self.cpu.threads();
+        let results = groups
+            .iter()
+            .map(|_| OnceLock::new())
+            .collect::<Vec<OnceLock<Result<Batch>>>>();
+        let contended = || crate::cpu::threads::compute_contended(CONTENTION_WINDOW);
+        let mut next_group = 0;
+        while next_group < groups.len() {
+            if threads < 2 || contended() {
+                let _ = results[next_group].set(run(&groups[next_group]));
+                next_group += 1;
+                continue;
+            }
+            let next = AtomicUsize::new(next_group);
+            crate::cpu::threads::par_for(threads, threads, 1, |_, _| {
+                while !contended() {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(group) = groups.get(k) else { break };
+                    let _ = results[k].set(run(group));
+                }
+            });
+            // Every group taken below the end has run.
+            next_group = next.into_inner().min(groups.len());
+        }
+        results
+    }
+}
+
+/// A width group: `[start, end)` of the width order, and the padded width.
+type Group = (usize, usize, usize);
+
+/// The crops in batching order, widest first, and the width groups over
+/// that order: each at most `max_batch` crops and [`GROUP_COLUMNS`]
+/// columns.
+fn width_groups(crops: &[RecCrop], rec: &RecOptions) -> (Vec<usize>, Vec<Group>) {
+    let mut order = (0..crops.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&i| {
+        std::cmp::Reverse(batch_width(crops[i].width, rec.batching, rec.max_width))
+    });
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < order.len() {
+        let width = batch_width(crops[order[start]].width, rec.batching, rec.max_width);
+        let mut end = start + 1;
+        let max_batch = rec.max_batch.min(GROUP_COLUMNS / width).max(1);
+        while end < order.len()
+            && end - start < max_batch
+            && batch_width(crops[order[end]].width, rec.batching, rec.max_width) == width
+        {
+            end += 1;
+        }
+        groups.push((start, end, width));
+        start = end;
+    }
+    (order, groups)
 }
 /// Where [`Recognizer::recognize_timed`] spent its time, in milliseconds.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -731,7 +780,9 @@ pub struct RecTimings {
     /// width groups. Groups that run side by side each count their own
     /// time, so the sums can exceed `recognize_ms`.
     pub pack_ms: f64,
+    /// Network, CTC head and greedy decode, summed the same way.
     pub forward_ms: f64,
+    /// Width groups run.
     pub batches: usize,
 }
 struct Batch {
@@ -786,10 +837,13 @@ fn transpose(x: &[f32], batch: usize, c: usize, t: usize, to_nchw: bool) -> Resu
     }
     Ok(y)
 }
+/// The text read from one line.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DecodedLine {
+    /// The characters, in reading order.
     pub text: String,
+    /// The mean probability of the characters kept; 0 for an empty line.
     pub score: f32,
 }
 // Independent lanes break the scalar max/index dependency over 11,947
@@ -854,27 +908,28 @@ pub fn decode(
     let mut ids = try_vec::<usize>(batch * t)?;
     let mut probs = try_vec::<f32>(batch * t)?;
     let ok = AtomicBool::new(true);
-    let (pi, pp) = (ids.as_mut_ptr() as usize, probs.as_mut_ptr() as usize);
-    crate::cpu::kernels::for_ranges(threads, batch * t, ROW_GRAIN.div_ceil(classes), |lo, hi| {
-        // SAFETY: workers receive disjoint row ranges of `ids` and `probs`.
-        let (ids, probs) = unsafe {
-            (
-                crate::cpu::kernels::rows_mut(pi as *mut usize, lo, hi, 1),
-                crate::cpu::kernels::rows_mut(pp as *mut f32, lo, hi, 1),
-            )
-        };
-        for ((r, id), p) in (lo..hi).zip(ids).zip(probs) {
-            let row = &prob.values[r * classes..(r + 1) * classes];
-            if !row.iter().all(|v| v.is_finite() && (0. ..=1.).contains(v)) {
-                ok.store(false, Ordering::Relaxed);
-                return;
+    let grain = ROW_GRAIN.div_ceil(classes);
+    crate::cpu::kernels::for_rows2(
+        threads,
+        grain,
+        &mut ids,
+        1,
+        &mut probs,
+        1,
+        |lo, hi, ids, probs| {
+            for ((r, id), p) in (lo..hi).zip(ids).zip(probs) {
+                let row = &prob.values[r * classes..(r + 1) * classes];
+                if !row.iter().all(|v| v.is_finite() && (0. ..=1.).contains(v)) {
+                    ok.store(false, Ordering::Relaxed);
+                    return;
+                }
+                if r % t < length(r / t) {
+                    *id = first_argmax(row);
+                    *p = row[*id];
+                }
             }
-            if r % t < length(r / t) {
-                *id = first_argmax(row);
-                *p = row[*id];
-            }
-        }
-    });
+        },
+    );
     crate::check_shape!(ok.into_inner(), "invalid CTC probability");
     Ok(assemble(
         &ids, &probs, batch, t, classes, dictionary, length,
@@ -954,7 +1009,7 @@ mod tests {
                 (seed >> 8) as f32 / (1 << 24) as f32
             })
             .collect();
-        let mut prob = Tensor::new(vec![batch, t, CTC_CLASSES], values).unwrap();
+        let mut prob = Tensor::try_new(vec![batch, t, CTC_CLASSES], values).unwrap();
         let d = (0..DICTIONARY_ENTRIES)
             .map(|i| char::from_u32(0x4e00 + i as u32).unwrap().to_string())
             .collect::<Vec<_>>();
@@ -986,7 +1041,7 @@ mod tests {
         {
             v[i * 4 + id] = score;
         }
-        let t = Tensor::new(vec![1, 7, 4], v).unwrap();
+        let t = Tensor::try_new(vec![1, 7, 4], v).unwrap();
         let d = vec!["가".into(), "나".into()];
         let got = decode(&t, &d, None, 1).unwrap();
         assert_eq!(got[0].text, "가가나 ");
@@ -994,7 +1049,7 @@ mod tests {
         assert_eq!(decode(&t, &d, Some(&[3]), 2).unwrap()[0].text, "가");
         assert!(decode(&t, &d, Some(&[8]), 1).is_err());
         assert!(decode(&t, &[], None, 1).is_err());
-        let t = Tensor::new(vec![1, 1, 4], vec![0.5, 0.5, 0., 0.]).unwrap();
+        let t = Tensor::try_new(vec![1, 1, 4], vec![0.5, 0.5, 0., 0.]).unwrap();
         assert_eq!(decode(&t, &d, None, 1).unwrap()[0].text, "");
     }
 }

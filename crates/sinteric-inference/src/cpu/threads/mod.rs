@@ -36,7 +36,7 @@ pub struct ThreadBudget {
 }
 
 impl ThreadBudget {
-    pub fn new(nthreads: usize) -> Result<Self> {
+    pub fn try_new(nthreads: usize) -> Result<Self> {
         if nthreads == 0 || nthreads > libc::CPU_SETSIZE as usize {
             return Err(crate::Error::config(
                 "ThreadBudget.nthreads must be in 1..=CPU_SETSIZE",
@@ -152,6 +152,8 @@ fn normalize_sibling_key(s: &str) -> String {
 /// `None` when unknown.
 pub fn allowed_cpus() -> Option<Vec<usize>> {
     #[cfg(target_os = "linux")]
+    // SAFETY: an all-zero `cpu_set_t` is a valid empty set, and
+    // `sched_getaffinity` writes at most its size into it.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         if libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set) != 0 {

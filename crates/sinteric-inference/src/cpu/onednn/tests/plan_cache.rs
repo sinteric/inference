@@ -9,16 +9,13 @@ fn creations(cpu: &OnednnCpu) -> u64 {
 fn full_cache_evicts_least_recently_used_plan() {
     crate::test_support::own_process!(full_cache_evicts_least_recently_used_plan);
     let cpu = OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(1).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(1).unwrap(),
         SessionOptions::default(),
     )
     .unwrap();
     cpu.set_primitive_capacity(2).unwrap();
-    // Kind 3 is GELU (erf), an elementwise plan keyed by its row count.
-    let gelu = |m: usize| {
-        cpu.op_inner(3, m, 8, &vec![-1.; m * 8], None, None, 0.)
-            .unwrap()
-    };
+    // GELU (erf) is an elementwise plan keyed by its row count.
+    let gelu = |m: usize| cpu.gelu_erf(m, 8, &vec![-1.; m * 8]).unwrap();
     gelu(1);
     gelu(2);
     gelu(1);
@@ -52,7 +49,7 @@ fn memory_budget_evicts_plans_without_changing_results() {
     crate::test_support::own_process!(memory_budget_evicts_plans_without_changing_results);
     let load = |memory_budget| {
         OnednnCpu::load_with(
-            &crate::cpu::threads::ThreadBudget::new(1).unwrap(),
+            &crate::cpu::threads::ThreadBudget::try_new(1).unwrap(),
             SessionOptions {
                 memory_budget,
                 ..SessionOptions::default()
@@ -94,7 +91,7 @@ fn memory_budget_evicts_plans_without_changing_results() {
 fn memory_budget_bounds_pooled_buffers() {
     crate::test_support::own_process!(memory_budget_bounds_pooled_buffers);
     let cpu = OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(1).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(1).unwrap(),
         SessionOptions {
             memory_budget: 1 << 20,
             ..SessionOptions::default()

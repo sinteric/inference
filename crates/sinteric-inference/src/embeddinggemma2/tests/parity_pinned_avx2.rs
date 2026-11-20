@@ -38,7 +38,7 @@ fn parity_fp32_pinned_avx2() {
     let Some(dir) = skip_assets() else {
         return;
     };
-    let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+    let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
     let session = SessionOptions {
         max_cpu_isa: CpuIsaCap::Avx2,
         ..SessionOptions::default()

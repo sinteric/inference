@@ -9,17 +9,34 @@ use crate::ppocr::{det_graph, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// How [`Detector`] turns its probability map into boxes. The defaults
+/// are PP-OCR's.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
 pub struct DetOptions {
+    /// A map pixel above this probability is text (default 0.2).
     pub thresh: f32,
+    /// Keep a region whose mean probability is at least this (default
+    /// 0.45).
     pub box_thresh: f32,
+    /// How far each kept rectangle grows outward, as a share of its area
+    /// over its perimeter (default 1.4).
     pub unclip_ratio: f32,
+    /// The most regions examined per page, in discovery order (default
+    /// 1,000).
     pub max_candidates: usize,
+    /// Drop a region whose rectangle's short side is under this many map
+    /// pixels before growing it (default 3).
     pub min_side_pre: f32,
+    /// Drop a box whose short side is under this many map pixels after
+    /// growing it (default 5).
     pub min_side_post: f32,
+    /// Scale a page down so its longer side is at most this many pixels
+    /// before detection; `None` (default) keeps its size. Either way each
+    /// side rounds to a multiple of 32.
     pub max_side: Option<u32>,
+    /// Input shapes whose plans stay cached (default 16).
     pub plan_capacity: usize,
     /// Bound both source and resized pixels before preprocessing allocations.
     pub max_pixels: usize,
@@ -40,6 +57,8 @@ impl Default for DetOptions {
     }
 }
 impl DetOptions {
+    /// [`crate::ErrorKind::Config`] when a threshold is outside `0..=1`, a
+    /// size or count is zero, or a value is not finite.
     pub fn validate(&self) -> Result<()> {
         if !self.thresh.is_finite()
             || !(0. ..=1.).contains(&self.thresh)
@@ -124,8 +143,9 @@ impl Detector {
             cpu,
         })
     }
-    #[doc(hidden)]
-    #[cfg(feature = "debug-dumps")]
+    /// The output of the network's first `count` nodes, for the ignored
+    /// `dump_means` test that compares them with ONNX Runtime's dumps.
+    #[cfg(all(test, feature = "debug-dumps"))]
     pub(crate) fn debug_prefix(
         &self,
         count: usize,
@@ -135,8 +155,9 @@ impl Detector {
         self.validate_shape(&shape)?;
         net::validate(&shape, input.len())?;
         let (s, v) = self.net.prefix(count)?.run(shape, input)?;
-        Tensor::new(s.to_vec(), v)
+        Tensor::try_new(s.to_vec(), v)
     }
+    /// The options it was loaded with.
     pub fn options(&self) -> &DetOptions {
         &self.options
     }
@@ -160,8 +181,8 @@ impl Detector {
                 && shape[1] == 3
                 && shape[2] > 0
                 && shape[3] > 0
-                && shape[2] % 32 == 0
-                && shape[3] % 32 == 0,
+                && shape[2].is_multiple_of(32)
+                && shape[3].is_multiple_of(32),
             "detector requires NCHW BGR with H/W positive multiples of 32"
         );
         self.options.pixels(shape[3], shape[2])?;
@@ -236,7 +257,7 @@ impl OcrNet for Detector {
         );
         // DB head Sigmoid, bit-identical to ONNX Runtime's x86-64 kernel.
         crate::cpu::kernels::logistic_ort_inplace(&mut values, self.threads);
-        Tensor::new(shape.to_vec(), values)
+        Tensor::try_new(shape.to_vec(), values)
     }
 }
 
@@ -257,14 +278,14 @@ pub fn preprocess_threads(
     )?;
     options.pixels(size.width as usize, size.height as usize)?;
     let bytes = crate::image::resize_triangle_bgr_threads(image, size.width, size.height, threads)?;
-    let view = ImageView::new(
+    let view = ImageView::try_new(
         &bytes,
         size.width,
         size.height,
         size.width as usize * 3,
         PixelFormat::Bgr8,
     )?;
-    Tensor::new(
+    Tensor::try_new(
         vec![1, 3, size.height as usize, size.width as usize],
         crate::image::normalize_nchw_threads(
             &view,
@@ -395,7 +416,7 @@ mod tests {
         assert!(postprocess(&[0.; 4], 2, 2, size, &DetOptions::default())
             .unwrap()
             .is_empty());
-        let image = ImageView::new(&[0; 12], 2, 2, 6, PixelFormat::Bgr8).unwrap();
+        let image = ImageView::try_new(&[0; 12], 2, 2, 6, PixelFormat::Bgr8).unwrap();
         assert!(preprocess_threads(
             &image,
             &DetOptions {

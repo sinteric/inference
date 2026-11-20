@@ -55,7 +55,7 @@ fn main() -> Result<()> {
             _ => bail!("usage: unload_rss [--eg2 DIR]"),
         }
     }
-    let rt = Runtime::new(Options::new().with_threads(1))?;
+    let rt = Runtime::try_new(Options::new().with_threads(1))?;
     report("-", "runtime")?;
     for trim in [false, true] {
         if let Some(d) = &eg2_dir {

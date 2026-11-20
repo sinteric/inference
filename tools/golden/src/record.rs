@@ -159,7 +159,7 @@ impl Recorder {
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let rt = Runtime::new(
+    let rt = Runtime::try_new(
         Options::new()
             .with_threads(args.threads)
             .with_isa_cap(args.isa),
@@ -218,9 +218,9 @@ fn embeddinggemma2(
     let gray = inputs::image_pixels(150, 150, 1);
     let second = inputs::audio_samples(16_000);
     let odd = inputs::audio_samples(37_123);
-    let image = eg2::ImageView::new(&tex, 200, 300, 200 * 3, eg2::PixelFormat::Rgb8)?;
-    let wide = eg2::ImageView::new(&tall, 512, 64, 512 * 3, eg2::PixelFormat::Rgb8)?;
-    let mono = eg2::ImageView::new(&gray, 150, 150, 150, eg2::PixelFormat::Gray8)?;
+    let image = eg2::ImageView::try_new(&tex, 200, 300, 200 * 3, eg2::PixelFormat::Rgb8)?;
+    let wide = eg2::ImageView::try_new(&tall, 512, 64, 512 * 3, eg2::PixelFormat::Rgb8)?;
+    let mono = eg2::ImageView::try_new(&gray, 150, 150, 150, eg2::PixelFormat::Gray8)?;
     let media: [(&str, Vec<Vec<eg2::Part<'_>>>); 5] = [
         ("img", vec![vec![eg2::Part::Image(image)]]),
         (
@@ -321,7 +321,7 @@ fn ocr(rt: &Runtime, args: &Args, rec: &mut Recorder) -> Result<()> {
             _ => ppocr::PixelFormat::Rgb8,
         };
         let stride = page.width as usize * page.channels;
-        let view = ppocr::ImageView::new(&page.data, page.width, page.height, stride, format)?;
+        let view = ppocr::ImageView::try_new(&page.data, page.width, page.height, stride, format)?;
         let quads = rec.case(
             "ppocr-det",
             &page.name,

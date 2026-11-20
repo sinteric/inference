@@ -30,7 +30,7 @@ fn parity_pinned_avx512_core_bf16() {
     let Some(dir) = skip_assets() else {
         return;
     };
-    let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+    let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
     let session = SessionOptions {
         max_cpu_isa: CpuIsaCap::Avx512CoreBf16,
         ..SessionOptions::default()

@@ -16,16 +16,22 @@ impl Graph<'_> {
         self.nodes.push(Node::new(op, inputs));
         self.nodes.len()
     }
+    /// A convolution read from `rec.conv{id}`, padded to keep its kernel
+    /// centred.
     fn conv(
         &mut self,
         id: usize,
         src: usize,
-        oc: usize,
-        ic: usize,
-        kernel: [usize; 2],
+        filters: Filters,
         strides: [usize; 2],
-        groups: usize,
     ) -> Result<usize> {
+        let Filters {
+            output: oc,
+            input: ic,
+            kernel,
+            groups,
+            ..
+        } = filters;
         let key = format!("rec.conv{id:03}");
         if self.assets.graph().tensors.get(&format!("{key}.w"))
             != Some(&vec![oc, ic / groups, kernel[0], kernel[1]])
@@ -37,16 +43,8 @@ impl Graph<'_> {
         let raw = self.assets.tensor(&format!("{key}.w"))?;
         let bias = self.assets.tensor(&format!("{key}.b"))?;
         let tiny = matches!(id, 22 | 23 | 26 | 27);
-        let weights = ConvWeights::pack(
-            self.cpu.clone(),
-            oc,
-            ic,
-            kernel,
-            groups,
-            false,
-            &raw,
-            if tiny { Some(&bias) } else { None },
-        )?;
+        let weights =
+            ConvWeights::pack(self.cpu.clone(), filters, &raw, tiny.then_some(&bias[..]))?;
         let pad = kernel.map(|k| k / 2);
         let n = self.push(
             Op::Conv {
@@ -89,9 +87,14 @@ impl Graph<'_> {
     }
     fn se(&mut self, n: usize, id: usize, channels: usize) -> Result<usize> {
         let mean = self.push(Op::SpatialMean(SpatialMean::Sequential), [n]);
-        let a = self.conv(id, mean, channels / 4, channels, [1, 1], [1, 1], 1)?;
+        let a = self.conv(id, mean, Filters::square(channels / 4, channels, 1), [1, 1])?;
         self.act(a, Activation::Relu);
-        let b = self.conv(id + 1, a, channels, channels / 4, [1, 1], [1, 1], 1)?;
+        let b = self.conv(
+            id + 1,
+            a,
+            Filters::square(channels, channels / 4, 1),
+            [1, 1],
+        )?;
         self.act(
             b,
             Activation::HardSigmoid {
@@ -102,7 +105,7 @@ impl Graph<'_> {
         Ok(self.push(Op::Binary(Binary::Mul), [n, b]))
     }
     fn finish(self, capacity: usize) -> Result<ConvNet> {
-        ConvNet::new(self.cpu, self.nodes, capacity).map(ConvNet::with_pointwise_tiles)
+        ConvNet::try_new(self.cpu, self.nodes, capacity).map(ConvNet::with_pointwise_tiles)
     }
 }
 fn graph(cpu: Arc<OnednnCpu>, assets: &Assets) -> Graph<'_> {
@@ -120,8 +123,39 @@ pub(super) struct Segments {
     pub fusion: ConvNet,
 }
 pub(super) fn build(cpu: Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Result<Segments> {
+    let backbone = backbone(cpu.clone(), assets, capacity)?;
     let mut g = graph(cpu.clone(), assets);
-    let mut a = g.conv(0, 0, 16, 3, [3, 3], [2, 2], 1)?;
+    let a = g.conv(33, 0, Filters::new(60, 480, [1, 3]), [1, 1])?;
+    g.act(a, Activation::Swish);
+    let a = g.conv(34, a, Filters::square(120, 60, 1), [1, 1])?;
+    g.act(a, Activation::Swish);
+    let neck_in = g.finish(capacity)?;
+    let mut g = graph(cpu.clone(), assets);
+    let a = g.conv(35, 0, Filters::square(480, 120, 1), [1, 1])?;
+    g.act(a, Activation::Swish);
+    let neck_out = g.finish(capacity)?;
+    let mut g = graph(cpu, assets);
+    let a = g.conv(36, 0, Filters::new(60, 960, [1, 3]), [1, 1])?;
+    g.act(a, Activation::Swish);
+    let a = g.conv(37, a, Filters::square(120, 60, 1), [1, 1])?;
+    g.act(a, Activation::Swish);
+    Ok(Segments {
+        backbone,
+        neck_in,
+        neck_out,
+        fusion: g.finish(capacity)?,
+    })
+}
+
+/// PPLCNetV3: a stride-2 stem, depthwise-separable blocks with learned
+/// activations and two squeeze-excite stages, then a 3x2 average pool.
+fn backbone(cpu: Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Result<ConvNet> {
+    let grouped = |oc, ic, k, groups| Filters {
+        groups,
+        ..Filters::square(oc, ic, k)
+    };
+    let mut g = graph(cpu, assets);
+    let mut a = g.conv(0, 0, Filters::square(16, 3, 3), [2, 2])?;
     // Conv000 contains folded BN/affine weights; Conv001 onward retain
     // explicit trained scalar affines around hard-swish in the pinned export.
     for (id, oc, ic, k, groups, pre, post) in [
@@ -132,7 +166,7 @@ pub(super) fn build(cpu: Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Re
         (5, 64, 64, 3, 64, 211, 213),
         (6, 64, 64, 1, 1, 107, 109),
     ] {
-        a = g.conv(id, a, oc, ic, [k, k], [1, 1], groups)?;
+        a = g.conv(id, a, grouped(oc, ic, k, groups), [1, 1])?;
         g.affine(a, pre, pre + 1)?;
         g.act(a, Activation::HardSwish);
         g.affine(a, post, post + 1)?;
@@ -154,7 +188,7 @@ pub(super) fn build(cpu: Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Re
         (20, 240, 240, 1, [1, 1], 1, 167),
         (21, 240, 240, 5, [2, 1], 240, 173),
     ] {
-        a = g.conv(id, a, oc, ic, [k, k], stride, groups)?;
+        a = g.conv(id, a, grouped(oc, ic, k, groups), stride)?;
         a = g.learned_act(a, first)?;
     }
     a = g.se(a, 22, 240)?;
@@ -162,7 +196,7 @@ pub(super) fn build(cpu: Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Re
         (24, 480, 240, 1, [1, 1], 1, 177),
         (25, 480, 480, 5, [1, 1], 480, 181),
     ] {
-        a = g.conv(id, a, oc, ic, [k, k], stride, groups)?;
+        a = g.conv(id, a, grouped(oc, ic, k, groups), stride)?;
         a = g.learned_act(a, first)?;
     }
     a = g.se(a, 26, 480)?;
@@ -173,7 +207,7 @@ pub(super) fn build(cpu: Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Re
         (31, 5, [1, 1], 480, 199),
         (32, 1, [1, 1], 1, 203),
     ] {
-        a = g.conv(id, a, 480, 480, [k, k], stride, groups)?;
+        a = g.conv(id, a, grouped(480, 480, k, groups), stride)?;
         a = g.learned_act(a, first)?;
     }
     g.push(
@@ -187,26 +221,5 @@ pub(super) fn build(cpu: Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Re
         },
         [a],
     );
-    let backbone = g.finish(capacity)?;
-    let mut g = graph(cpu.clone(), assets);
-    let a = g.conv(33, 0, 60, 480, [1, 3], [1, 1], 1)?;
-    g.act(a, Activation::Swish);
-    let a = g.conv(34, a, 120, 60, [1, 1], [1, 1], 1)?;
-    g.act(a, Activation::Swish);
-    let neck_in = g.finish(capacity)?;
-    let mut g = graph(cpu.clone(), assets);
-    let a = g.conv(35, 0, 480, 120, [1, 1], [1, 1], 1)?;
-    g.act(a, Activation::Swish);
-    let neck_out = g.finish(capacity)?;
-    let mut g = graph(cpu, assets);
-    let a = g.conv(36, 0, 60, 960, [1, 3], [1, 1], 1)?;
-    g.act(a, Activation::Swish);
-    let a = g.conv(37, a, 120, 60, [1, 1], [1, 1], 1)?;
-    g.act(a, Activation::Swish);
-    Ok(Segments {
-        backbone,
-        neck_in,
-        neck_out,
-        fusion: g.finish(capacity)?,
-    })
+    g.finish(capacity)
 }

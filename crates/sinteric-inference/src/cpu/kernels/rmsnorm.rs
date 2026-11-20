@@ -1,9 +1,12 @@
 //! RMSNorm matching EmbeddingGemma 2 / Gemma 4:
 //! `y = x * (mean(x^2) + eps)^(-0.5) [* scale]`, computed in f32.
 //! Scale is optional (`v_norm` has `with_scale=False`).
+//!
+//! Each kernel panics on lengths that do not fit its shape; [`super::checked`]
+//! turns the same checks into errors for callers that hold outside input.
 
 use crate::cpu::kernels::bf16::f32_to_bf16_bits;
-use crate::cpu::kernels::parallel::{for_ranges, rows_mut, rows_ref};
+use crate::cpu::kernels::parallel::{for_ranges, for_rows, for_rows2, RowsMut};
 use crate::cpu::kernels::rope::apply_rope_vec;
 
 /// Single-threaded [`rmsnorm_nthreads`]: the reference the tests compare against.
@@ -20,23 +23,11 @@ pub(crate) fn rmsnorm_nthreads(
     y: &mut [f32],
     nthreads: usize,
 ) {
-    debug_assert_eq!(x.len(), y.len());
-    debug_assert!(hidden > 0 && x.len().is_multiple_of(hidden));
-    if let Some(s) = scale {
-        debug_assert_eq!(s.len(), hidden);
-    }
-    let rows = x.len() / hidden;
+    assert_eq!(x.len(), y.len(), "RMSNorm lengths");
     let inv_n = 1.0 / hidden as f32;
-    let x_p = x.as_ptr() as usize;
-    let y_p = y.as_mut_ptr() as usize;
-    let scale_p = scale.map(|s| s.as_ptr() as usize);
-    for_ranges(nthreads, rows, 8, |lo, hi| {
-        let x = unsafe { rows_ref(x_p as *const f32, lo, hi, hidden) };
-        let y = unsafe { rows_mut(y_p as *mut f32, lo, hi, hidden) };
-        let scale = scale_p.map(|p| unsafe { std::slice::from_raw_parts(p as *const f32, hidden) });
-        for i in 0..(hi - lo) {
-            let row = &x[i * hidden..(i + 1) * hidden];
-            let out = &mut y[i * hidden..(i + 1) * hidden];
+    for_rows(nthreads, 8, y, hidden, |lo, hi, y| {
+        let x = &x[lo * hidden..hi * hidden];
+        for (row, out) in x.chunks_exact(hidden).zip(y.chunks_exact_mut(hidden)) {
             let inv = inv_rms(row, inv_n, eps);
             apply_scale_f32(row, scale, inv, out);
         }
@@ -51,19 +42,9 @@ pub(crate) fn rmsnorm_inplace(
     eps: f32,
     nthreads: usize,
 ) {
-    debug_assert!(hidden > 0 && x.len().is_multiple_of(hidden));
-    if let Some(s) = scale {
-        debug_assert_eq!(s.len(), hidden);
-    }
-    let rows = x.len() / hidden;
     let inv_n = 1.0 / hidden as f32;
-    let x_p = x.as_mut_ptr() as usize;
-    let scale_p = scale.map(|s| s.as_ptr() as usize);
-    for_ranges(nthreads, rows, 8, |lo, hi| {
-        let x = unsafe { rows_mut(x_p as *mut f32, lo, hi, hidden) };
-        let scale = scale_p.map(|p| unsafe { std::slice::from_raw_parts(p as *const f32, hidden) });
-        for i in 0..(hi - lo) {
-            let row = &mut x[i * hidden..(i + 1) * hidden];
+    for_rows(nthreads, 8, x, hidden, |_, _, x| {
+        for row in x.chunks_exact_mut(hidden) {
             let inv = inv_rms(row, inv_n, eps);
             apply_scale_inplace(row, scale, inv);
         }
@@ -71,10 +52,15 @@ pub(crate) fn rmsnorm_inplace(
 }
 
 fn apply_scale_inplace(row: &mut [f32], scale: Option<&[f32]>, inv: f32) {
+    if let Some(s) = scale {
+        assert_eq!(s.len(), row.len(), "RMSNorm scale length");
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx512f") {
         // Keep main's SIMD arithmetic without aliasing a shared input slice
         // with the mutable output slice of an in-place operation.
+        // SAFETY: the CPU has AVX-512F (checked just above) and the scale's
+        // length is checked above.
         unsafe { apply_scale_inplace_avx512(row, scale, inv) };
         return;
     }
@@ -89,6 +75,9 @@ fn apply_scale_inplace(row: &mut [f32], scale: Option<&[f32]>, inv: f32) {
     }
 }
 
+/// # Safety
+/// The CPU must support AVX-512F.
+/// The caller checks that `scale`, if given, is as long as `row`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn apply_scale_inplace_avx512(row: &mut [f32], scale: Option<&[f32]>, inv: f32) {
@@ -135,33 +124,30 @@ pub(crate) fn add_rmsnorm(
     eps: f32,
     nthreads: usize,
 ) {
-    debug_assert_eq!(residual.len(), x.len());
-    debug_assert!(hidden > 0 && x.len().is_multiple_of(hidden));
-    if let Some(s) = rms_scale {
-        debug_assert_eq!(s.len(), hidden);
-    }
-    let rows = x.len() / hidden;
+    assert_eq!(residual.len(), x.len(), "residual lengths");
     let inv_n = 1.0 / hidden as f32;
-    let r_p = residual.as_mut_ptr() as usize;
-    let x_p = x.as_ptr() as usize;
-    let scale_p = rms_scale.map(|s| s.as_ptr() as usize);
-    for_ranges(nthreads, rows, 8, |lo, hi| {
-        let residual = unsafe { rows_mut(r_p as *mut f32, lo, hi, hidden) };
-        let x = unsafe { rows_ref(x_p as *const f32, lo, hi, hidden) };
-        let scale = scale_p.map(|p| unsafe { std::slice::from_raw_parts(p as *const f32, hidden) });
-        for i in 0..(hi - lo) {
-            let row = &x[i * hidden..(i + 1) * hidden];
-            let dst = &mut residual[i * hidden..(i + 1) * hidden];
+    for_rows(nthreads, 8, residual, hidden, |lo, hi, residual| {
+        let x = &x[lo * hidden..hi * hidden];
+        for (row, dst) in x
+            .chunks_exact(hidden)
+            .zip(residual.chunks_exact_mut(hidden))
+        {
             let inv = inv_rms(row, inv_n, eps);
-            apply_scale_add(row, scale, inv, add_scale, dst);
+            apply_scale_add(row, rms_scale, inv, add_scale, dst);
         }
     });
 }
 
 fn apply_scale_add(row: &[f32], scale: Option<&[f32]>, inv: f32, add_scale: f32, dst: &mut [f32]) {
+    assert_eq!(dst.len(), row.len(), "residual row length");
+    if let Some(s) = scale {
+        assert_eq!(s.len(), row.len(), "RMSNorm scale length");
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU has AVX-512F (checked just above) and the
+            // lengths are checked above.
             unsafe {
                 apply_scale_add_avx512(row, scale, inv, add_scale, dst);
             }
@@ -181,6 +167,9 @@ fn apply_scale_add(row: &[f32], scale: Option<&[f32]>, inv: f32, add_scale: f32,
     }
 }
 
+/// # Safety
+/// The CPU must support AVX-512F.
+/// The caller checks that `dst` and `scale`, if given, are as long as `row`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn apply_scale_add_avx512(
@@ -238,44 +227,24 @@ pub(crate) fn rmsnorm_rope_to_bf16(
     rope: Option<(&[f32], &[f32])>,
     nthreads: usize,
 ) {
-    debug_assert_eq!(x.len(), b * nh * s * d);
-    debug_assert_eq!(out.len(), x.len());
-    if let Some(g) = rms_scale {
-        debug_assert_eq!(g.len(), d);
-    }
-    let rows = b * nh * s;
+    assert!(
+        x.len() == b * nh * s * d && out.len() == x.len() && d <= 512,
+        "RMSNorm RoPE shape"
+    );
     let inv_n = 1.0 / d as f32;
-    let x_p = x.as_ptr() as usize;
-    let y_p = out.as_mut_ptr() as usize;
-    let scale_p = rms_scale.map(|s| s.as_ptr() as usize);
-    let (c_p, s_p, rope_len) = match rope {
-        Some((c, si)) => (c.as_ptr() as usize, si.as_ptr() as usize, c.len()),
-        None => (0, 0, 0),
-    };
-    for_ranges(nthreads, rows, 8, |lo, hi| {
-        let x = unsafe { rows_ref(x_p as *const f32, lo, hi, d) };
-        let out = unsafe { rows_mut(y_p as *mut u16, lo, hi, d) };
-        let scale = scale_p.map(|p| unsafe { std::slice::from_raw_parts(p as *const f32, d) });
-        let rope = if rope_len > 0 {
-            let c = unsafe { std::slice::from_raw_parts(c_p as *const f32, rope_len) };
-            let si = unsafe { std::slice::from_raw_parts(s_p as *const f32, rope_len) };
-            Some((c, si))
-        } else {
-            None
-        };
+    for_rows(nthreads, 8, out, d, |lo, hi, out| {
+        let x = &x[lo * d..hi * d];
         let mut tmp = [0f32; 512];
-        debug_assert!(d <= tmp.len());
-        for i in 0..(hi - lo) {
-            let r = lo + i;
+        let rows = x.chunks_exact(d).zip(out.chunks_exact_mut(d));
+        for (r, (row, out)) in (lo..hi).zip(rows) {
             let p = r % s;
-            let row = &x[i * d..(i + 1) * d];
             let dst = &mut tmp[..d];
             let inv = inv_rms(row, inv_n, eps);
-            apply_scale_f32(row, scale, inv, dst);
+            apply_scale_f32(row, rms_scale, inv, dst);
             if let Some((c, si)) = rope {
                 apply_rope_vec(dst, &c[p * d..(p + 1) * d], &si[p * d..(p + 1) * d]);
             }
-            apply_scale_bf16_from_f32(dst, &mut out[i * d..(i + 1) * d]);
+            apply_scale_bf16_from_f32(dst, out);
         }
     });
 }
@@ -300,48 +269,43 @@ pub(crate) fn qkv_split_norm_rope(
     nthreads: usize,
 ) {
     let stride = (nq + 2 * nkv) * d;
-    debug_assert!(fused.len() >= b * s * stride);
-    debug_assert_eq!(q.len(), b * nq * s * d);
-    debug_assert_eq!(k.len(), b * nkv * s * d);
-    debug_assert_eq!(v.len(), k.len());
-    let inv_n = 1.0 / d as f32;
-    let f_p = fused.as_ptr() as usize;
-    let q_p = q.as_mut_ptr() as usize;
-    let k_p = k.as_mut_ptr() as usize;
-    let v_p = v.as_mut_ptr() as usize;
-    let qs_p = q_scale.map(|g| g.as_ptr() as usize);
-    let ks_p = k_scale.map(|g| g.as_ptr() as usize);
-    let (c_p, s_p, rope_len) = (
-        rope.0.as_ptr() as usize,
-        rope.1.as_ptr() as usize,
-        rope.0.len(),
+    assert!(
+        fused.len() >= b * s * stride
+            && q.len() == b * nq * s * d
+            && k.len() == b * nkv * s * d
+            && v.len() == k.len(),
+        "fused QKV shape"
     );
+    let inv_n = 1.0 / d as f32;
+    let (cos, sin) = rope;
+    let (q, k, v) = (RowsMut::new(q, d), RowsMut::new(k, d), RowsMut::new(v, d));
     for_ranges(nthreads, b * s, 4, |lo, hi| {
-        let qs = qs_p.map(|p| unsafe { std::slice::from_raw_parts(p as *const f32, d) });
-        let ks = ks_p.map(|p| unsafe { std::slice::from_raw_parts(p as *const f32, d) });
-        let cos = unsafe { std::slice::from_raw_parts(c_p as *const f32, rope_len) };
-        let sin = unsafe { std::slice::from_raw_parts(s_p as *const f32, rope_len) };
         for idx in lo..hi {
             let bi = idx / s;
             let p = idx % s;
-            let src = unsafe { rows_ref(f_p as *const f32, idx, idx + 1, stride) };
+            let src = &fused[idx * stride..(idx + 1) * stride];
             let c = &cos[p * d..(p + 1) * d];
             let si = &sin[p * d..(p + 1) * d];
+            // Token `idx` is `(bi, p)` and writes row `(bi * heads + h) * s +
+            // p` of each output, one per head: distinct tokens and heads give
+            // distinct rows, and `for_ranges` hands each token to one call.
             for h in 0..nq {
                 let row = &src[h * d..(h + 1) * d];
-                let r = (bi * nq + h) * s + p;
-                let dst = unsafe { rows_mut(q_p as *mut f32, r, r + 1, d) };
-                apply_scale_f32(row, qs, inv_rms(row, inv_n, eps), dst);
+                // SAFETY: this token's own row of Q for head `h` (above).
+                let dst = unsafe { q.row((bi * nq + h) * s + p) };
+                apply_scale_f32(row, q_scale, inv_rms(row, inv_n, eps), dst);
                 apply_rope_vec(dst, c, si);
             }
             for h in 0..nkv {
                 let r = (bi * nkv + h) * s + p;
                 let row = &src[(nq + h) * d..(nq + h + 1) * d];
-                let dst = unsafe { rows_mut(k_p as *mut f32, r, r + 1, d) };
-                apply_scale_f32(row, ks, inv_rms(row, inv_n, eps), dst);
+                // SAFETY: this token's own row of K for head `h` (above).
+                let dst = unsafe { k.row(r) };
+                apply_scale_f32(row, k_scale, inv_rms(row, inv_n, eps), dst);
                 apply_rope_vec(dst, c, si);
                 let row = &src[(nq + nkv + h) * d..(nq + nkv + h + 1) * d];
-                let dst = unsafe { rows_mut(v_p as *mut f32, r, r + 1, d) };
+                // SAFETY: this token's own row of V for head `h` (above).
+                let dst = unsafe { v.row(r) };
                 apply_scale_f32(row, None, inv_rms(row, inv_n, eps), dst);
             }
         }
@@ -362,24 +326,24 @@ pub(crate) fn scaled_rmsnorm_chunks(
     out: &mut [f32],
     nthreads: usize,
 ) {
-    debug_assert!(x.len() >= rows * chunks * width && width <= 512);
-    debug_assert_eq!(out.len(), rows * chunks * width);
+    assert!(
+        x.len() >= rows * chunks * width && out.len() == rows * chunks * width && width <= 512,
+        "chunked RMSNorm shape"
+    );
     let inv_n = 1.0 / width as f32;
-    let x_p = x.as_ptr() as usize;
-    let o_p = out.as_mut_ptr() as usize;
-    let scale_p = scale.map(|g| g.as_ptr() as usize);
+    let out = RowsMut::new(out, width);
     for_ranges(nthreads, rows, 4, |lo, hi| {
-        let scale = scale_p.map(|p| unsafe { std::slice::from_raw_parts(p as *const f32, width) });
         let mut tmp = [0f32; 512];
         let tmp = &mut tmp[..width];
         for r in lo..hi {
-            let src = unsafe { rows_ref(x_p as *const f32, r, r + 1, chunks * width) };
+            let src = &x[r * chunks * width..(r + 1) * chunks * width];
             for c in 0..chunks {
                 for (t, &v) in tmp.iter_mut().zip(&src[c * width..(c + 1) * width]) {
                     *t = v * pre_scale;
                 }
-                let o = c * rows + r;
-                let dst = unsafe { rows_mut(o_p as *mut f32, o, o + 1, width) };
+                // SAFETY: row `c * rows + r` belongs to input row `r` alone,
+                // and `for_ranges` hands each input row to one call.
+                let dst = unsafe { out.row(c * rows + r) };
                 apply_scale_f32(tmp, scale, inv_rms(tmp, inv_n, eps), dst);
             }
         }
@@ -399,31 +363,27 @@ pub(crate) fn add_rmsnorm_then_norm(
     y: &mut [f32],
     nthreads: usize,
 ) {
-    debug_assert_eq!(residual.len(), x.len());
-    debug_assert_eq!(y.len(), x.len());
-    debug_assert!(hidden > 0 && x.len().is_multiple_of(hidden));
-    let rows = x.len() / hidden;
+    assert_eq!(residual.len(), x.len(), "residual lengths");
     let inv_n = 1.0 / hidden as f32;
-    let r_p = residual.as_mut_ptr() as usize;
-    let x_p = x.as_ptr() as usize;
-    let y_p = y.as_mut_ptr() as usize;
-    let scale_p = rms_scale.map(|s| s.as_ptr() as usize);
-    let y_scale_p = y_scale.map(|s| s.as_ptr() as usize);
-    for_ranges(nthreads, rows, 8, |lo, hi| {
-        let residual = unsafe { rows_mut(r_p as *mut f32, lo, hi, hidden) };
-        let x = unsafe { rows_ref(x_p as *const f32, lo, hi, hidden) };
-        let y = unsafe { rows_mut(y_p as *mut f32, lo, hi, hidden) };
-        let scale = scale_p.map(|p| unsafe { std::slice::from_raw_parts(p as *const f32, hidden) });
-        let y_scale =
-            y_scale_p.map(|p| unsafe { std::slice::from_raw_parts(p as *const f32, hidden) });
-        for i in 0..(hi - lo) {
-            let row = &x[i * hidden..(i + 1) * hidden];
-            let dst = &mut residual[i * hidden..(i + 1) * hidden];
-            apply_scale_add(row, scale, inv_rms(row, inv_n, eps), add_scale, dst);
-            let inv = inv_rms(dst, inv_n, eps);
-            apply_scale_f32(dst, y_scale, inv, &mut y[i * hidden..(i + 1) * hidden]);
-        }
-    });
+    for_rows2(
+        nthreads,
+        8,
+        residual,
+        hidden,
+        y,
+        hidden,
+        |lo, hi, residual, y| {
+            let x = &x[lo * hidden..hi * hidden];
+            let rows = x
+                .chunks_exact(hidden)
+                .zip(residual.chunks_exact_mut(hidden));
+            for ((row, dst), y) in rows.zip(y.chunks_exact_mut(hidden)) {
+                apply_scale_add(row, rms_scale, inv_rms(row, inv_n, eps), add_scale, dst);
+                let inv = inv_rms(dst, inv_n, eps);
+                apply_scale_f32(dst, y_scale, inv, y);
+            }
+        },
+    );
 }
 
 fn apply_scale_bf16_from_f32(row: &[f32], out: &mut [u16]) {
@@ -439,23 +399,11 @@ pub(crate) fn rmsnorm_to_bf16(
     y: &mut [u16],
     nthreads: usize,
 ) {
-    debug_assert_eq!(x.len(), y.len());
-    debug_assert!(hidden > 0 && x.len().is_multiple_of(hidden));
-    if let Some(s) = scale {
-        debug_assert_eq!(s.len(), hidden);
-    }
-    let rows = x.len() / hidden;
+    assert_eq!(x.len(), y.len(), "RMSNorm lengths");
     let inv_n = 1.0 / hidden as f32;
-    let x_p = x.as_ptr() as usize;
-    let y_p = y.as_mut_ptr() as usize;
-    let scale_p = scale.map(|s| s.as_ptr() as usize);
-    for_ranges(nthreads, rows, 8, |lo, hi| {
-        let x = unsafe { rows_ref(x_p as *const f32, lo, hi, hidden) };
-        let y = unsafe { rows_mut(y_p as *mut u16, lo, hi, hidden) };
-        let scale = scale_p.map(|p| unsafe { std::slice::from_raw_parts(p as *const f32, hidden) });
-        for i in 0..(hi - lo) {
-            let row = &x[i * hidden..(i + 1) * hidden];
-            let out = &mut y[i * hidden..(i + 1) * hidden];
+    for_rows(nthreads, 8, y, hidden, |lo, hi, y| {
+        let x = &x[lo * hidden..hi * hidden];
+        for (row, out) in x.chunks_exact(hidden).zip(y.chunks_exact_mut(hidden)) {
             let inv = inv_rms(row, inv_n, eps);
             apply_scale_bf16(row, scale, inv, out);
         }
@@ -471,6 +419,7 @@ fn mean_sq(row: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU has AVX-512F (checked just above).
             return unsafe { mean_sq_avx512(row) };
         }
     }
@@ -481,6 +430,8 @@ fn mean_sq(row: &[f32]) -> f32 {
     mean_sq
 }
 
+/// # Safety
+/// The CPU must support AVX-512F.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn mean_sq_avx512(row: &[f32]) -> f32 {
@@ -503,9 +454,15 @@ unsafe fn mean_sq_avx512(row: &[f32]) -> f32 {
 }
 
 fn apply_scale_f32(row: &[f32], scale: Option<&[f32]>, inv: f32, out: &mut [f32]) {
+    assert_eq!(out.len(), row.len(), "RMSNorm output row length");
+    if let Some(s) = scale {
+        assert_eq!(s.len(), row.len(), "RMSNorm scale length");
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU has AVX-512F (checked just above) and the
+            // lengths are checked above.
             unsafe {
                 apply_scale_f32_avx512(row, scale, inv, out);
             }
@@ -523,6 +480,9 @@ fn apply_scale_f32(row: &[f32], scale: Option<&[f32]>, inv: f32, out: &mut [f32]
     }
 }
 
+/// # Safety
+/// The CPU must support AVX-512F.
+/// The caller checks that `out` and `scale`, if given, are as long as `row`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn apply_scale_f32_avx512(row: &[f32], scale: Option<&[f32]>, inv: f32, out: &mut [f32]) {
@@ -558,9 +518,15 @@ unsafe fn apply_scale_f32_avx512(row: &[f32], scale: Option<&[f32]>, inv: f32, o
 }
 
 fn apply_scale_bf16(row: &[f32], scale: Option<&[f32]>, inv: f32, out: &mut [u16]) {
+    assert_eq!(out.len(), row.len(), "RMSNorm output row length");
+    if let Some(s) = scale {
+        assert_eq!(s.len(), row.len(), "RMSNorm scale length");
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bf16") {
+            // SAFETY: the CPU has both features (checked just above) and the
+            // lengths are checked above.
             unsafe {
                 apply_scale_bf16_avx512(row, scale, inv, out);
             }
@@ -578,6 +544,9 @@ fn apply_scale_bf16(row: &[f32], scale: Option<&[f32]>, inv: f32, out: &mut [u16
     }
 }
 
+/// # Safety
+/// The CPU must support AVX-512F and AVX512_BF16.
+/// The caller checks that `out` and `scale`, if given, are as long as `row`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bf16")]
 unsafe fn apply_scale_bf16_avx512(row: &[f32], scale: Option<&[f32]>, inv: f32, out: &mut [u16]) {
@@ -666,7 +635,7 @@ mod tests {
             .collect();
         let qg: Vec<f32> = (0..d).map(|i| 0.9 + i as f32 * 0.01).collect();
         let kg: Vec<f32> = (0..d).map(|i| 1.1 - i as f32 * 0.01).collect();
-        let rope = crate::cpu::kernels::DefaultRope::new(d, s, 10_000.0).unwrap();
+        let rope = crate::cpu::kernels::DefaultRope::try_new(d, s, 10_000.0).unwrap();
         let mut q = vec![0f32; b * nq * s * d];
         let mut k = vec![0f32; b * nkv * s * d];
         let mut v = vec![0f32; k.len()];

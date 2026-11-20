@@ -12,7 +12,7 @@
 //! RMSNorm and `embed_vision` (768 -> 512).
 
 use crate::cpu::kernels::{add_rmsnorm, bf16_bits_to_f32, qkv_split_norm_rope, rmsnorm_nthreads};
-use crate::cpu::onednn::OnednnCpu;
+use crate::cpu::onednn::{Attention, OnednnCpu};
 use crate::{check_shape, Result};
 
 use super::tower::{load_tower, Packer, TowerParts, TowerSource, Views};
@@ -185,8 +185,8 @@ impl VisionTower {
         let n = img.patches();
         check_shape!(
             n > 0
-                && img.pw % POOL == 0
-                && img.ph % POOL == 0
+                && img.pw.is_multiple_of(POOL)
+                && img.ph.is_multiple_of(POOL)
                 && img.pixels.len() == n * PATCH_PIXELS
                 && img.pw.max(img.ph) <= POSITIONS,
             "vision patches {}x{}",
@@ -199,6 +199,54 @@ impl VisionTower {
             "EG2 vision activations",
             &[n, WIDTH * 8 + INTER * 3 + n * HEADS.min(4), 4],
         )?)?;
+        let mut x = self.embed_patches(hw, precision, img)?;
+        let (cos, sin) = self.rope(img);
+        let pass = Pass {
+            hw,
+            precision,
+            tile,
+            n,
+            rope: (&cos, &sin),
+        };
+        let raw = |name: &str, len| self.parts.raw(name, len);
+        let norm = |name: String| raw(&name, WIDTH);
+        let mut h = hw.buffer(x.len())?;
+        for i in 0..LAYERS {
+            let base = layer(i);
+            let input_norm = norm(format!("{base}.input_layernorm.weight"))?;
+            rmsnorm_nthreads(&x, WIDTH, Some(input_norm), RMS_EPS, &mut h, threads)?;
+            let o = self.attention(&pass, &base, &h)?;
+            let post_attn = norm(format!("{base}.post_attention_layernorm.weight"))?;
+            add_rmsnorm(&mut x, &o, WIDTH, Some(post_attn), 1.0, RMS_EPS, threads)?;
+            hw.recycle(o);
+            let pre_ff = norm(format!("{base}.pre_feedforward_layernorm.weight"))?;
+            rmsnorm_nthreads(&x, WIDTH, Some(pre_ff), RMS_EPS, &mut h, threads)?;
+            let up = self.lin(hw, precision, &h, &format!("{base}.mlp.up_proj"))?;
+            let gate = self.parts.linear(&format!("{base}.mlp.gate_proj"))?;
+            let gated = hw.gated_linear_tanh(&h, gate, &up)?;
+            hw.recycle(up);
+            let down = self.lin(hw, precision, &gated, &format!("{base}.mlp.down_proj"))?;
+            hw.recycle(gated);
+            let post_ff = norm(format!("{base}.post_feedforward_layernorm.weight"))?;
+            add_rmsnorm(&mut x, &down, WIDTH, Some(post_ff), 1.0, RMS_EPS, threads)?;
+            hw.recycle(down);
+        }
+        hw.recycle(h);
+        let pooled = pool(&x, img);
+        hw.recycle(x);
+        let mut normed = vec![0f32; pooled.len()];
+        rmsnorm_nthreads(&pooled, WIDTH, None, RMS_EPS, &mut normed, threads)?;
+        self.lin(hw, precision, &normed, "embed_vision.embedding_projection")
+    }
+
+    /// The patches projected to the tower's width, plus each patch's
+    /// learned x and y position rows.
+    fn embed_patches(
+        &self,
+        hw: &OnednnCpu,
+        precision: Precision,
+        img: &ImagePatches,
+    ) -> Result<Vec<f32>> {
         let mut x = self.lin(
             hw,
             precision,
@@ -213,156 +261,106 @@ impl VisionTower {
                 *v += bf16_bits_to_f32(a) + bf16_bits_to_f32(b);
             }
         }
-        let (cos, sin) = self.rope(img);
+        Ok(x)
+    }
+
+    /// Layer `base`'s attention over the normalized rows `h`, through its
+    /// output projection.
+    fn attention(&self, pass: &Pass<'_>, base: &str, h: &[f32]) -> Result<Vec<f32>> {
+        let Pass {
+            hw,
+            precision,
+            tile,
+            n,
+            rope,
+        } = *pass;
         let raw = |name: &str, len| self.parts.raw(name, len);
-        let mut h = hw.buffer(x.len())?;
-        for i in 0..LAYERS {
-            let base = layer(i);
-            rmsnorm_nthreads(
-                &x,
-                WIDTH,
-                Some(raw(&format!("{base}.input_layernorm.weight"), WIDTH)?),
-                RMS_EPS,
-                &mut h,
-                threads,
-            )?;
-            let fused = self.lin(hw, precision, &h, &format!("{base}.self_attn.qkv"))?;
-            let mut q = hw.buffer(n * WIDTH)?;
-            let mut k = hw.buffer(n * WIDTH)?;
-            let mut v = hw.buffer(n * WIDTH)?;
-            qkv_split_norm_rope(
-                &fused,
-                &mut q,
-                &mut k,
-                &mut v,
-                1,
-                n,
-                HEADS,
-                HEADS,
-                HEAD_DIM,
-                Some(raw(&format!("{base}.self_attn.q_norm.weight"), HEAD_DIM)?),
-                Some(raw(&format!("{base}.self_attn.k_norm.weight"), HEAD_DIM)?),
-                RMS_EPS,
-                (&cos, &sin),
-                threads,
-            )?;
-            hw.recycle(fused);
-            let attn = if precision == Precision::Fp32 {
-                hw.attention_gqa_f32(
-                    &q,
-                    &k,
-                    &v,
-                    1,
-                    n,
-                    HEADS,
-                    HEADS,
-                    HEAD_DIM,
-                    tile,
-                    false,
-                    0,
-                    1.0,
-                    &[vec![]],
-                )?
-            } else {
-                hw.attention_gqa(
-                    &q,
-                    &k,
-                    &v,
-                    1,
-                    n,
-                    HEADS,
-                    HEADS,
-                    HEAD_DIM,
-                    tile,
-                    false,
-                    0,
-                    1.0,
-                    &[vec![]],
-                )?
-            };
-            hw.recycle(q);
-            hw.recycle(k);
-            hw.recycle(v);
-            check_shape!(attn.len() >= n * WIDTH, "vision attention rows");
-            let o = self.lin(
-                hw,
-                precision,
-                &attn[..n * WIDTH],
-                &format!("{base}.self_attn.o_proj"),
-            )?;
-            hw.recycle(attn);
-            add_rmsnorm(
-                &mut x,
-                &o,
-                WIDTH,
-                Some(raw(
-                    &format!("{base}.post_attention_layernorm.weight"),
-                    WIDTH,
-                )?),
-                1.0,
-                RMS_EPS,
-                threads,
-            )?;
-            hw.recycle(o);
-            rmsnorm_nthreads(
-                &x,
-                WIDTH,
-                Some(raw(
-                    &format!("{base}.pre_feedforward_layernorm.weight"),
-                    WIDTH,
-                )?),
-                RMS_EPS,
-                &mut h,
-                threads,
-            )?;
-            let up = self.lin(hw, precision, &h, &format!("{base}.mlp.up_proj"))?;
-            let gated = hw.gated_linear_tanh(
-                &h,
-                self.parts.linear(&format!("{base}.mlp.gate_proj"))?,
-                &up,
-            )?;
-            hw.recycle(up);
-            let down = self.lin(hw, precision, &gated, &format!("{base}.mlp.down_proj"))?;
-            hw.recycle(gated);
-            add_rmsnorm(
-                &mut x,
-                &down,
-                WIDTH,
-                Some(raw(
-                    &format!("{base}.post_feedforward_layernorm.weight"),
-                    WIDTH,
-                )?),
-                1.0,
-                RMS_EPS,
-                threads,
-            )?;
-            hw.recycle(down);
-        }
-        hw.recycle(h);
-        // 3x3 average pool (row-major blocks), then `* sqrt(768)` in f32.
-        let (bw, bh) = (img.pw / POOL, img.ph / POOL);
-        let mut pooled = vec![0f32; bw * bh * WIDTH];
-        let ninth = 1.0f32 / (POOL * POOL) as f32;
-        let root = (WIDTH as f64).sqrt() as f32;
-        for (b, out) in pooled.as_chunks_mut::<WIDTH>().0.iter_mut().enumerate() {
-            let (bx, by) = (b % bw, b / bw);
-            for dy in 0..POOL {
-                for dx in 0..POOL {
-                    let k = (by * POOL + dy) * img.pw + bx * POOL + dx;
-                    for (o, &v) in out.iter_mut().zip(&x[k * WIDTH..(k + 1) * WIDTH]) {
-                        *o += v * ninth;
-                    }
+        let fused = self.lin(hw, precision, h, &format!("{base}.self_attn.qkv"))?;
+        let mut q = hw.buffer(n * WIDTH)?;
+        let mut k = hw.buffer(n * WIDTH)?;
+        let mut v = hw.buffer(n * WIDTH)?;
+        qkv_split_norm_rope(
+            &fused,
+            &mut q,
+            &mut k,
+            &mut v,
+            1,
+            n,
+            HEADS,
+            HEADS,
+            HEAD_DIM,
+            Some(raw(&format!("{base}.self_attn.q_norm.weight"), HEAD_DIM)?),
+            Some(raw(&format!("{base}.self_attn.k_norm.weight"), HEAD_DIM)?),
+            RMS_EPS,
+            rope,
+            hw.threads(),
+        )?;
+        hw.recycle(fused);
+        let shape = Attention {
+            batch: 1,
+            seq: n,
+            q_heads: HEADS,
+            kv_heads: HEADS,
+            head_dim: HEAD_DIM,
+            tile,
+            window: None,
+            scale: 1.0,
+            padding: &[vec![]],
+        };
+        let attn = if precision == Precision::Fp32 {
+            hw.attention_gqa_f32(&shape, &q, &k, &v)?
+        } else {
+            hw.attention_gqa(&shape, &q, &k, &v)?
+        };
+        hw.recycle(q);
+        hw.recycle(k);
+        hw.recycle(v);
+        check_shape!(attn.len() >= n * WIDTH, "vision attention rows");
+        let o = self.lin(
+            hw,
+            precision,
+            &attn[..n * WIDTH],
+            &format!("{base}.self_attn.o_proj"),
+        )?;
+        hw.recycle(attn);
+        Ok(o)
+    }
+}
+
+/// What one vision forward runs with.
+#[derive(Clone, Copy)]
+struct Pass<'a> {
+    hw: &'a OnednnCpu,
+    precision: Precision,
+    tile: usize,
+    /// Patches in the image.
+    n: usize,
+    /// The image's rotary cos and sin rows.
+    rope: (&'a [f32], &'a [f32]),
+}
+
+/// 3x3 average pool of the patch rows `x` (row-major blocks), then
+/// `* sqrt(768)` in f32.
+fn pool(x: &[f32], img: &ImagePatches) -> Vec<f32> {
+    let (bw, bh) = (img.pw / POOL, img.ph / POOL);
+    let mut pooled = vec![0f32; bw * bh * WIDTH];
+    let ninth = 1.0f32 / (POOL * POOL) as f32;
+    let root = (WIDTH as f64).sqrt() as f32;
+    for (b, out) in pooled.as_chunks_mut::<WIDTH>().0.iter_mut().enumerate() {
+        let (bx, by) = (b % bw, b / bw);
+        for dy in 0..POOL {
+            for dx in 0..POOL {
+                let k = (by * POOL + dy) * img.pw + bx * POOL + dx;
+                for (o, &v) in out.iter_mut().zip(&x[k * WIDTH..(k + 1) * WIDTH]) {
+                    *o += v * ninth;
                 }
             }
-            for o in out.iter_mut() {
-                *o *= root;
-            }
         }
-        hw.recycle(x);
-        let mut normed = vec![0f32; pooled.len()];
-        rmsnorm_nthreads(&pooled, WIDTH, None, RMS_EPS, &mut normed, threads)?;
-        self.lin(hw, precision, &normed, "embed_vision.embedding_projection")
+        for o in out.iter_mut() {
+            *o *= root;
+        }
     }
+    pooled
 }
 
 #[cfg(test)]

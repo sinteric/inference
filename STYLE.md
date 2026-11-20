@@ -11,9 +11,9 @@ gives a reason for each rule.
 
 Why some rules do not fit: the guide serves google3, Chromium, Android and
 Fuchsia, where Rust ships in operating systems and browsers built with GN or
-Bazel, with `panic = abort`. This is a set of crates built with Cargo and
-linked into other people's programs, with its own pinned thread pool, so the
-rules that follow from that setting are excluded.
+Bazel, with `panic = abort`. This is a library built with Cargo and linked
+into other people's programs, with its own pinned thread pool, so the rules
+that follow from that setting are excluded.
 
 [g]: https://google.github.io/styleguide/rustguide.html
 
@@ -24,27 +24,28 @@ application code ([§api-design-context][adc]). **Every crate under `crates/`
 is library code**: other programs build against `sinteric-inference`
 ([`docs/library.md`](docs/library.md)). **The drivers and harnesses are
 application code**: everything under `bench/` and `tools/` (the drivers
-`eg2-onednn`, `ppocr-onednn` and `ppocr-ort` among them), and examples and
-tests.
+`eg2-onednn`, `ppocr-onednn` and `ppocr-ort` and the `golden` gate among
+them), and examples and tests.
 
 [adc]: https://google.github.io/styleguide/rustguide.html#api-design-context
 
 ## The rules
 
 "Held by" names what catches a break: rustfmt (`python3 scripts/fmt.py
---check`, a CI step), a clippy lint (CI runs clippy with `-D warnings` over the
-packages `.github/workflows/ci.yml` names), or review. ⚠ A rule held by review is held only as well as
-the reviewer remembers it.
+--check`, a CI step), a lint (`[workspace.lints]` in the root `Cargo.toml`,
+which CI runs with `-D warnings` over the packages `.github/workflows/ci.yml`
+names), a script CI runs, or review. ⚠ A rule held by review is held only as
+well as the reviewer remembers it.
 
 | Guide rule | Here | Held by | Why, where it is not "adopted" |
 | --- | --- | --- | --- |
 | [Follow public Rust style rules](https://google.github.io/styleguide/rustguide.html#public-rules) | adopted | rustfmt, clippy, review | |
 | [Apply API design rules in context](https://google.github.io/styleguide/rustguide.html#api-design-context) | adopted | review | Library code is defined above. |
-| [Prefer small crates](https://google.github.io/styleguide/rustguide.html#small-crates) [chrome] | **excluded** | | It exists for Chromium's GN build graph and caching. Our crates follow layers instead: `rt-*` know no model, `onednn-sys` is the FFI, each model is one crate under `models/`, and `sinteric-inference` is the one API a caller links. `models/*` may depend on `rt-*`; `rt-*` never depends on a model. |
+| [Prefer small crates](https://google.github.io/styleguide/rustguide.html#small-crates) [chrome] | **excluded** | | It exists for Chromium's GN build graph and caching. Here a crate is a unit a caller links, and a caller links one: `sinteric-inference`, over `onednn-sys` (the FFI). The layers are modules instead: `cpu` (the runtime, the oneDNN backend, the kernels) knows no model, and each model is a module with a submodule per hardware. Why one crate: the models share the backend's internals, which a crate boundary would have to make public. |
 | [Flat file layout](https://google.github.io/styleguide/rustguide.html#structure) [chrome] | **excluded** | | The guide itself keeps Cargo's layout for code built with Cargo, which all of ours is. |
 | [Name files after the primary item](https://google.github.io/styleguide/rustguide.html#userdefined-item) | adopted | review | Older files move only when they are already being restructured: a sweep would collide with every open branch. |
 | [No APIs in non-leaf modules](https://google.github.io/styleguide/rustguide.html#non-leaf-modules) | adopted | review | Same as the row above. |
-| [No glob imports](https://google.github.io/styleguide/rustguide.html#glob-imports) | **changed** | review | The guide's own exceptions apply (`use super::*` in tests, `use Enum::*` in a function about that enum). Changed for one more: each model module of `sinteric-inference` re-exports its own `api` module whole (`pub use api::*`), because the model module is that API under a stable path and `api` is where its items are named; naming them again would make adding one a change in two files. |
+| [No glob imports](https://google.github.io/styleguide/rustguide.html#glob-imports) | **changed** | review | The guide's own exceptions apply (`use super::*` in tests, `use Enum::*` in a function about that enum). Changed for one more: `onednn-sys` re-exports its bindgen output whole (`pub use bindings::*`), because bindgen names those items, not us. |
 | [One module per `use`](https://google.github.io/styleguide/rustguide.html#use-statement) | adopted | rustfmt `imports_granularity = "Module"` | |
 | [Locally scoped trait imports](https://google.github.io/styleguide/rustguide.html#prefer-local-trait-imports) | adopted | review | |
 | [Module-qualified calls to top-level functions](https://google.github.io/styleguide/rustguide.html#toplevel-functions) | adopted | review | |
@@ -70,7 +71,7 @@ the reviewer remembers it.
 | [Extension traits](https://google.github.io/styleguide/rustguide.html#extension-traits) | adopted | review | |
 | [Guidance for important traits](https://google.github.io/styleguide/rustguide.html#important-traits) | adopted | clippy `new_without_default`, review | |
 | [Pair `From` with a constructor](https://google.github.io/styleguide/rustguide.html#from-impls) | adopted | review | |
-| [Options structs implement `Default`](https://google.github.io/styleguide/rustguide.html#options-should-implement-default) | **changed** | review | A public configuration is an options struct with `Default` (`RuntimeOptions`, each model's `Config`). Changed: clippy's `too_many_arguments` is allowed workspace-wide (root `Cargo.toml`), because a kernel's arguments are its shapes and strides (`m`, `n`, `k`, row strides, a thread budget), each one required, and a struct that bundles them only moves the list one line up. Outside kernels, a function with that many inputs takes an options struct. |
+| [Options structs implement `Default`](https://google.github.io/styleguide/rustguide.html#options-should-implement-default) | adopted | clippy `too_many_arguments`, review | A public configuration is an options struct with `Default` (`cpu::Options`, each model's options), or a `Config` built with `new(model_dir)` where the directory has no default. Inside the library, arguments that travel together are one type (`Filters`, `Spatial` and `Planes` for the convolution and image code), so no function takes more than clippy's seven. |
 | [Handling poison](https://google.github.io/styleguide/rustguide.html#poison) | **changed** | review | A lock that only serializes, or that guards a step that cannot stop halfway (a cache insert), may ignore poison with `PoisonError::into_inner`. A lock over data with invariants either restores them on poison or panics. Why: the guide's concern is reading state a panic left broken, and a lock that panics forever on a healthy value turns one failed call into a dead model. |
 | [No `async`/`.await`](https://google.github.io/styleguide/rustguide.html#async-await-chrome) [chrome] | **excluded** | | Chromium-only. The library has no `async`: inference is CPU-bound and blocks, and an async caller runs it on `spawn_blocking`. |
 | [No `std::thread`](https://google.github.io/styleguide/rustguide.html#std-thread) [chrome] | **excluded** | | Chromium-only: it has its own sequence scheduler. Our threads are the runtime's own pinned pool, which oneDNN runs on. |
@@ -80,10 +81,10 @@ the reviewer remembers it.
 | [Naming lifetimes](https://google.github.io/styleguide/rustguide.html#lifetimes) | adopted | review | |
 | [Naming generic parameters](https://google.github.io/styleguide/rustguide.html#generic-parameters) | adopted | review | |
 | [Naming extension traits](https://google.github.io/styleguide/rustguide.html#naming-extension-traits) | adopted | review | |
-| [Naming initialization functions](https://google.github.io/styleguide/rustguide.html#naming-initialization-functions) | adopted | review | A constructor that returns `Result` is `try_new`. Older ones are renamed when their file is next touched. |
+| [Naming initialization functions](https://google.github.io/styleguide/rustguide.html#naming-initialization-functions) | adopted | review | A constructor that returns `Result` is `try_new` (`Runtime::try_new`, `ImageView::try_new`). |
 | [Avoid abbreviations](https://google.github.io/styleguide/rustguide.html#avoid-abbreviations) | **changed** (one addition) | review | Numerics vocabulary counts as known: the ISA names oneDNN uses (`avx2`, `avx512_core_bf16`, `amx`), `fp32`/`bf16`, `gemm`, `qkv`, `rope`, `geglu`, `ln`/`rms`, `md` (a oneDNN memory descriptor), `isa`, `ort`, and the model short names `eg2` and `ppocr`. |
-| [When and how to write documentation](https://google.github.io/styleguide/rustguide.html#writing-doc) | adopted | review; `missing_docs` once the tree meets it | |
-| [Unsafe code](https://google.github.io/styleguide/rustguide.html#unsafe) | adopted | review | Most `unsafe` here is the oneDNN FFI and SIMD intrinsics. Each block says what it relies on. ⚠ clippy `undocumented_unsafe_blocks` is not on yet: the tree does not meet it. |
+| [When and how to write documentation](https://google.github.io/styleguide/rustguide.html#writing-doc) | adopted | rustc `missing_docs`, `cargo test --doc` and `cargo doc -D warnings` (CI steps), review | Every public item has a doc comment. A doc example is `no_run`, because running one needs model files CI does not have; CI still compiles each, so an example cannot drift from the API, and builds the docs with warnings as errors, so a link to a renamed item fails. ⚠ The lint sees that a doc exists, not that it is true. |
+| [Unsafe code](https://google.github.io/styleguide/rustguide.html#unsafe) | adopted | clippy `undocumented_unsafe_blocks`, review | Most `unsafe` here is the oneDNN FFI and SIMD intrinsics. Each block has a `// SAFETY:` comment that says what it relies on, and each `unsafe fn` a `# Safety` section that says what its caller must hold. ⚠ The lint sees that the comment exists, not that it is right. |
 | [No unstable features](https://google.github.io/styleguide/rustguide.html#unstable-features) | adopted | the stable compiler | Nightly rustfmt is a formatter, not a language feature. |
 | [Getters and setters](https://google.github.io/styleguide/rustguide.html#getters-and-setters) | adopted | review | |
 | [Accessors that accept closures](https://google.github.io/styleguide/rustguide.html#closure-accessors) | adopted | review | |
@@ -91,9 +92,9 @@ the reviewer remembers it.
 | [Don't use others' `#[doc(hidden)]`](https://google.github.io/styleguide/rustguide.html#doc-hidden) | adopted | review | |
 | [`const fn` responsibly](https://google.github.io/styleguide/rustguide.html#const-functions) | adopted | review | |
 | [Operator overloads](https://google.github.io/styleguide/rustguide.html#operator-overloads) | adopted | review | |
-| [`#[non_exhaustive]` on public enums](https://google.github.io/styleguide/rustguide.html#non-exhaustive-enums) | adopted | review | Library code. `Error`, `CpuIsa` and `Precision` are marked. |
-| [`#[non_exhaustive]` on public structs](https://google.github.io/styleguide/rustguide.html#non-exhaustive-structs) | adopted | review | Library code. `RuntimeOptions` and the model configurations are marked, which is why they are built with `new` and builders. |
-| [`#[must_use]` on functions](https://google.github.io/styleguide/rustguide.html#must-use-on-functions) | adopted | review | Library code, in full. |
+| [`#[non_exhaustive]` on public enums](https://google.github.io/styleguide/rustguide.html#non-exhaustive-enums) | adopted | review | Library code: every public enum is marked (`ErrorKind`, `Isa`, each model's `Precision`, `PixelFormat`, `PromptKind` among them). |
+| [`#[non_exhaustive]` on public structs](https://google.github.io/styleguide/rustguide.html#non-exhaustive-structs) | adopted | review | Library code. The options, configs, reports and outputs are marked, which is why configs are built with `new` and builders. `embeddinggemma2::Batch` is not: it is a plain pair of id and mask rows a caller may build. |
+| [`#[must_use]` on functions](https://google.github.io/styleguide/rustguide.html#must-use-on-functions) | adopted | clippy `must_use_candidate`, `return_self_not_must_use` | Library code, in full: every public builder `with_*` and getter is marked. The lints bind the drivers too; the attribute costs them nothing. |
 | [`#[must_use]` on types](https://google.github.io/styleguide/rustguide.html#must-use-on-types) | adopted | review | |
 | [No code before `main`](https://google.github.io/styleguide/rustguide.html#global-initialization) | adopted | review | Process-global state (the oneDNN ISA cap, the thread pool, the AMX probe's result) is set on the first `Runtime::new`, not before `main`. |
 | [Don't overuse type inference](https://google.github.io/styleguide/rustguide.html#type-inference) | adopted | review | |
@@ -102,26 +103,22 @@ the reviewer remembers it.
 | [Don't omit patterns on `non_exhaustive` enums](https://google.github.io/styleguide/rustguide.html#non-exhaustive-enum-matching) | adopted | review | |
 | [Context strings on assertions](https://google.github.io/styleguide/rustguide.html#assertion-context) | adopted | review | |
 | [Combinator chains vs direct iteration](https://google.github.io/styleguide/rustguide.html#combinator-chains) | adopted | clippy `needless_for_each`, review | |
-| [Don't call `catch_unwind`](https://google.github.io/styleguide/rustguide.html#catch-unwind) | **changed** | review | Allowed in tests that assert a panic, and at one boundary: a worker process (`sinteric_inference::worker`) catches a panic in a call and answers it as an error, because a call that never answers leaves its caller waiting forever. Each says why at the call. Why: the guide's ban rests on `panic = abort` in Chrome, Android and Fuchsia, and we cannot choose that for the programs that link this library. |
+| [Don't call `catch_unwind`](https://google.github.io/styleguide/rustguide.html#catch-unwind) | adopted | review | Nothing calls it; a test that expects a panic says so with `#[should_panic]`. |
 | [`format!`/`write!` for concatenation](https://google.github.io/styleguide/rustguide.html#prefer-format-or-write) | adopted | review | |
 | [Per-codebase test framework](https://google.github.io/styleguide/rustguide.html#test-framework) [chrome, fuchsia] | **excluded** | | Those frameworks plug Rust tests into C++ and Fuchsia harnesses. We use `#[test]` under `cargo test`; tests that need weights skip when the files are absent. |
 
-### The workspace's clippy allows
+### Allowing a lint
 
-The root `Cargo.toml` allows a set of clippy lints workspace-wide
-(`[workspace.lints.clippy]`). `too_many_arguments` has its reason in the
-options-struct row above. The others (`needless_range_loop`,
-`excessive_precision`, `manual_range_contains` and the rest of that list) were
-allowed when the qualified numerics code was ported as-is, so that the port
-changed no arithmetic: an index loop over several buffers and a constant
-written to more digits than `f32` holds are how a kernel matches its reference
-bit for bit. They are allowances, not rules: a kernel rewritten later meets
-clippy's default, and a lint leaves the list once the tree meets it.
+The workspace allows no lint. An `#[expect]` (or, where the lint may not fire
+on every build, an `#[allow]`) sits on the one item it covers and gives its
+reason (`#[expect(lint, reason = "...")]`, held by clippy
+`allow_attributes_without_reason`). The bindgen output in `onednn-sys` is the
+one module-wide allow: its names and missing docs are oneDNN's.
 
 ## What the guide leaves open
 
 The guide says how a line of Rust should read. These say what the guide does
-not, and review holds all of them.
+not. Review holds them, and a tool also holds the one that names it.
 
 1. **One thing has one home.** A piece of logic is written once and called from
    wherever it is needed. Why: a fix reaches only the copy its author knew
@@ -130,8 +127,9 @@ not, and review holds all of them.
 2. **A unit fits in one read.** A function does one job in at most 100 lines; a
    file holds one subject in at most 1,000 lines, not counting its tests. Why:
    a reader has lost the top of a long function before reaching its end.
-   ⚠ Some files are past this today (the oneDNN backend's `cpu.rs` and
-   `conv.rs`, and the model graphs); they are split when next restructured.
+   Held by clippy `too_many_lines` (`clippy.toml`; CI runs it outside tests)
+   and `scripts/check_file_sizes.py` (a CI step), which say what they cannot
+   see.
 3. **Nothing is left over.** Code no caller reaches is deleted. Code that
    exists only for a test lives in the test. No code is commented out. Why:
    leftover code is still read, maintained and believed.
@@ -159,7 +157,8 @@ Most of the guide is judgement, and only review holds it: module-qualified
 calls, `enum` over `bool`, options structs, `expect` with a reason, explicit
 types on `.into()` and `.parse()`, combinator chains, `Rc`/`Arc` against
 borrowing, assertion messages, poison handling. An `#[allow]` silences any
-lint, and nothing yet requires it to give a reason. A lint is added to
+lint; the reason it must give is read only by review. A lint is added to
 `[workspace.lints]` only once the tree meets it, because a lint with open sites
 is a red build. CI runs clippy on the whole workspace and on the drivers'
-`ort` feature; the Python under `bench/` and `tools/` is not linted.
+`ort` feature; the Python under `bench/`, `tools/` and `scripts/` is not
+linted.

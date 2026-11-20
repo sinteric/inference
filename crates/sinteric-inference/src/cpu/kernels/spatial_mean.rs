@@ -30,9 +30,8 @@ pub fn spatial_mean(
                     .ok_or(Error::size_overflow("spatial mean"))?,
         "invalid spatial mean extent"
     );
-    let ptr = output.as_mut_ptr() as usize;
-    crate::cpu::kernels::for_ranges(threads, output.len(), 1, |lo, hi| {
-        for c in lo..hi {
+    crate::cpu::kernels::parallel::for_rows(threads, 1, output, 1, |lo, hi, out| {
+        for (c, out) in (lo..hi).zip(out) {
             let row = &input[c * plane..(c + 1) * plane];
             let mut value = match order {
                 SpatialMean::Sequential => {
@@ -45,10 +44,7 @@ pub fn spatial_mean(
                 SpatialMean::EigenAvx => eigen_avx_sum(row, (8 - c * plane % 8) % 8),
             };
             value /= plane as f32;
-            // Boundary validation proves disjoint, in-bounds output rows.
-            unsafe {
-                *(ptr as *mut f32).add(c) = value;
-            }
+            *out = value;
         }
     });
     Ok(())

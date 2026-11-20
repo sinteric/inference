@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 /// CPU seconds this process has used, on every thread.
+#[must_use]
 pub fn cpu_seconds() -> f64 {
     let mut t = libc::timespec {
         tv_sec: 0,
@@ -71,6 +72,7 @@ pub fn peak_rss_kib() -> Result<u64> {
 }
 
 /// `{rss_bytes, peak_rss_bytes}`; a field it cannot read is left out.
+#[must_use]
 pub fn memory() -> Value {
     let mut v = serde_json::Map::new();
     for (field, key) in [("VmRSS:", "rss_bytes"), ("VmHWM:", "peak_rss_bytes")] {
@@ -82,6 +84,7 @@ pub fn memory() -> Value {
 }
 
 /// `value` rounded to `digits` decimals.
+#[must_use]
 pub fn rounded(value: f64, digits: i32) -> f64 {
     let scale = 10f64.powi(digits);
     (value * scale).round() / scale

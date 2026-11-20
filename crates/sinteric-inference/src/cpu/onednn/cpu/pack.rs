@@ -2,7 +2,7 @@
 //! unpacking them for the packed-weight cache. One reorder per `(n, k,
 //! dtype)` layout is built once and shared by every weight of that shape.
 
-use super::{Aligned, ExecWorkspace, MatDt, OnednnCpu, PackedWeight, WeightLayout};
+use super::{Aligned, ExecWorkspace, MatDt, OnednnCpu, Operand, PackedWeight, WeightLayout};
 use crate::cpu::onednn::api::Api;
 use crate::cpu::onednn::cache::{empty_layout_tag, LayoutTag, LAYOUT_TAG_LEN};
 use crate::{check_shape, Result, Result as AResult, ResultContext as Context};
@@ -46,28 +46,31 @@ impl OnednnCpu {
         let a = self.md_strides_dt(&[64, k], &[k, 1], dt.src())?;
         let b = self.md_any_dt(&[k, n], dt.weights())?;
         let c = self.md_strides(&[64, n], &[n, 1])?;
-        let (attr, post) = if dt != MatDt::F32 {
-            self.bf16_attr(false, None)?
-        } else {
-            self.strict_attr(false, None)?
-        };
+        let attr = self.attr(false, None)?;
         let mut pd = ptr::null_mut();
-        let st = unsafe { (self.api.matmul_pd)(&mut pd, self.engine, a, b, ptr::null(), c, attr) };
+        // SAFETY: the three descriptors and the attribute are live (created
+        // above), and oneDNN writes the new handle to a live local.
+        let rc =
+            unsafe { (self.api.matmul_pd)(&mut pd, self.engine, a, b, ptr::null(), c, attr.raw()) };
+        // SAFETY: created above for this probe alone; the primitive
+        // descriptor keeps its own copies.
         unsafe {
-            (self.api.attr_destroy)(attr);
-            if let Some(p) = post {
-                (self.api.post_ops_destroy)(p);
-            }
             (self.api.md_destroy)(a);
             (self.api.md_destroy)(b);
             (self.api.md_destroy)(c);
         }
-        Api::check(st, "weight-format matmul pd")?;
+        Api::check(rc, "weight-format matmul pd")?;
+        // SAFETY: `pd` is the live descriptor built above; the weights
+        // descriptor is its own, alive while it is.
         let queried = unsafe { (self.api.pd_query_md)(pd, dnnl_query_weights_md, 0) };
-        let packed = self.clone_md(queried)?;
-        let bytes = unsafe { (self.api.md_size)(packed) };
+        let packed = self.clone_md(queried);
+        // SAFETY: a copy of the descriptor, alive past `pd`.
+        let bytes = packed
+            .as_ref()
+            .map_or(0, |&md| unsafe { (self.api.md_size)(md) });
+        // SAFETY: nothing uses `pd` after this.
         unsafe { (self.api.pd_destroy)(pd) };
-        Ok((packed, bytes))
+        Ok((packed?, bytes))
     }
 
     fn make_layout(&self, n: usize, k: usize, dt: MatDt) -> AResult<Arc<WeightLayout>> {
@@ -86,24 +89,18 @@ impl OnednnCpu {
         let _ = self.api.apply_threads(self.threads);
         let (packed_md, bytes) = self.select_weight_md(n as i64, k as i64, dt)?;
         let raw_md = self.md_strides_dt(&[k as i64, n as i64], &[1, k as i64], dt.weights())?;
-        let (attr, post) = if dt != MatDt::F32 {
-            self.bf16_attr(false, None)?
-        } else {
-            self.strict_attr(false, None)?
-        };
+        let attr = self.attr(false, None)?;
         let mut pd = ptr::null_mut();
-        let st = unsafe {
-            (self.api.reorder_pd)(&mut pd, raw_md, self.engine, packed_md, self.engine, attr)
+        let engine = self.engine;
+        // SAFETY: both descriptors and the attribute are live, and oneDNN
+        // writes the new handle to a live local.
+        let rc = unsafe {
+            (self.api.reorder_pd)(&mut pd, raw_md, engine, packed_md, engine, attr.raw())
         };
-        unsafe {
-            (self.api.attr_destroy)(attr);
-            if let Some(p) = post {
-                (self.api.post_ops_destroy)(p);
-            }
-        }
-        Api::check(st, "reorder pd")?;
+        Api::check(rc, "reorder pd")?;
         let scratch = self.scratch_size(pd);
         self.check_workspace("operator scratch", &[scratch])?;
+        // SAFETY: `pd` is the live descriptor built above.
         let q = unsafe { (self.api.pd_query_md)(pd, dnnl_query_scratchpad_md, 0) };
         let scratch_md = if q.is_null() {
             self.md_strides(&[16], &[1])?
@@ -111,13 +108,15 @@ impl OnednnCpu {
             self.clone_md(q)?
         };
         let reorder = self.create_prim(pd)?;
+        // SAFETY: the primitive keeps what it needs; nothing uses `pd` after.
         unsafe { (self.api.pd_destroy)(pd) };
         check_shape!(
             bytes > 0 && bytes <= 1024 * 1024 * 1024 && scratch <= 512 * 1024 * 1024,
             "packing allocation size"
         );
+        let api = self.api.clone();
         Ok(Arc::new(WeightLayout {
-            api: self.api.clone(),
+            api,
             packed_md,
             raw_md,
             scratch_md,
@@ -128,98 +127,98 @@ impl OnednnCpu {
     }
 
     fn layout_for(&self, n: usize, k: usize, dt: MatDt) -> AResult<Arc<WeightLayout>> {
-        let s = self
-            .state
-            .lock()
-            .map_err(|_| crate::Error::poisoned("backend"))?;
-        if let Some(l) = s.layouts.get(&(n, k, dt)) {
+        if let Some(l) = self.lock_state()?.layouts.get(&(n, k, dt)) {
             return Ok(l.clone());
         }
-        drop(s);
         let l = self.make_layout(n, k, dt)?;
-        let mut s = self
-            .state
-            .lock()
-            .map_err(|_| crate::Error::poisoned("backend"))?;
-        s.layouts.insert((n, k, dt), l.clone());
+        self.lock_state()?.layouts.insert((n, k, dt), l.clone());
         Ok(l)
     }
 
+    /// Packs a row-major `[n, k]` f32 weight for FP32 math.
     pub fn pack(&self, n: usize, k: usize, src: &[f32]) -> AResult<PackedWeight> {
-        check_shape!(
-            src.len() == n.checked_mul(k).context("weight size")?,
-            "weight shape"
-        );
-        self.reorder_pack(n, k, MatDt::F32, src.as_ptr() as *const u8)
+        self.reorder_pack(n, k, MatDt::F32, Operand::F32(src))
     }
 
+    /// Packs a row-major `[n, k]` BF16 weight for BF16 math.
     pub fn pack_bf16(&self, n: usize, k: usize, src: &[u16]) -> AResult<PackedWeight> {
-        check_shape!(
-            src.len() == n.checked_mul(k).context("weight size")?,
-            "weight shape"
-        );
-        self.reorder_pack(n, k, MatDt::Bf16, src.as_ptr() as *const u8)
+        self.reorder_pack(n, k, MatDt::Bf16, Operand::Bf16(src))
     }
 
     /// Pack BF16 weights for f32 activations: BF16 storage, FP32 math.
     pub fn pack_bf16_f32(&self, n: usize, k: usize, src: &[u16]) -> AResult<PackedWeight> {
+        self.reorder_pack(n, k, MatDt::F32Bf16, Operand::Bf16(src))
+    }
+
+    fn reorder_pack(&self, n: usize, k: usize, dt: MatDt, src: Operand) -> AResult<PackedWeight> {
         check_shape!(
             src.len() == n.checked_mul(k).context("weight size")?,
             "weight shape"
         );
-        self.reorder_pack(n, k, MatDt::F32Bf16, src.as_ptr() as *const u8)
-    }
-
-    fn reorder_pack(&self, n: usize, k: usize, dt: MatDt, src: *const u8) -> AResult<PackedWeight> {
+        check_shape!(
+            matches!(src, Operand::F32(_)) == (dt == MatDt::F32),
+            "{dt:?} weights in the wrong element type"
+        );
         let layout = self.layout_for(n, k, dt)?;
         let mut ws = self
             .exec
-            .acquire(|| ExecWorkspace::new(&self.api, self.engine, self.threadpool()))?;
-        let mut s = self
-            .state
-            .lock()
-            .map_err(|_| crate::Error::poisoned("backend"))?;
-        let data = Aligned::new(layout.bytes)?;
+            .acquire(|| ExecWorkspace::try_new(&self.api, self.engine, self.threadpool()))?;
+        let mut s = self.lock_state()?;
+        let data = Aligned::try_new(layout.bytes)?;
         if ws.scratch.bytes < layout.scratch {
-            ws.scratch = Aligned::new(layout.scratch)?;
+            ws.scratch = Aligned::try_new(layout.scratch)?;
         }
         let _ = self.api.apply_threads(self.threads);
-        let src_mem = self.mem(layout.raw_md)?;
-        let dst_mem = self.mem(layout.packed_md)?;
-        let scratch_mem = self.mem(layout.scratch_md)?;
-        unsafe {
-            Api::check(
-                (self.api.mem_set)(src_mem, src as *mut c_void),
-                "reorder src",
-            )?;
-            Api::check((self.api.mem_set)(dst_mem, data.ptr()), "reorder dst")?;
-            Api::check(
-                (self.api.mem_set)(scratch_mem, ws.scratch.ptr()),
-                "reorder scratch",
-            )?;
-            let args = [
-                dnnl_exec_arg_t {
-                    arg: DNNL_ARG_FROM,
-                    memory: src_mem,
-                },
-                dnnl_exec_arg_t {
-                    arg: DNNL_ARG_TO,
-                    memory: dst_mem,
-                },
-                dnnl_exec_arg_t {
-                    arg: DNNL_ARG_SCRATCHPAD,
-                    memory: scratch_mem,
-                },
-            ];
-            Api::check(
-                (self.api.prim_execute)(layout.reorder, ws.stream, 3, args.as_ptr()),
-                "reorder execute",
-            )?;
-            Api::check((self.api.stream_wait)(ws.stream), "reorder wait")?;
-            (self.api.mem_destroy)(src_mem);
-            (self.api.mem_destroy)(dst_mem);
-            (self.api.mem_destroy)(scratch_mem);
+        let from = match src {
+            Operand::F32(v) => v.as_ptr().cast::<c_void>(),
+            Operand::Bf16(v) => v.as_ptr().cast::<c_void>(),
+        };
+        let bound = [
+            (DNNL_ARG_FROM, layout.raw_md, from.cast_mut()),
+            (DNNL_ARG_TO, layout.packed_md, data.ptr()),
+            (DNNL_ARG_SCRATCHPAD, layout.scratch_md, ws.scratch.ptr()),
+        ];
+        let mut args = Vec::with_capacity(bound.len());
+        let mut rc = Ok(());
+        for (arg, md, handle) in bound {
+            let memory = match self.mem(md) {
+                Ok(memory) => memory,
+                Err(e) => {
+                    rc = Err(e);
+                    break;
+                }
+            };
+            args.push(dnnl_exec_arg_t { arg, memory });
+            // SAFETY: `memory` was created just above for this call alone,
+            // and `handle` holds what `md` describes: the source is `n * k`
+            // elements of `dt`'s weight type (both checked above), `data` is
+            // `layout.bytes`, and the scratch at least `layout.scratch`.
+            rc = Api::check(
+                unsafe { (self.api.mem_set)(memory, handle) },
+                "reorder handle",
+            );
+            if rc.is_err() {
+                break;
+            }
         }
+        if rc.is_ok() {
+            let (n_args, stream) = (args.len() as i32, ws.stream);
+            // SAFETY: the reorder is alive (`layout` holds it), every argument
+            // is bound above, and waiting on the stream before returning keeps
+            // each bound buffer alive for the whole execute.
+            rc = Api::check(
+                unsafe { (self.api.prim_execute)(layout.reorder, stream, n_args, args.as_ptr()) },
+                "reorder execute",
+            )
+            // SAFETY: `stream` is this workspace's live stream.
+            .and_then(|()| Api::check(unsafe { (self.api.stream_wait)(stream) }, "reorder wait"));
+        }
+        for a in &args {
+            // SAFETY: created above for this call alone, and the reorder has
+            // finished with it.
+            unsafe { (self.api.mem_destroy)(a.memory) };
+        }
+        rc?;
         s.weight_bytes += layout.bytes;
         let tag = self.layout_tag_of(layout.packed_md, layout.bytes);
         Ok(PackedWeight {
@@ -232,29 +231,30 @@ impl OnednnCpu {
         })
     }
 
-    fn pack_from_cache_dt(
+    /// A packed weight from the packed-weight cache: `bytes` as
+    /// [`Self::unpack_into`] wrote them, under the layout tag `layout`,
+    /// which must match the layout this CPU picks for `(n, k, dt)`.
+    fn restore_packed(
         &self,
         n: usize,
         k: usize,
-        bytes: &[u8],
         dt: MatDt,
-        expected: Option<&LayoutTag>,
+        bytes: &[u8],
+        layout: &[u8],
     ) -> AResult<PackedWeight> {
+        let mut expected = empty_layout_tag();
+        if layout.len() == LAYOUT_TAG_LEN {
+            expected.copy_from_slice(layout);
+        }
         let layout = self.layout_for(n, k, dt)?;
         let tag = self.layout_tag_of(layout.packed_md, layout.bytes);
-        if let Some(exp) = expected {
-            check_shape!(
-                *exp == tag,
-                "packed layout ISA/format mismatch (cache vs live oneDNN MD)"
-            );
-        }
+        check_shape!(
+            expected == tag,
+            "packed layout ISA/format mismatch (cache vs live oneDNN MD)"
+        );
         check_shape!(bytes.len() == layout.bytes, "cached packed size");
         let data = Aligned::copy_from(bytes)?;
-        let mut s = self
-            .state
-            .lock()
-            .map_err(|_| crate::Error::poisoned("backend"))?;
-        s.weight_bytes += layout.bytes;
+        self.lock_state()?.weight_bytes += layout.bytes;
         Ok(PackedWeight {
             layout,
             data,
@@ -265,6 +265,7 @@ impl OnednnCpu {
         })
     }
 
+    /// [`Self::restore_packed`] of an f32 weight.
     pub(crate) fn restore_packed_checked(
         &self,
         n: usize,
@@ -272,22 +273,10 @@ impl OnednnCpu {
         bytes: &[u8],
         layout: &[u8],
     ) -> Result<PackedWeight> {
-        let mut tag = empty_layout_tag();
-        if layout.len() == LAYOUT_TAG_LEN {
-            tag.copy_from_slice(layout);
-        }
-        self.pack_from_cache_dt(n, k, bytes, MatDt::F32, Some(&tag))
+        self.restore_packed(n, k, MatDt::F32, bytes, layout)
     }
 
-    pub(crate) fn unpack_into(&self, packed: &PackedWeight, dst: &mut [u8]) -> Result<()> {
-        let src = packed.as_bytes();
-        if dst.len() < src.len() {
-            return Err(crate::Error::internal("packed unpack dest"));
-        }
-        dst[..src.len()].copy_from_slice(src);
-        Ok(())
-    }
-
+    /// [`Self::restore_packed`] of a BF16 weight for BF16 math.
     pub(crate) fn restore_packed_bf16_checked(
         &self,
         n: usize,
@@ -295,13 +284,10 @@ impl OnednnCpu {
         bytes: &[u8],
         layout: &[u8],
     ) -> Result<PackedWeight> {
-        let mut tag = empty_layout_tag();
-        if layout.len() == LAYOUT_TAG_LEN {
-            tag.copy_from_slice(layout);
-        }
-        self.pack_from_cache_dt(n, k, bytes, MatDt::Bf16, Some(&tag))
+        self.restore_packed(n, k, MatDt::Bf16, bytes, layout)
     }
 
+    /// [`Self::restore_packed`] of a BF16 weight for FP32 math.
     pub(crate) fn restore_packed_bf16_f32_checked(
         &self,
         n: usize,
@@ -309,10 +295,17 @@ impl OnednnCpu {
         bytes: &[u8],
         layout: &[u8],
     ) -> Result<PackedWeight> {
-        let mut tag = empty_layout_tag();
-        if layout.len() == LAYOUT_TAG_LEN {
-            tag.copy_from_slice(layout);
+        self.restore_packed(n, k, MatDt::F32Bf16, bytes, layout)
+    }
+
+    /// Copies a packed weight's bytes into `dst`, for the packed-weight
+    /// cache.
+    pub(crate) fn unpack_into(&self, packed: &PackedWeight, dst: &mut [u8]) -> Result<()> {
+        let src = packed.as_bytes();
+        if dst.len() < src.len() {
+            return Err(crate::Error::internal("packed unpack dest"));
         }
-        self.pack_from_cache_dt(n, k, bytes, MatDt::F32Bf16, Some(&tag))
+        dst[..src.len()].copy_from_slice(src);
+        Ok(())
     }
 }

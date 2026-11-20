@@ -6,6 +6,7 @@
 //! unguarded; the default runtime falls back from AMX on an affected host).
 
 use crate::cpu::kernels::{f32_slice_to_bf16, f32_slice_to_bf16_nthreads, layout_qkv_rope};
+use crate::cpu::onednn::Attention;
 use crate::cpu::runtime::{IsaCap, Options, Runtime};
 
 fn random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
@@ -65,7 +66,7 @@ fn sweep() {
     {
         options = options.with_isa_cap(name.parse::<IsaCap>().unwrap());
     }
-    let rt = Runtime::new(options).unwrap();
+    let rt = Runtime::try_new(options).unwrap();
     let hw = rt.backend().unwrap();
     if let Some(v) = std::env::var("AMX_REPRO_VERBOSE")
         .ok()
@@ -110,23 +111,18 @@ fn sweep() {
                     )
                     .unwrap();
                     let pad = vec![vec![]];
-                    let y = hw
-                        .attention_gqa(
-                            &q,
-                            &kk,
-                            &vv,
-                            1,
-                            s,
-                            nh,
-                            nh,
-                            d,
-                            256,
-                            mode == "attn_local",
-                            64,
-                            1.0,
-                            &pad,
-                        )
-                        .unwrap();
+                    let shape = Attention {
+                        batch: 1,
+                        seq: s,
+                        q_heads: nh,
+                        kv_heads: nh,
+                        head_dim: d,
+                        tile: 256,
+                        window: (mode == "attn_local").then_some(64),
+                        scale: 1.0,
+                        padding: &pad,
+                    };
+                    let y = hw.attention_gqa(&shape, &q, &kk, &vv).unwrap();
                     let _ = dirty;
                     y[..s * nh * d].to_vec()
                 }

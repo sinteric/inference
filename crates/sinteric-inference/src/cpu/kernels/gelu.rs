@@ -7,12 +7,14 @@ pub fn gelu_erf_scalar(x: f32) -> f32 {
 }
 
 #[inline]
-#[allow(clippy::excessive_precision)]
 fn libm_erf(x: f32) -> f32 {
     // Abramowitz & Stegun 7.1.26, sufficient for FP32 GEMM glue.
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
-    #[allow(clippy::excessive_precision)]
+    #[expect(
+        clippy::excessive_precision,
+        reason = "Abramowitz and Stegun's digits, so they check against the table"
+    )]
     let y = {
         let t = 1.0 / (1.0 + 0.3275911 * x);
         1.0 - (((((1.061405429 * t + -1.453152027) * t) + 1.421413741) * t + -0.284496736) * t
@@ -23,25 +25,31 @@ fn libm_erf(x: f32) -> f32 {
     sign * y
 }
 
+/// `sqrt(2/π)` to the digits PyTorch writes, which round to the f32 it uses.
+#[expect(clippy::excessive_precision, reason = "PyTorch's digits")]
+const SQRT_2_OVER_PI: f32 = 0.797_884_583_473_205_6;
+const COEFF: f32 = 0.044_715;
+
 /// `gelu_pytorch_tanh` / oneDNN `dnnl_eltwise_gelu_tanh`.
 #[inline]
 pub fn gelu_tanh_scalar(x: f32) -> f32 {
-    const SQRT_2_OVER_PI: f32 = 0.797_884_583_473_205_6; // sqrt(2/π)
-    const COEFF: f32 = 0.044_715;
     0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + COEFF * x * x * x)).tanh())
 }
 
 /// `y[i] = gelu_pytorch_tanh(x[i]) * f[i]`.
+///
+/// # Panics
+/// If the three slices differ in length.
 pub(crate) fn gelu_tanh_mul(x: &[f32], f: &[f32], y: &mut [f32]) {
-    debug_assert_eq!(x.len(), f.len());
-    debug_assert_eq!(x.len(), y.len());
-    gelu_tanh_mul_range(x, f, y);
-}
-
-fn gelu_tanh_mul_range(x: &[f32], f: &[f32], y: &mut [f32]) {
+    assert!(
+        x.len() == f.len() && x.len() == y.len(),
+        "GELU gate lengths"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU has AVX-512F (checked just above) and the
+            // lengths are checked above.
             unsafe {
                 gelu_tanh_mul_avx512(x, f, y);
             }
@@ -53,12 +61,12 @@ fn gelu_tanh_mul_range(x: &[f32], f: &[f32], y: &mut [f32]) {
     }
 }
 
+/// # Safety
+/// The CPU must support AVX-512F, and `f` and `y` must be as long as `x`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn gelu_tanh_mul_avx512(x: &[f32], f: &[f32], y: &mut [f32]) {
     use std::arch::x86_64::*;
-    const SQRT_2_OVER_PI: f32 = 0.797_884_583_473_205_6;
-    const COEFF: f32 = 0.044_715;
     let n = x.len();
     let k = _mm512_set1_ps(SQRT_2_OVER_PI);
     let c = _mm512_set1_ps(COEFF);
@@ -82,6 +90,9 @@ unsafe fn gelu_tanh_mul_avx512(x: &[f32], f: &[f32], y: &mut [f32]) {
 }
 
 /// Rational tanh that matches libm closely enough for PLE mixing.
+///
+/// # Safety
+/// The CPU must support AVX-512F.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn tanh_avx512(x: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512 {
@@ -96,42 +107,14 @@ unsafe fn tanh_avx512(x: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512
     _mm512_sub_ps(_mm512_div_ps(two, denom), one)
 }
 
+/// # Safety
+/// The CPU must support AVX-512F.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn crate_exp_neg_two(x: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512 {
     use std::arch::x86_64::*;
     let n2 = _mm512_set1_ps(-2.0);
-    exp_ps(_mm512_mul_ps(n2, x))
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn exp_ps(x: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512 {
-    use std::arch::x86_64::*;
-    let x = _mm512_min_ps(
-        _mm512_max_ps(x, _mm512_set1_ps(-87.336)),
-        _mm512_set1_ps(88.376),
-    );
-    let log2e = _mm512_set1_ps(std::f32::consts::LOG2_E);
-    let n = _mm512_roundscale_ps(
-        _mm512_mul_ps(x, log2e),
-        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
-    );
-    let ln2 = _mm512_set1_ps(std::f32::consts::LN_2);
-    let f = _mm512_fnmadd_ps(n, ln2, x);
-    let c6 = _mm512_set1_ps(1.0 / 720.0);
-    let c5 = _mm512_set1_ps(1.0 / 120.0);
-    let c4 = _mm512_set1_ps(1.0 / 24.0);
-    let c3 = _mm512_set1_ps(1.0 / 6.0);
-    let c2 = _mm512_set1_ps(0.5);
-    let one = _mm512_set1_ps(1.0);
-    let mut p = _mm512_fmadd_ps(c6, f, c5);
-    p = _mm512_fmadd_ps(p, f, c4);
-    p = _mm512_fmadd_ps(p, f, c3);
-    p = _mm512_fmadd_ps(p, f, c2);
-    p = _mm512_fmadd_ps(p, f, one);
-    p = _mm512_fmadd_ps(p, f, one);
-    _mm512_mul_ps(p, _mm512_scalef_ps(one, n))
+    crate::cpu::kernels::softmax::exp_avx512(_mm512_mul_ps(n2, x))
 }
 
 #[cfg(test)]

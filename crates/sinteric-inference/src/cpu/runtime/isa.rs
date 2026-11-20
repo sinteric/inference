@@ -15,20 +15,32 @@ use crate::{Error, Result};
 /// A later ISA holds everything an earlier one in the same family does; ask
 /// what a model needs with [`Isa::has_bf16_matmul`] and [`Isa::has_amx`]
 /// rather than comparing variants. Below AVX2 the library does not run
-/// ([`super::Runtime::new`] refuses it).
+/// ([`super::Runtime::try_new`] refuses it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Isa {
+    /// `AVX2`: 256-bit vectors, the library's floor.
     Avx2,
+    /// `AVX2_VNNI`: AVX2 with int8 dot products.
     Avx2Vnni,
+    /// `AVX2_VNNI_2`: AVX2 VNNI with int8/int16 and BF16/FP16 conversions.
     Avx2Vnni2,
+    /// `AVX512_CORE`: 512-bit vectors.
     Avx512Core,
+    /// `AVX512_CORE_VNNI`: AVX-512 with int8 dot products.
     Avx512CoreVnni,
+    /// `AVX512_CORE_BF16`: AVX-512 with BF16 dot products, the lowest ISA
+    /// with BF16 matmul kernels.
     Avx512CoreBf16,
+    /// `AVX10_1_512`: AVX10.1 at 512 bits, with FP16 arithmetic.
     Avx10_1_512,
+    /// `AVX10_1_512_AMX`: AVX10.1 with AMX BF16 and int8 tiles.
     Avx10_1_512Amx,
+    /// `AVX10_1_512_AMX_FP16`: AMX with FP16 tiles.
     Avx10_1_512AmxFp16,
+    /// `AVX10_2_512`: AVX10.2 at 512 bits.
     Avx10_2_512,
+    /// `AVX10_2_512_AMX_2`: AVX10.2 with the second AMX generation.
     Avx10_2_512Amx2,
 }
 
@@ -69,6 +81,7 @@ impl Isa {
     }
 
     /// oneDNN's name for it (`AVX512_CORE_BF16`, `AVX10_1_512_AMX`, ...).
+    #[must_use]
     pub fn name(self) -> &'static str {
         ISAS.iter()
             .find(|(isa, ..)| *isa == self)
@@ -78,11 +91,13 @@ impl Isa {
     /// Whether oneDNN has BF16 matmul kernels here (AVX512_CORE_BF16 and
     /// every later ISA). Without them a BF16 matmul runs on oneDNN's
     /// reference path, orders of magnitude slower, so no model offers BF16.
+    #[must_use]
     pub fn has_bf16_matmul(self) -> bool {
         self.bits() & BF16_BITS == BF16_BITS
     }
 
     /// Whether oneDNN runs AMX tile kernels here.
+    #[must_use]
     pub fn has_amx(self) -> bool {
         self.bits() & AMX_BITS == AMX_BITS
     }
@@ -157,15 +172,18 @@ pub enum AmxHealth {
     NotProbed,
     /// The process cannot use AMX (no CPU support or no OS permission).
     Unavailable,
-    /// No wrong result. `conclusive` is false when the probe thread was
-    /// preempted too rarely to tell.
-    Healthy { conclusive: bool },
-    /// Tile state was lost: `corrupt` wrong results in `iterations` tile
-    /// GEMMs over `preemptions` preemptions. The runtime runs
-    /// AVX512_CORE_BF16.
+    /// No wrong result.
+    Healthy {
+        /// False when the probe thread was preempted too rarely to tell.
+        conclusive: bool,
+    },
+    /// Tile state was lost. The runtime runs AVX512_CORE_BF16.
     TileStateLoss {
+        /// Tile GEMMs that returned a wrong block.
         corrupt: u64,
+        /// Tile GEMMs the probe ran.
         iterations: u64,
+        /// Times the probe thread was preempted while it ran.
         preemptions: u64,
     },
 }

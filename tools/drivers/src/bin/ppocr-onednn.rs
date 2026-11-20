@@ -49,7 +49,7 @@ fn main() -> Result<()> {
         .get::<String>("--isa")?
         .unwrap_or_else(|| "avx512_core_bf16".into());
     let profile = flags.switch("--profile");
-    let rt = Runtime::new(
+    let rt = Runtime::try_new(
         Options::new()
             .with_threads(flags.required("--threads")?)
             .with_isa_cap(isa.parse::<IsaCap>()?),

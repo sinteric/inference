@@ -28,7 +28,7 @@ fn default_isa_bf16_linear_is_repeatable_under_load() {
     let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads = cpus.clamp(2, 8);
     let cpu = OnednnCpu::load_with(
-        &crate::cpu::threads::ThreadBudget::new(threads).unwrap(),
+        &crate::cpu::threads::ThreadBudget::try_new(threads).unwrap(),
         SessionOptions {
             workspace_limit: 1 << 28,
             ..SessionOptions::default()

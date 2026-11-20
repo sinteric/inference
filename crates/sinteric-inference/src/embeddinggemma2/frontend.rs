@@ -10,6 +10,7 @@ use crate::{check_input, check_shape, Error, ErrorKind, Result};
 /// Which retrieval prompt a text is embedded under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum PromptKind {
     /// `task: search result | query: `.
     Query,
@@ -19,6 +20,7 @@ pub enum PromptKind {
 
 impl PromptKind {
     /// The prompt text put before the input.
+    #[must_use]
     pub fn prefix(self) -> &'static str {
         match self {
             Self::Query => QUERY_PREFIX,
@@ -30,7 +32,9 @@ impl PromptKind {
 /// Token ids and masks for one batch, every row padded to the longest.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Batch {
+    /// One row of token ids per input.
     pub input_ids: Vec<Vec<u32>>,
+    /// 1 for each live token, 0 for padding; the same shape as `input_ids`.
     pub attention_mask: Vec<Vec<u32>>,
 }
 

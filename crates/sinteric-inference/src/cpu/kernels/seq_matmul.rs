@@ -5,7 +5,7 @@
 //! `onednn_attention_matmuls_are_sequential_fma_chains`), so
 //! these replace per-shape oneDNN primitives without changing results.
 
-use crate::cpu::kernels::parallel::{for_ranges, rows_mut};
+use crate::cpu::kernels::parallel::for_rows;
 use crate::{check_shape, try_vec, Result};
 
 /// `out[i][..n] = Σ_k a[i][k] · b[k][..n]`, one FMA chain per output.
@@ -25,6 +25,8 @@ fn rows_portable(a: &[f32], b: &[f32], k: usize, n: usize, out: &mut [f32]) {
     }
 }
 
+/// # Safety
+/// The CPU must support AVX2 and FMA.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn rows_fma(a: &[f32], b: &[f32], k: usize, n: usize, out: &mut [f32]) {
@@ -38,6 +40,7 @@ fn rows(a: &[f32], b: &[f32], k: usize, n: usize, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: the CPU has both features (checked just above).
             return unsafe { rows_fma(a, b, k, n, out) };
         }
     }
@@ -56,11 +59,11 @@ fn run<'a>(
     nthreads: usize,
 ) -> Result<Vec<f32>> {
     let mut out = try_vec(g * m * n)?;
-    let p = out.as_mut_ptr() as usize;
-    let grain = (1usize << 14).div_ceil(k * n).max(1);
-    for_ranges(nthreads, g * m, grain, |lo, hi| {
-        // SAFETY: workers receive disjoint row ranges of `out`.
-        let out = unsafe { rows_mut(p as *mut f32, lo, hi, n) };
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let grain = (1usize << 14).div_ceil((k * n).max(1)).max(1);
+    for_rows(nthreads, grain, &mut out, n, |lo, hi, out| {
         let mut r = lo;
         while r < hi {
             let group = r / m;

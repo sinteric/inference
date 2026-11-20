@@ -2,7 +2,10 @@
 //! glue, norms, RoPE, softmax windows, BF16 conversion and the helpers that
 //! split work across the pool. `checked` wraps them with shape checks.
 
-#![allow(clippy::too_many_arguments)]
+#![expect(
+    clippy::too_many_arguments,
+    reason = "a kernel's arguments are its shapes and strides, each one required (STYLE.md)"
+)]
 
 mod bf16;
 mod checked;
@@ -25,7 +28,7 @@ pub use gelu::gelu_erf_scalar;
 #[cfg(test)]
 pub use gelu::gelu_tanh_scalar;
 pub use logistic::logistic_ort_inplace;
-pub use parallel::{for_ranges, for_row_tiles, row_mut, row_ref, rows_mut, rows_ref};
+pub use parallel::{for_ranges, for_row_tiles, for_rows, for_rows2, RowsMut};
 #[cfg(test)]
 pub use ref_gemm::sgemm_ref;
 pub use rope::DefaultRope;
@@ -39,13 +42,7 @@ pub use checked::{
     scaled_rmsnorm_chunks, softmax_rows_nthreads,
 };
 
-/// GELU gate for callers that validated the enclosing tensor once.
-///
-/// # Safety
-/// `x`, `gate`, and `out` must have identical lengths.
-pub unsafe fn gelu_tanh_mul_unchecked(x: &[f32], gate: &[f32], out: &mut [f32]) {
-    gelu::gelu_tanh_mul(x, gate, out);
-}
+pub(crate) use gelu::gelu_tanh_mul;
 
 pub use checked::f32_slice_to_bf16;
 

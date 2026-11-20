@@ -120,7 +120,7 @@ fn load_skips_when_weights_or_onednn_absent() {
         assert_eq!(m.repo, "google/embeddinggemma-2");
         return;
     };
-    let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+    let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
     let backend = crate::cpu::onednn::OnednnCpu::load(&budget).expect("libdnnl");
     Model::load(&dir, backend, 64).expect("weights present; oneDNN load");
 }
@@ -131,7 +131,7 @@ fn parity_vs_pytorch_fixtures() {
     let Some(dir) = skip_assets() else {
         return;
     };
-    let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+    let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
     let backend = crate::cpu::onednn::OnednnCpu::load(&budget).expect("libdnnl");
     let model = Model::load(&dir, backend, 64).expect("load");
     let fe = Tokenizer::load(&dir).expect("tokenizer");
@@ -145,7 +145,7 @@ fn parity_fp32_vs_pytorch_fixtures() {
     let Some(dir) = skip_assets() else {
         return;
     };
-    let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+    let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
     let backend = crate::cpu::onednn::OnednnCpu::load(&budget).expect("libdnnl");
     let model =
         Model::load_with_precision(&dir, backend, 64, &CacheOptions::default(), Precision::Fp32)
@@ -160,7 +160,7 @@ fn parity_amx_path_when_supported() {
     let Some(dir) = skip_assets() else {
         return;
     };
-    let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+    let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
     let backend = crate::cpu::onednn::OnednnCpu::load(&budget).expect("libdnnl");
     if !isa_has_amx(backend.cpu_isa()) {
         eprintln!(
@@ -195,7 +195,7 @@ fn packed_cache_foreign_isa_miss() {
         ..CacheOptions::default()
     };
     {
-        let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+        let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
         let backend = crate::cpu::onednn::OnednnCpu::load(&budget).expect("libdnnl");
         let live = backend.cpu_isa();
         let model = Model::load_with(&dir, backend, 64, &cache).expect("empty-cache load");
@@ -215,7 +215,7 @@ fn packed_cache_foreign_isa_miss() {
     bytes[isa_off..isa_off + 8].copy_from_slice(&foreign.to_le_bytes());
     std::fs::write(&tmp, &bytes).unwrap();
     {
-        let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+        let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
         let backend = crate::cpu::onednn::OnednnCpu::load(&budget).expect("libdnnl");
         let isa = backend.cpu_isa();
         let model = Model::load_with(&dir, backend, 64, &cache).expect("foreign-ISA miss rebuilds");
@@ -246,7 +246,7 @@ fn mixed_and_ragged(precision: Precision) {
     let Some(dir) = skip_assets() else {
         return;
     };
-    let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
+    let budget = crate::cpu::threads::ThreadBudget::try_new(1).unwrap();
     let backend = crate::cpu::onednn::OnednnCpu::load(&budget).expect("libdnnl");
     let model = Model::load_with_precision(&dir, backend, 64, &CacheOptions::default(), precision)
         .expect("load");
@@ -309,7 +309,7 @@ fn ident_embed_seqs(
     pinned: bool,
     precision: Precision,
 ) -> Vec<(String, Vec<f32>)> {
-    let budget = crate::cpu::threads::ThreadBudget::new(threads).unwrap();
+    let budget = crate::cpu::threads::ThreadBudget::try_new(threads).unwrap();
     let session = crate::cpu::onednn::SessionOptions {
         max_cpu_isa: if pinned {
             crate::cpu::onednn::CpuIsaCap::Avx512CoreBf16
@@ -420,10 +420,12 @@ fn embeddings_match_across_thread_counts() {
                 continue;
             }
         }
-        let mut references: Vec<(usize, Vec<(String, Vec<f32>)>)> = Vec::new();
+        // Per thread count, each input's embedding: (threads, [(input, values)]).
+        type Vectors = Vec<(String, Vec<f32>)>;
+        let mut references: Vec<(usize, Vectors)> = Vec::new();
         let mut min_cross = 1.0f32;
         for t in [1usize, 2, 4, 8] {
-            if crate::cpu::threads::ThreadBudget::new(t).is_err() {
+            if crate::cpu::threads::ThreadBudget::try_new(t).is_err() {
                 eprintln!("skip t={t}: not enough physical cores");
                 continue;
             }

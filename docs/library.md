@@ -33,7 +33,7 @@ sinteric-inference = { git = "https://github.com/sinteric/inference", rev = "<sh
 use sinteric_inference::{cpu, embeddinggemma2 as eg2, guard};
 
 let opts: cpu::Options = serde_json::from_str(&std::fs::read_to_string("runtime.json")?)?;
-let rt = cpu::Runtime::new(opts)?;
+let rt = cpu::Runtime::try_new(opts)?;
 
 let embedder = eg2::cpu::EmbeddingGemma2::load(&rt, eg2::cpu::Config::new("/models/embeddinggemma2"))?;
 let embeddings = embedder.embed(["query text"], eg2::PromptKind::Query)?;
@@ -52,7 +52,7 @@ their public fields, and map your application's settings onto them.
 
 Required:
 
-- one `cpu::Runtime` per process (`Runtime::new`);
+- one `cpu::Runtime` per process (`Runtime::try_new`);
 - `model_dir` in each model's `Config`: its weights and tokenizer.
 
 There is no `library` path: oneDNN 3.13.4 is linked statically at build time.
@@ -83,11 +83,11 @@ cargo build -p sinteric-inference
 
 ## The CPU runtime
 
-`cpu::Runtime::new(cpu::Options)` starts the pinned pool, sets oneDNN's ISA
+`cpu::Runtime::try_new(cpu::Options)` starts the pinned pool, sets oneDNN's ISA
 cap and reports what it runs on: `rt.isa()` (a `cpu::Isa`, oneDNN's name for
 it with `Display`, and `has_bf16_matmul()` / `has_amx()` for what a model
 needs), `rt.amx_health()`, `rt.threads()` and `rt.cpus()`. Below AVX2 the
-library does not run, and `Runtime::new` fails with `ErrorKind::Unsupported`.
+library does not run, and `Runtime::try_new` fails with `ErrorKind::Unsupported`.
 
 | `cpu::Options` field | Default | Notes |
 |---|---|---|
@@ -111,7 +111,7 @@ ISA is applied with `dnnl_set_max_cpu_isa` before any other oneDNN API
 a thread that is preempted mid-GEMM; the thread resumes with zeroed tiles and
 an AMX matmul returns an occasional wrong 32x32 block (nondeterministic, only
 with more runnable threads than free vCPUs, never with the AVX-512 kernels).
-Under `isa_cap: best`, `Runtime::new` first runs a ~40 ms check (cached for
+Under `isa_cap: best`, `Runtime::try_new` first runs a ~40 ms check (cached for
 the process): a tile GEMM that a second thread keeps preempting on one CPU.
 If any result is wrong, the runtime runs `AVX512_CORE_BF16` instead of AMX,
 and `rt.amx_health()` says so (`AmxHealth::TileStateLoss` with the counts).
@@ -160,7 +160,7 @@ constant.
 
 ## Public API
 
-- `cpu::Runtime::new(cpu::Options)` → the process's CPU runtime. It knows no
+- `cpu::Runtime::try_new(cpu::Options)` → the process's CPU runtime. It knows no
   model. `Error`, `ErrorKind` and `Result` are at the crate root.
 - `embeddinggemma2::cpu::EmbeddingGemma2::load(&rt, Config)` → `Send + Sync`.
   Share with `Arc`.
@@ -196,7 +196,7 @@ tokens, no prompt prefix unless one is passed):
 use sinteric_inference::embeddinggemma2::{self as eg2, ImageView, Part, PixelFormat};
 
 let model = eg2::cpu::EmbeddingGemma2::load(&rt, eg2::cpu::Config::new(dir).with_image(true).with_audio(true))?;
-let image = ImageView::new(&rgb, width, height, width * 3, PixelFormat::Rgb8)?;
+let image = ImageView::try_new(&rgb, width, height, width * 3, PixelFormat::Rgb8)?;
 let clip: &[f32] = &mono_16khz; // mono, 16 kHz, at most 30 s
 let out = model.embed_parts(&[&[Part::Text("a photo of "), Part::Image(image)], &[Part::Audio(clip)]], None)?;
 ```
@@ -276,7 +276,7 @@ README with the full results is in git history under `bench/serve-sim`:
   activation pool (capped by `workspace_limit_bytes`), OCR's convolution
   arena (its last page's size) and cached plans, bounded by count unless
   a [memory budget](#memory-budget) bounds the total in bytes. OCR plans
-  per line width (`RecConfig.plan_capacity`, 512) and its plans hold about
+  per line width (`RecOptions::plan_capacity`, 512) and its plans hold about
   435 MiB on the 100-page gate set. And freed heap that glibc keeps in
   per-thread arenas, which grows with the number of threads calling in;
   `MALLOC_ARENA_MAX=2` in the process environment bounds it at no
@@ -342,12 +342,12 @@ cap are process-global and stay; a later load reuses them.
 
 ## Process-global vs per-model
 
-`Runtime::new` installs the ISA cap and the pinned thread pool (GEMMs +
+`Runtime::try_new` installs the ISA cap and the pinned thread pool (GEMMs +
 glue), and reads core topology (sysfs) for the default thread width. Two
 models loaded from the same `Runtime` run at the same ISA and threads. Each
 model has its own engine, execute-slot pool, and weights.
 
-A second `Runtime::new` with a different `threads`, `cpuset` or `isa_cap`
+A second `Runtime::try_new` with a different `threads`, `cpuset` or `isa_cap`
 fails with `ErrorKind::Config`. Matching options are idempotent.
 
 A model can run on fewer pool threads than `Options::threads`:
@@ -463,122 +463,19 @@ plans of every padded width at load instead.
 
 ## OCR
 
-`ppocr` loads each model from its own directory: validated graph
-descriptions, mmap-backed FP32 tensors and, for the recognizer, the Korean
-dictionary. Graph and dictionary files are
-always checked against hashes compiled from `assets/ppocr.toml`; optional
-`verify_weights` hashes tensor payloads too. Safetensors names, byte extents,
-dtypes and shapes are checked regardless of that option. Source files must
-remain immutable while mapped. Paths are explicit; libraries read no env.
-See [the importer instructions](../tools/ppocr-import/README.md) for provisioning.
+`ppocr::cpu` holds three models, each loaded from its own directory of an
+imported root (`det/`, `rec/`, `uvdoc/`): the PP-OCRv6 tiny `Detector`, the
+Korean PP-OCRv5 mobile `Recognizer`, and the UVDoc `Unwarper`. They run FP32
+only, the precision they are qualified at, so no config has a precision.
+[The importer instructions](../tools/ppocr-import/README.md) say how to
+provision the directories.
 
-The models run on the library's internal convolution graph: FP32
-convolution/depthwise/deconvolution, pooling, resampling, spatial means,
-concat, PReLU, reorders and activation/binary post-ops, on the model's
-backend with the runtime's pinned pool, ISA and strict FP32 policy.
-Weights use explicit tags fixed by channels/ISA, independent of H/W. Graph
-inputs/outputs are NCHW; internal activations use channel blocks of the ISA's
-vector width, nChw16c with AVX-512 and nChw8c below it, with explicit plain
-reorders where required by optimized small-channel conv, nonzero-preserving
-eltwise, reduction and PReLU implementations. The block follows the ISA
-because oneDNN's AVX2 convolutions take only 8-channel blocks: given 16, every
-convolution fell to the reference kernel (measured 2026-11-01 on a 32-channel
-5x5: 19 MMAC/s against 74 GMAC/s for the AVX-512 kernel). oneDNN names no
-8-channel deconvolution weight layout, so below AVX-512 a deconvolution is
-`Unsupported`; the detector's upsampling is a convolution and depth-to-space
-and is unaffected. A convolution whose padding is wider than the jit kernel's
-register block also falls to the reference kernel (oneDNN 3.13.4 requires
-left padding no wider than that block, which shrinks with the ISA's vector
-width). When the plan sees that, it zero-pads the input itself and runs the
-convolution unpadded, the same sums on a jit kernel: UVDoc's widest bridge
-convolutions need this on every ISA, its dilated 5x5s only on AVX2. The probe
-asks oneDNN without the node's post-ops, so a convolution that its post-ops
-alone send to the reference kernel is padded for nothing and stays there.
+Each load checks the graph and dictionary files against hashes compiled from
+`assets/ppocr.toml`, and every tensor's name, byte extent, dtype and shape;
+`verify_weights` hashes the tensor payloads too. The files must stay
+unchanged while mapped. Nothing is cached on disk.
 
-Under the `avx2` cap (measured 2026-11-01 on a shared 4-vCPU AVX-512 container, one
-960×960 synthetic page for the detector and a random 2×48×320 batch for the
-recognizer, against ORT 1.28.0) no OCR primitive uses a reference kernel, the
-detector's probability map stays within 4.8e-4 with no pixel crossing the 0.2
-threshold, and the recognizer's argmax is identical. The detector took about
-1.3 times and the recognizer 1.6 times as long as under `avx512_core_bf16`.
-EmbeddingGemma 2's FP32 graph under the `avx2` cap matches the PyTorch FP32
-fixtures at cosine 1.0 to float precision (2026-11-19,
-`src/embeddinggemma2/tests/parity_pinned_avx2.rs`). oneDNN has no packed BF16 matmul below
-`avx512_core_bf16`, so a caller on an AVX2 CPU picks FP32. Aligned channel concatenation
-places producers directly into joined storage at N=1 when their lifetimes permit;
-other complete-block concats use blocked copies, and general concats use oneDNN. Spatial means use fixed FP32 accumulation orders to match ORT. General grouped conv
-beyond groups=1/depthwise is unsupported. Integral nearest upsampling matches
-ONNX asymmetric/floor; linear resampling uses half-pixel centers, not
-align-corners.
-
-`ConvNet::new(cpu, nodes, capacity)` takes a configurable positive LRU capacity.
-`warmup([N,C,H,W])` builds a shape plan and reports implementation names and
-arena/scratch sizes. `run(shape, input)` executes it. Plans share packed
-weights and immutable memory descriptors. Steps are cached by actual operand shapes
-and graph identity, so SE gates are reused across widths. Identical native descriptors
-share primitive code. A largest-first liveness arena borrows the network input.
-For OCR, arena **plus largest scratchpad** is refused (`ErrorKind::TooLarge`)
-before activation allocation when it exceeds the model's workspace limit.
-This bounds each convolution segment; SVTR and host image/output buffers are
-additional. The text models' retained-pool semantics are unchanged. No OCR disk cache is written. Concurrency uses the common compute
-lock. Convolution segments on one backend reuse one aligned arena, scratchpad and
-stream, growing to the maximum required size. Retained arena plus scratch remains
-within the configured convolution bound; host/SVTR buffers remain additional.
-
-The statically linked oneDNN build must enable convolution, deconvolution,
-pooling, resampling, concat and PReLU in addition to the text primitives.
-`onednn-sys` builds these by default. If a supplied pinned THREADPOOL prefix
-omits them, the build fails and names each missing `BUILD_*` define. There is
-no silent OUT_DIR fallback. An absent archive is built from source; an existing
-narrow 3.13.4 THREADPOOL prefix can be refreshed explicitly:
-
-```bash
-CC=gcc CXX=g++ ONEDNN_STATIC_ROOT="$HOME/.cache/sinteric-sdk/onednn-static-tp" \
-  ONEDNN_REBUILD_NARROW_PREFIX=1 cargo build -j6 -p onednn-sys --release
-```
-
-This opt-in modifies only the named matching prefix; unset it for normal builds.
-
-`ppocr::cpu::Detector` executes the hand-written PP-OCRv6 tiny graph. Load it
-from the runtime and pass decoded pixels:
-
-```rust
-use sinteric_inference::ppocr::cpu::{DetConfig, Detector};
-use sinteric_inference::ppocr::{ImageView, PixelFormat};
-
-let detector = Detector::load(&rt, DetConfig::new("/models/ppocr/det").with_verify_weights(true))?;
-let image = ImageView::new(&decoded_bgr, width, height, stride, PixelFormat::Bgr8)?;
-let boxes: Vec<[[f32; 2]; 4]> = detector.detect(&image)?;
-```
-
-`ImageView` also accepts RGB8 and Gray8, validates nonzero dimensions, row
-stride and complete byte extent, and borrows the supplied pixels. The library
-contains no image codec. `detect` returns clockwise TL/TR/BR/BL page quads in
-Paddle reading order (10px y tolerance).
-
-Defaults are BGR ImageNet normalization, Triangle resize to nearest multiple
-of 32 (ties to even), **no max-side cap**, DB thresh 0.2, fast polygon score
-threshold 0.45, unclip 1.4, 1000 candidates, minimum sides 3/5 pixels. Optional
-`max_side` is downscale-only. `max_pixels` defaults to 64 Mi pixels and bounds
-source/resized allocations without silently resizing oversized input. All
-options and tensor boundaries return typed errors for invalid input.
-
-The Triangle implementation follows `image` 0.25's vertical f32 intermediate,
-antialiasing, f32 tap weights and final byte rounding. It is byte-identical on
-the four pages and 1000 generated resizes against image 0.25.10; no deviation
-is known. Suzuki-Abe contours include holes (RETR_LIST/CHAIN_APPROX_SIMPLE).
-Caliper reconstruction, LINE_8 polygon scoring and integer round-join offsets
-preserve cv2/pyclipper behavior, including the rounding before integer unclip.
-
-The optimized 2400x1696 detector plan uses **227,942,464 bytes arena +
-320 bytes scratch = 227,942,784 bytes** at one thread. The DB head rearranges
-weights once into 1x1 convolutions followed by depth-to-space; fused post-ops
-are retained. This removes the large deconvolution scratchpad and padded C=1
-output. These are planned workspace sizes, excluding image/host output buffers.
-
-The detector and the recognizer each have their own config and `load`. They
-accept decoded, borrowed pixels and return typed errors. Page OCR is the
-caller's composition of the two:
+Page OCR is the caller's composition of the detector and the recognizer:
 
 ```rust
 use sinteric_inference::cpu::{BackendOverrides, Options, Runtime};
@@ -587,162 +484,112 @@ use sinteric_inference::ppocr::cpu::{
 };
 use sinteric_inference::ppocr::{ImageView, PixelFormat};
 
-let rt = Runtime::new(Options::new().with_threads(4))?;
+let rt = Runtime::try_new(Options::new().with_threads(4))?;
 // Optional: one backend for both models (about 150 MiB less peak RSS).
 let ocr_rt = rt.shared_backend(
     BackendOverrides::default().with_workspace_limit_bytes(Some(DEFAULT_WORKSPACE_LIMIT_BYTES)),
 )?;
 let det = Detector::load(&ocr_rt, DetConfig::new("/models/ppocr/det"))?;
 let rec = Recognizer::load(&ocr_rt, RecConfig::new("/models/ppocr/rec"))?;
-let image = ImageView::new(&decoded_bgr, width, height, stride, PixelFormat::Bgr8)?;
+let image = ImageView::try_new(&decoded_bgr, width, height, stride, PixelFormat::Bgr8)?;
 let quads = det.detect(&image)?; // clockwise TL/TR/BR/BL page coordinates, reading order
-let lines = rec.recognize(&image, &quads)?; // one per quad: decoded UTF-8, mean confidence
+let lines = rec.recognize(&image, &quads)?; // one per quad, in order
 for (quad, line) in quads.iter().zip(&lines) {
     if line.score >= 0.5 {
         // PP-OCR's default threshold; the recognizer itself drops nothing.
         println!("{} {} {:?}", line.text, line.score, quad);
     }
 }
-det.unload();
-rec.unload();
 ```
 
 `ppocr` holds the types every hardware shares (`ImageView`, `PixelFormat`,
-`Quad`, `DecodedLine`, `UnwarpedImage`); `ppocr::cpu` holds the models
-(`Detector`, `Recognizer`, `Unwarper`), their configs and options
-(`DetConfig`, `RecConfig`, `UvdocConfig`, `DetOptions`, `RecOptions`,
-`UvdocOptions`, `Batching`), their timings and
-`DEFAULT_WORKSPACE_LIMIT_BYTES`. They run FP32 only, the precision they are
-qualified at, so no config has a precision. Config and result types
-serialize with serde and are non-exhaustive. Use constructors/defaults, `with_*` builders and field
-assignments. `detect_timed` / `recognize_timed` also return stage timings.
+`Quad`, `DecodedLine`, `UnwarpedImage`); `ppocr::cpu` holds the models, their
+configs and options (`DetConfig`, `RecConfig`, `UvdocConfig`, `DetOptions`,
+`RecOptions`, `UvdocOptions`, `Batching`), their timings and
+`DEFAULT_WORKSPACE_LIMIT_BYTES`. Every option's meaning and default is on its
+field in the rustdoc. `detect_timed` / `recognize_timed` / `unwarp_timed` also
+return stage timings.
 
 | `DetConfig` / `RecConfig` / `UvdocConfig` field | Default | Notes |
 |---|---|---|
-| `model_dir` | required | That model's directory (`det/`, `rec/` or `uvdoc/` of an imported root) |
-| `workspace_limit_bytes` | `None`: 1 GiB (1,073,741,824 bytes) | Independent of `Options::workspace_limit_bytes`; the backend cap on each planned convolution arena plus native scratch. On a `shared_backend` handle the handle's cap applies and setting this is `ErrorKind::Config` |
-| `options` | `DetOptions` / `RecOptions` / `UvdocOptions` defaults | The settings described below; Exact recognition batching |
+| `model_dir` | required | That model's directory |
+| `workspace_limit_bytes` | `None`: 1 GiB | The backend's cap on each planned convolution arena plus native scratch, independent of `Options::workspace_limit_bytes`. On a `shared_backend` handle the handle's cap applies and setting this is `ErrorKind::Config` |
+| `options` | `DetOptions` / `RecOptions` / `UvdocOptions` defaults | PP-OCR's defaults |
 | `memory_budget_bytes` | runtime default | See [Memory budget](#memory-budget); on a `shared_backend` handle set it on the handle |
-| `manifest` | embedded PP-OCR manifest | Optional explicit TOML path |
-| `verify_weights` | `false` | Check the weight payload hash |
+| `manifest` | embedded PP-OCR manifest | An explicit TOML; its graph and dictionary identity must match the compiled export |
+| `verify_weights` | `false` | Hash the weight payloads too |
+
+### Detector
+
+`detect` takes decoded pixels (BGR8, RGB8 or Gray8; the library has no image
+codec) and returns clockwise TL/TR/BR/BL quads in page pixels, in Paddle's
+reading order (10 px row tolerance). The page is resized to the nearest
+multiple of 32 on each side (ties to even) with no size cap unless
+`max_side` is set, normalized as ImageNet BGR, and the probability map is
+turned into boxes by DB post-processing. The resize is byte-identical to the
+`image` crate 0.25's Triangle filter (four pages and 1,000 generated resizes
+against 0.25.10). Contours (Suzuki-Abe, holes included), the minimum-area
+rectangle, the polygon score and the integer unclip follow OpenCV and
+pyclipper, rounding included, since a rounding difference there moves a box
+by a whole pixel.
+
+### Recognizer
+
+`recognize(&image, &quads)` warps each quad from the full-resolution page
+(perspective, cubic, replicated borders, as OpenCV 5.0.0.93 does), turns it a
+quarter counter-clockwise when its height is at least 1.5 times its width,
+resizes it to height 48 and a width clamped to 16..1600, runs the crops in
+width groups, and decodes each with greedy CTC. It returns one
+`DecodedLine { text, score }` per quad, in order, and drops none: the score
+threshold is the caller's. A degenerate, nonconvex or nonfinite quad, or a
+crop past `max_pixels`, is an error before anything is allocated.
+
+`Batching::Exact` (the default) batches only crops of the same width, so no
+crop is padded. `Batching::Bucketed` pads crops to shared widths and is
+experimental: it changes some texts (`ppocr/rec.rs` says what was measured).
+
+### Memory and threads
 
 A model loaded on a plain `Runtime` owns its backend (engine, convolution
-arena, primitive cache), so it can be shared or unloaded independently.
-`Runtime::shared_backend(overrides)` returns a handle whose models all load
-onto one backend, keeping one arena sized to the larger plan: on the
-100-page gate, two separate backends raised peak RSS by about 150 MiB. The
-backend is freed once the handle and its models are dropped. All use the
-runtime's ISA cap and pinned pool. The default fits a 2400×2400 detector
-plan: **322,560,064 arena bytes plus 320 scratch bytes = 322,560,384 bytes** at
-one thread, including alignment. The text models keep their 512 MiB runtime default.
-Set `with_workspace_limit_bytes(bytes)` or the serde field for an explicit
-positive cap. Plans exceeding it fail with `ErrorKind::TooLarge` before
-activation allocation. This cap excludes weights, preprocessing, outputs, SVTR
-host tensors and cross-segment storage; it is not a process RSS limit.
+arena, primitive cache). `Runtime::shared_backend(overrides)` returns a
+handle whose models all load onto one backend with one arena sized to the
+larger plan: on the 100-page gate, two backends raised peak RSS by about
+150 MiB. The backend is freed once the handle and its models are dropped.
 
-`manifest` optionally selects an explicit TOML; its graph/dictionary
-identity must match the compiled export. No disk packed cache is used in phase A.
-`verify_weights` checks that model's payloads. Library loading does not read env or decode
-image files. The `ocr` example composes both models on one backend and reads
-caller-provided raw BGR bytes:
+The workspace cap bounds each planned convolution arena plus scratch: a plan
+past it fails with `ErrorKind::TooLarge` before any activation is allocated.
+The 1 GiB default fits a 2400×2400 detector plan (322,560,384 bytes at one
+thread, alignment included). The cap excludes weights, preprocessing,
+outputs and the recognizer's attention tensors; it is not a process RSS
+limit.
 
-```bash
-cargo run -p sinteric-inference --release --example ocr -- \
-  /models/ppocr /pages/page.bgr 1654 2339 4  # root containing det/ and rec/
-```
+`detect`, `recognize` and `unwarp` block and the models are `Send + Sync`:
+share them through `Arc` and call them from `spawn_blocking` in async code.
+`recognize` calls on one recognizer take turns, which bounds crop and batch
+storage; within a call, crops and width groups run on the pinned pool.
+Orientation is not a model: a caller that needs it can read the page at each
+quarter turn and keep the best.
 
-`Detector::detect` and `Recognizer::recognize` block and are `Send + Sync`;
-share the models through `Arc` and use `spawn_blocking` in async applications.
-A recognizer mutex serializes `recognize` calls to bound concurrent crop and
-batch storage, independent of the text model execute-slot setting. The
-detector and recognizer share the runtime's pinned pool. No process
-environment is mutated. Orientation is not a model: a caller that needs it
-can read the page at each quarter turn and keep the best.
+### Below AVX-512
 
-Recognizer defaults: full-resolution perspective warp with replicated borders
-and cubic interpolation, 90-degree CCW rotation when **h/w >= 1.5**, height 48,
-ceil resized width clamped to **16..1600**, bilinear resize and BGR normalization
-`(v/255 - 0.5)/0.5`. The independent oracle is **OpenCV 5.0.0.93**: its cubic
-warp uses continuous coordinates and FP32 coefficients (4.x quantized cubic
-sampling differs). Crop dimensions/pixel limits and quads are checked before
-allocation; zero, nonfinite, nonconvex or degenerate crops return errors.
+oneDNN names no 8-channel weight layout for a transposed convolution, so
+below AVX-512 a transposed convolution is `ErrorKind::Unsupported`. None of
+the three models runs one: the detector's two upsampling layers run as a
+convolution and depth-to-space. Measured 2026-11-01 under the `avx2` cap on a
+shared 4-vCPU AVX-512 container, against ONNX Runtime 1.28.0: no OCR
+primitive used a reference kernel, the detector's probability map on a
+960×960 synthetic page stayed within 4.8e-4 with no pixel crossing the 0.2
+threshold, and the recognizer's argmax on a random 2×48×320 batch was
+identical. The detector took about 1.3 times and the recognizer 1.6 times as
+long as under `avx512_core_bf16`. This is oneDNN capped to AVX2 on an
+AVX-512 machine, not an AVX2-only CPU.
 
-`Recognizer` runs the
-hand-written PPLCNetV3 and two SVTR blocks (dim 120, eight heads, SiLU MLP) using
-FP32 oneDNN conv/matmul/LN/softmax/SiLU primitives. The network returns
-`[N,T,11947]` probabilities; greedy CTC decoding collapses repeats then removes blank 0,
-appends dictionary space, and averages kept-step max probabilities.
-`recognize(&image, &quads)` crops every quad (bounded by `RecOptions.max_pixels`),
-runs the width groups and returns one line per quad, in order; it drops none,
-so the score threshold (PP-OCR's default is 0.5) is the caller's.
+### What was measured
 
-`Exact` is the default: process widths longest-first, batch only identical
-resized widths (up to `RecOptions.max_batch`, default 16), then restore reading
-order. `Bucketed` is explicit experimental configuration for round-4 measurement:
-zero-pad normalized pixels, apply key masks in both attention blocks, and truncate
-CTC to each crop's true token span. Padding still changes convolution edges;
-Round-6 four-page qualification found **426/437 exact texts**, so Exact remains
-the default. Detector padding to coarser grids also changes boxes and is disabled.
-Four convolution segments have bounded shape/step LRUs (default **512** each);
-the matmul/norm/softmax plan cache is a true LRU (256 plans by default; the
-OCR recognizer raises it to **4096**). Pointwise convolutions
-reuse code through independent spatial tiles (powers of two, 16..512 positions),
-with each scalar/channel fusion kept on the primitive. Spatial convolutions,
-global means and attention retain exact shapes. This preserves tensor/text parity
-and avoids padded convolution-edge semantics. The recognizer's segments share its
-convolution workspace; host tensors remain separate. CTC argmax uses independent lanes
-with the first-index tie rule preserved, shared with the ORT yardstick.
-Crops run independently on the pinned
-pool and are released after copying into their recognition batch.
-The `debug-dumps` feature exposes detector and recognizer backbone prefixes.
-The `ppocr-onednn` driver's `--profile` prints one `ppocr_profile` line per
-page with stage timings and retained workspace/weight bytes; the JSONL result
-file keeps its schema.
-
-The OCR gate's drivers are in `tools/drivers`; the library has no image codec
-and the drivers decode PNG and JPEG themselves:
-
-```bash
-cargo build --release -p drivers --bin ppocr-onednn
-target/release/ppocr-onednn --model /models/ppocr --threads 4 --warmup 3 \
-  --images pages.jsonl --out results.jsonl
-```
-
-`ppocr-ort` is the gate's ONNX Runtime 1.28.0 reference, behind the drivers'
-`ort` feature (`cargo build --release -p drivers --features ort --bin
-ppocr-ort`). It runs the library's own steps around the networks through the
-hidden `ppocr::reference` module (the library's `reference` feature, not a
-supported API), so the two runners differ only in the networks.
-
-Input rows are `{"img_id":"page1","path":"/pages/page1.png"}`. The driver appends
-`{"img_id":...,"lines":[{"text":...,"score":...,"poly":[[x,y],...]}],"ms":...,"rss_mb":...}`.
-Scores round to four decimals, quad coordinates and metrics to one. Wall time
-includes preprocessing, inference and postprocessing and excludes PNG decode;
-RSS is Linux VmHWM in MiB. Per-image failures append `{"img_id":...,"error":"..."}`.
-The first K input images warm up and produce no rows; IDs already in the output
-(including error rows) are skipped. Output flushes per image and can be resumed.
-`--model` names the root containing `det/` and `rec/`. The driver loads both
-on one `shared_backend` handle with the 1 GiB default (`--workspace-limit-bytes BYTES`
-overrides it) and drops lines scoring below 0.5, as the ORT reference does.
-`--isa` caps oneDNN (default `avx512_core_bf16`, the ISA the gate was
-measured at).
-
-Round-3 qualification against **ORT 1.28.0**: widths 16/48/320/1600 (N=1) and
-N=2 at width 48, maximum probability error **2.2053719e-5**, zero argmax
-mismatches. All **3,106,220 probabilities** are bitwise identical at 1/2/4
-threads; all inspected conv and 60 SVTR/head primitives use non-`ref:` kernels.
-A separate two-crop masked ONNX oracle passes with max error **1.5735626e-5**.
-All 446 page crops plus 69 generated quads are exact against cv2
-(**14,544,432 normalized values**). Four-page Flat parity is **437/437** exact
-line texts (99/70/99/169), box IoU 1.0, CER 0, and maximum score error
-**1.0073185e-5**.
-
-Round-6 tiling/arena validation retains **437/437 exact texts, IoU 1.0**;
-max score error is **1.04904175e-5**, recognizer max probability error
-**2.18153e-5**, and masked-oracle max error **1.5974045e-5**.
-The 100-page gate (60 scanned Korean documents and 40 synthetic pages, on a
-4-vCPU Ryzen 7 9700X) against pyke ORT 1.28.0 passes: 100/100 pages and
-11288/11288 lines have identical text and polygons at 1, 2 and 4 threads.
+The 100-page gate (60 scanned Korean documents and 40 synthetic pages; not
+distributed), on a 4-vCPU Ryzen 7 9700X against ONNX Runtime 1.28.0 (pyke):
+100/100 pages and 11,288/11,288 lines have identical text and polygons at 1,
+2 and 4 threads.
 
 | threads | p50 ms (ours / ORT) | p95 ms (ours / ORT) | peak RSS MiB (ours / ORT) |
 |---|---|---|---|
@@ -750,10 +597,15 @@ The 100-page gate (60 scanned Korean documents and 40 synthetic pages, on a
 | 2 | 648 / 934 | 1546 / 3193 | 1665 / 2144 |
 | 1 | 1082 / 1119 | 2829 / 3983 | 1598 / 2128 |
 
+The recognizer against ONNX Runtime 1.28.0 at widths 16, 48, 320 and 1600:
+maximum probability error 2.2e-5, no argmax mismatch, and every probability
+bitwise identical at 1, 2 and 4 threads. Every page crop and 69 generated
+quads are exact against OpenCV's.
+
 ### UVDoc unwarper
 
-`ppocr::cpu::Unwarper` flattens a photographed page with PaddlePaddle's UVDoc
-export (pinned in `assets/ppocr.toml`). Load it like the other two, on the same
+`Unwarper` flattens a photographed page with PaddlePaddle's UVDoc export
+(pinned in `assets/ppocr.toml`). Load it like the other two, on the same
 backend if you like, and hand it decoded pixels:
 
 ```rust
@@ -767,39 +619,74 @@ let quads = det.detect(&flat.view()?)?;
 The page is resized to 712×488 (bilinear, align-corners), the network
 predicts a 45×31 grid of normalized source positions, and the page is sampled
 through that grid brought back to its own size (bilinear, zeros outside,
-align-corners); every value is then clamped to `[0, 1]` and rounded to
-8 bits. The convolutions run on oneDNN in FP32, as three networks: the
-backbone with the bridge, and the two head convolutions that read
-reflect-padded inputs. The resizes, the reflect pads and the sample run on the
-host.
-The network takes and returns unit-range RGB planes `[1, 3, H, W]`, as the
-ONNX export does.
+align-corners); every value is then clamped to `[0, 1]` and rounded to 8 bits.
 
 The rectified page is a different raster: a box found on it does not address
 the caller's pixels, and whether it reads better than the original is the
 caller's question to ask. The model cannot tell a flat page from a curved one;
 it resamples every page it is given.
 
-`UvdocOptions`: `plan_capacity` (default 2) and `max_pixels` (default 64 Mi,
-checked before any allocation). Measured 2026-11-01 against ORT 1.28.0 on a
-seeded random 96×64 input and a 960×960 invoice, flat and curled
-(`tools/ppocr-import/uvdoc_reference.py`), on a shared 4-vCPU AVX-512 container:
+Measured 2026-11-01 against ONNX Runtime 1.28.0 on a seeded random 96×64
+input and a 960×960 invoice, flat and curled
+(`tools/ppocr-import/uvdoc_reference.py`), on a shared 4-vCPU AVX-512
+container:
 
 | ISA cap | grid max abs | output mean abs | 8-bit values that differ (of 2,764,800) | 960×960 network, 1 / 4 threads |
 |---|---|---|---|---|
 | `avx512_core_bf16` | 4.8e-7 | ≤ 1.0e-6 | ≤ 183, each by one level | ~250 / ~95 ms |
 | `avx2` | 1.8e-6 | ≤ 2.6e-6 | ≤ 531, each by one level | ~460 / ~150 ms |
 
-ORT took about 380 ms for the whole 960×960 page on one core; resize and
-sample add about 70 ms to ours. Smoke evidence only. Outputs are bitwise
-identical at 1, 2 and 4 threads under each cap. What these tests cannot see:
-photographs of real curved pages (the fixtures' curl is a synthetic
-sinusoid), and a real AVX2-only CPU: the `avx2` row is oneDNN capped to AVX2
-on an AVX-512 machine.
+ONNX Runtime took about 380 ms for the whole 960×960 page on one core; resize
+and sample add about 70 ms to ours. Outputs are bitwise identical at 1, 2 and
+4 threads under each cap. What these tests cannot see: photographs of real
+curved pages (the fixtures' curl is a synthetic sinusoid), and a real
+AVX2-only CPU.
 
-Asset-backed tests skip when `SINTERIC_OCR_ASSETS` is absent. Tests alone capture
-that path using `TestOverrides`; it names the root containing `det/`, `rec/` and
-`uvdoc/`.
-`PPOCR_TEST_THREADS` controls isolated primitive identity test subprocesses.
-`SINTERIC_TEST_CPU_ISA` (`avx2` or `avx512_core_bf16`, the default) caps the ISA
-for the convolution and OCR tests, so one AVX-512 machine runs both.
+### Building oneDNN with the OCR primitives
+
+The statically linked oneDNN must enable convolution, deconvolution,
+pooling, resampling, concat and PReLU besides the text primitives.
+`onednn-sys` builds these by default. If a supplied THREADPOOL prefix omits
+them, the build fails and names each missing `BUILD_*` define. An existing
+narrow 3.13.4 prefix can be refreshed explicitly (this modifies only the
+named prefix; unset it for normal builds):
+
+```bash
+CC=gcc CXX=g++ ONEDNN_STATIC_ROOT="$HOME/.cache/sinteric-sdk/onednn-static-tp" \
+  ONEDNN_REBUILD_NARROW_PREFIX=1 cargo build -j6 -p onednn-sys --release
+```
+
+### Drivers and tests
+
+The OCR gate's drivers are in `tools/drivers` and decode PNG and JPEG
+themselves:
+
+```bash
+cargo build --release -p drivers --bin ppocr-onednn
+target/release/ppocr-onednn --model /models/ppocr --threads 4 --warmup 3 \
+  --images pages.jsonl --out results.jsonl
+```
+
+Input rows are `{"img_id":"page1","path":"/pages/page1.png"}`; the driver
+appends `{"img_id":...,"lines":[{"text":...,"score":...,"poly":[[x,y],...]}],"ms":...,"rss_mb":...}`
+per page, or `{"img_id":...,"error":"..."}`. Scores round to four decimals,
+coordinates and metrics to one. Wall time includes pre- and post-processing
+and excludes decoding; RSS is Linux VmHWM in MiB. The first `--warmup` pages
+run without a row, pages already in the output are skipped, and output
+flushes per page, so a run resumes. `--model` names the root holding `det/`
+and `rec/`; both load on one `shared_backend` handle (1 GiB default,
+`--workspace-limit-bytes` overrides it), lines scoring below 0.5 are dropped
+as the reference does, and `--isa` caps oneDNN (default `avx512_core_bf16`,
+the ISA the gate was measured at). `--profile` prints one `ppocr_profile`
+line per page with stage timings and retained bytes.
+
+`ppocr-ort` is the gate's ONNX Runtime 1.28.0 reference, behind the drivers'
+`ort` feature. It runs the library's own steps around the networks through
+the hidden `ppocr::reference` module (the library's `reference` feature, not
+a supported API), so the two runners differ only in the networks.
+
+Asset-backed tests skip when `SINTERIC_OCR_ASSETS` (the root holding `det/`,
+`rec/` and `uvdoc/`) is unset. `SINTERIC_TEST_CPU_ISA` (`avx2` or
+`avx512_core_bf16`, the default) caps the ISA for the convolution and OCR
+tests, so one AVX-512 machine runs both; `PPOCR_TEST_THREADS` sets the
+thread count of the isolated primitive tests. Only tests read these.
