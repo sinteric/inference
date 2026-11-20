@@ -1,5 +1,6 @@
-// C++ shim: dnnl::threadpool_interop::threadpool_iface → sinteric_tp_* (rt-threads).
-// Weak defaults keep onednn-sys tests linkable; rt-threads provides strong defs.
+// C++ shim: dnnl::threadpool_interop::threadpool_iface → sinteric_tp_* (the
+// library's thread pool). Weak defaults keep onednn-sys tests linkable; the
+// library provides the strong definitions.
 #include "oneapi/dnnl/dnnl_threadpool_iface.hpp"
 
 #include <cstdint>

@@ -18,7 +18,8 @@ ONEDNN_BINDGEN=1 cargo build -p onednn-sys --features bindgen
 libgomp dependency.
 
 `snt_threadpool.cpp` implements `dnnl::threadpool_interop::threadpool_iface`
-and forwards to `sinteric_tp_*` in `rt-threads`. Streams are created with
+and forwards to `sinteric_tp_*`, the library's thread pool
+(`crates/sinteric-inference/src/cpu/threads`). Streams are created with
 `dnnl_threadpool_interop_stream_create`.
 
 Cache / CI:
@@ -34,8 +35,8 @@ Cache / CI:
   `git fetch` of the same commit (`git`), checked to be that commit. A source
   tree already there (it has `CMakeLists.txt`) is used as it is.
 
-There is no runtime `dlopen` of `libdnnl.so`. `rt-onednn` calls `dnnl_*`
-directly. The library does not set process environment variables.
+There is no runtime `dlopen` of `libdnnl.so`. The library's oneDNN backend
+(`crates/sinteric-inference/src/cpu/onednn`) calls `dnnl_*` directly. The library does not set process environment variables.
 
 The enabled set is `MATMUL;REORDER;LAYER_NORMALIZATION;SOFTMAX;ELTWISE;BINARY;
 REDUCTION;CONVOLUTION;DECONVOLUTION;POOLING;RESAMPLING;CONCAT;PRELU` (one line).

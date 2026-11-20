@@ -21,12 +21,11 @@ rules that follow from that setting are excluded.
 
 The guide's API rules bind library code and are a strong recommendation for
 application code ([§api-design-context][adc]). **Every crate under `crates/`
-and `models/` is library code**: other programs build against them, through
-`sinteric-inference` or, for a model of their own, the `rt-*` crates
-([`docs/library.md`](docs/library.md), "A model of your own"). **The drivers
-and harnesses are application code**: the `[[bin]]` targets (`eg2-onednn`,
-`vela2-onednn`, `ppocr-onednn`), everything under `bench/` and `tools/`, and
-examples and tests.
+is library code**: other programs build against `sinteric-inference`
+([`docs/library.md`](docs/library.md)). **The drivers and harnesses are
+application code**: everything under `bench/` and `tools/` (the drivers
+`eg2-onednn`, `ppocr-onednn` and `ppocr-ort` among them), and examples and
+tests.
 
 [adc]: https://google.github.io/styleguide/rustguide.html#api-design-context
 
@@ -45,7 +44,7 @@ the reviewer remembers it.
 | [Flat file layout](https://google.github.io/styleguide/rustguide.html#structure) [chrome] | **excluded** | | The guide itself keeps Cargo's layout for code built with Cargo, which all of ours is. |
 | [Name files after the primary item](https://google.github.io/styleguide/rustguide.html#userdefined-item) | adopted | review | Older files move only when they are already being restructured: a sweep would collide with every open branch. |
 | [No APIs in non-leaf modules](https://google.github.io/styleguide/rustguide.html#non-leaf-modules) | adopted | review | Same as the row above. |
-| [No glob imports](https://google.github.io/styleguide/rustguide.html#glob-imports) | **changed** | review | The guide's own exceptions apply (`use super::*` in tests, `use Enum::*` in a function about that enum). Changed for one more: `sinteric-inference`'s model modules re-export their model crate's `api` whole (`pub use ::embeddinggemma2::api::*`), because each module is that API under a stable path, and naming every item again would make adding one a change in two crates. |
+| [No glob imports](https://google.github.io/styleguide/rustguide.html#glob-imports) | **changed** | review | The guide's own exceptions apply (`use super::*` in tests, `use Enum::*` in a function about that enum). Changed for one more: each model module of `sinteric-inference` re-exports its own `api` module whole (`pub use api::*`), because the model module is that API under a stable path and `api` is where its items are named; naming them again would make adding one a change in two files. |
 | [One module per `use`](https://google.github.io/styleguide/rustguide.html#use-statement) | adopted | rustfmt `imports_granularity = "Module"` | |
 | [Locally scoped trait imports](https://google.github.io/styleguide/rustguide.html#prefer-local-trait-imports) | adopted | review | |
 | [Module-qualified calls to top-level functions](https://google.github.io/styleguide/rustguide.html#toplevel-functions) | adopted | review | |
@@ -60,21 +59,21 @@ the reviewer remembers it.
 | [Iterators vs slices in parameters](https://google.github.io/styleguide/rustguide.html#accept-iterators) | adopted | review | Kernels take slices: a kernel reads a contiguous buffer by index, often from several threads, which an iterator cannot give it. |
 | [Accepting `Into`](https://google.github.io/styleguide/rustguide.html#accepting-into) | adopted | review | The guide's own note binds here: application code almost never takes `impl Into<T>`. |
 | [`enum` over `bool` in APIs](https://google.github.io/styleguide/rustguide.html#enum-vs-bool) | adopted | review | |
-| [Reporting errors](https://google.github.io/styleguide/rustguide.html#reporting-errors) | **changed** (two additions) | review | Added: a model directory, its weights, a tokenizer, an image and a text are outside input, never a precondition, so a wrong shape, a missing tensor or a bad pixel buffer fails with `Result`, never a panic. Why: a panic in a library is a crash in the caller's process, and a model file is the caller's to supply. Added: every library boundary returns the typed `rt_core::Error`, which a caller can match on; `anyhow` is for the application binaries only ([`docs/library.md`](docs/library.md), "Errors"). We do not take the guide's option of avoiding panics entirely: a panic still marks a bug in our own code. |
+| [Reporting errors](https://google.github.io/styleguide/rustguide.html#reporting-errors) | **changed** (two additions) | review | Added: a model directory, its weights, a tokenizer, an image and a text are outside input, never a precondition, so a wrong shape, a missing tensor or a bad pixel buffer fails with `Result`, never a panic. Why: a panic in a library is a crash in the caller's process, and a model file is the caller's to supply. Added: every library boundary returns the typed `sinteric_inference::Error`, which a caller can match on; `anyhow` is for the application binaries only ([`docs/library.md`](docs/library.md), "Errors"). We do not take the guide's option of avoiding panics entirely: a panic still marks a bug in our own code. |
 | [Newtypes vs type aliases](https://google.github.io/styleguide/rustguide.html#newtypes-vs-type-aliases) | adopted | review | |
 | [Named fields over tuples](https://google.github.io/styleguide/rustguide.html#prefer-named-fields) | adopted | review | |
 | [Add trait impls when needed](https://google.github.io/styleguide/rustguide.html#traits-yagni) | adopted | review | |
 | [Implement standard traits](https://google.github.io/styleguide/rustguide.html#known-traits) | adopted | clippy `should_implement_trait` | |
 | [`#[derive]` when possible](https://google.github.io/styleguide/rustguide.html#derive) | adopted | clippy `derivable_impls` | |
-| [Generics vs `dyn Trait`](https://google.github.io/styleguide/rustguide.html#generics-vs-dyn-trait) | adopted | review | The model graphs are generic over `rt_backend::Hardware`, so the backend's calls in a hot loop are static. |
+| [Generics vs `dyn Trait`](https://google.github.io/styleguide/rustguide.html#generics-vs-dyn-trait) | adopted | review | The model graphs call the oneDNN backend's concrete type, so its calls in a hot loop are static; there is no backend trait to be generic over. |
 | [Trait vs inherent impl](https://google.github.io/styleguide/rustguide.html#trait-vs-inherent-impl) | adopted | review | |
 | [Extension traits](https://google.github.io/styleguide/rustguide.html#extension-traits) | adopted | review | |
 | [Guidance for important traits](https://google.github.io/styleguide/rustguide.html#important-traits) | adopted | clippy `new_without_default`, review | |
 | [Pair `From` with a constructor](https://google.github.io/styleguide/rustguide.html#from-impls) | adopted | review | |
 | [Options structs implement `Default`](https://google.github.io/styleguide/rustguide.html#options-should-implement-default) | **changed** | review | A public configuration is an options struct with `Default` (`RuntimeOptions`, each model's `Config`). Changed: clippy's `too_many_arguments` is allowed workspace-wide (root `Cargo.toml`), because a kernel's arguments are its shapes and strides (`m`, `n`, `k`, row strides, a thread budget), each one required, and a struct that bundles them only moves the list one line up. Outside kernels, a function with that many inputs takes an options struct. |
 | [Handling poison](https://google.github.io/styleguide/rustguide.html#poison) | **changed** | review | A lock that only serializes, or that guards a step that cannot stop halfway (a cache insert), may ignore poison with `PoisonError::into_inner`. A lock over data with invariants either restores them on poison or panics. Why: the guide's concern is reading state a panic left broken, and a lock that panics forever on a healthy value turns one failed call into a dead model. |
-| [No `async`/`.await`](https://google.github.io/styleguide/rustguide.html#async-await-chrome) [chrome] | **excluded** | | Chromium-only. The library has no `async`: inference is CPU-bound and blocks, and an async caller runs it on `spawn_blocking`. `bench/serve-sim` is an async host and may use it. |
-| [No `std::thread`](https://google.github.io/styleguide/rustguide.html#std-thread) [chrome] | **excluded** | | Chromium-only: it has its own sequence scheduler. Our threads are the runtime's own pinned pool (`rt-threads`), which oneDNN runs on. |
+| [No `async`/`.await`](https://google.github.io/styleguide/rustguide.html#async-await-chrome) [chrome] | **excluded** | | Chromium-only. The library has no `async`: inference is CPU-bound and blocks, and an async caller runs it on `spawn_blocking`. |
+| [No `std::thread`](https://google.github.io/styleguide/rustguide.html#std-thread) [chrome] | **excluded** | | Chromium-only: it has its own sequence scheduler. Our threads are the runtime's own pinned pool, which oneDNN runs on. |
 | [`fuchsia_sync::Mutex`](https://google.github.io/styleguide/rustguide.html#fuchsia-mutex) [fuchsia] | **excluded** | | Fuchsia-only. Which mutex to use follows the poison row above. |
 | [Macros](https://google.github.io/styleguide/rustguide.html#macros) | adopted | review | |
 | [Naming methods](https://google.github.io/styleguide/rustguide.html#naming-methods) | adopted | clippy `wrong_self_convention` | |
@@ -92,7 +91,7 @@ the reviewer remembers it.
 | [Don't use others' `#[doc(hidden)]`](https://google.github.io/styleguide/rustguide.html#doc-hidden) | adopted | review | |
 | [`const fn` responsibly](https://google.github.io/styleguide/rustguide.html#const-functions) | adopted | review | |
 | [Operator overloads](https://google.github.io/styleguide/rustguide.html#operator-overloads) | adopted | review | |
-| [`#[non_exhaustive]` on public enums](https://google.github.io/styleguide/rustguide.html#non-exhaustive-enums) | adopted | review | Library code. `rt_core::Error`, `CpuIsa` and `Precision` are marked. |
+| [`#[non_exhaustive]` on public enums](https://google.github.io/styleguide/rustguide.html#non-exhaustive-enums) | adopted | review | Library code. `Error`, `CpuIsa` and `Precision` are marked. |
 | [`#[non_exhaustive]` on public structs](https://google.github.io/styleguide/rustguide.html#non-exhaustive-structs) | adopted | review | Library code. `RuntimeOptions` and the model configurations are marked, which is why they are built with `new` and builders. |
 | [`#[must_use]` on functions](https://google.github.io/styleguide/rustguide.html#must-use-on-functions) | adopted | review | Library code, in full. |
 | [`#[must_use]` on types](https://google.github.io/styleguide/rustguide.html#must-use-on-types) | adopted | review | |
@@ -162,6 +161,5 @@ types on `.into()` and `.parse()`, combinator chains, `Rc`/`Arc` against
 borrowing, assertion messages, poison handling. An `#[allow]` silences any
 lint, and nothing yet requires it to give a reason. A lint is added to
 `[workspace.lints]` only once the tree meets it, because a lint with open sites
-is a red build. Clippy sees only the packages CI names and the workspace crates
-they depend on: the research crates (`crates/candle-mlas`, `bench/vela-mlas`)
-and the benches are not linted.
+is a red build. CI runs clippy on the whole workspace and on the drivers'
+`ort` feature; the Python under `bench/` and `tools/` is not linted.

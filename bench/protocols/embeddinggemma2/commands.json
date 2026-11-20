@@ -3,8 +3,6 @@
     "target/release/eg2-onednn",
     "--model",
     "{model}",
-    "--library",
-    "{library}",
     "--threads",
     "{threads}",
     "--tile",

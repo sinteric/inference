@@ -1,0 +1,45 @@
+# Pinned identity for Horizon-Labs/prompt-injection-guard-base (ModernBERT
+# encoder with its prompt-injection head) and its tokenizer.
+# Bytes are NOT in git. Fetch with scripts/download_assets.py and verify sha256.
+
+model = "guard"
+source = "huggingface"
+repo = "Horizon-Labs/prompt-injection-guard-base"
+revision = "fc071c5754f8cf2edce9dc1d7fd3513ef9287007"
+license = "Apache-2.0"
+notes = """
+Apache-2.0, ungated. The runtime loads the encoder (model.*), the injection
+head (head.*) and the classifier; the ONNX exports and training code in the
+repository are not used. The 256000×768 token embedding table is mmapped
+FP32 and is not copied into the packed-weight cache. Hosted CI skips tests
+that need these files.
+"""
+
+[[files]]
+path = "model.safetensors"
+sha256 = "d0c0f899f118481855cfe34ba718cf5e44613d266270721c380d54741626d405"
+size = 1230141424
+lfs = true
+license = "Apache-2.0"
+
+[[files]]
+path = "tokenizer.json"
+sha256 = "47834a7dbbb0c4324fe9569fe47955241594a9ee539c9e478755d6fbc51e5f46"
+size = 34387555
+lfs = true
+license = "Apache-2.0"
+
+[[files]]
+path = "config.json"
+sha256 = "34fbf08b5c26d800bb55d6f1de0d3a39c35eb8b5d4208c681361a20f93923f54"
+size = 2032
+
+[[files]]
+path = "tokenizer_config.json"
+sha256 = "1d2f82c1341a79748e00efe82e67690f99d00b3c2a894f2b23128fd9d3519da3"
+size = 46440
+
+[[files]]
+path = "special_tokens_map.json"
+sha256 = "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351"
+size = 636

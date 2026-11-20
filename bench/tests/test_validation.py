@@ -1,5 +1,4 @@
 """Portable contract tests and optional public oneDNN primitive integration tests; no model assets."""
-import ctypes
 import importlib.util
 import json
 import os
@@ -127,23 +126,6 @@ class ValidationTests(unittest.TestCase):
                 '--output',str(directory/'failed-summary.json')],capture_output=True,text=True)
             self.assertEqual(result.returncode,1)
             self.assertFalse(json.loads((directory/'failed-summary.json').read_text())['pass'])
-
-
-@unittest.skipUnless(os.environ.get('VELA_TEST_LIBRARY'),'Set VELA_TEST_LIBRARY=libdnnl.so to run C API identity checks')
-class PrimitiveTests(unittest.TestCase):
-    """Numeric parity of matmul/GeGLU/LN/softmax lives in `rt-onednn` (atol 1e-6).
-    This class only checks the library uses the oneDNN C API, not the retired C++ bridge."""
-    def test_libdnnl_exports_c_api_3_13_4(self):
-        lib=ctypes.CDLL(os.environ['VELA_TEST_LIBRARY'])
-        class Version(ctypes.Structure):
-            _fields_=[('major',ctypes.c_int),('minor',ctypes.c_int),('patch',ctypes.c_int),
-                      ('hash',ctypes.c_char_p),('cpu_runtime',ctypes.c_uint),('gpu_runtime',ctypes.c_uint)]
-        lib.dnnl_version.restype=ctypes.POINTER(Version)
-        v=lib.dnnl_version().contents
-        self.assertEqual((v.major,v.minor,v.patch),(3,13,4))
-        lib.dnnl_matmul_primitive_desc_create.restype=ctypes.c_int
-        lib.dnnl_post_ops_append_eltwise.restype=ctypes.c_int
-        lib.dnnl_post_ops_append_binary.restype=ctypes.c_int
 
 
 if __name__=='__main__':

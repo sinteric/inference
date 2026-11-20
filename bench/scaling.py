@@ -133,7 +133,7 @@ def run_group(args, out, threads, cases, exec_slots, instances, cells, errors):
             print(
                 f"  load_wall_s={ready.get('load_wall_s')} "
                 f"rss_mb={(mem.get('VmRSS') or 0)/1024/1024:.1f} "
-                f"isa={ready.get('cpu_isa')} exec_slots={ready.get('exec_slots')} "
+                f"isa={ready.get('isa')} exec_slots={ready.get('exec_slots')} "
                 f"instances={ready.get('instances')}",
                 flush=True,
             )

@@ -25,5 +25,3 @@ bindgen = ["dep:bindgen"]
 [build-dependencies]
 bindgen = { version = "0.71", optional = true }
 
-[dependencies]
-rt-core.workspace = true

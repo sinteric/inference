@@ -3,7 +3,7 @@
 # znver5 binary SIGILLs on anything else.
 #
 # Turin:
-#   RUSTFLAGS='-C target-cpu=znver5' cargo build --release -p vela2-0p3b --bin vela2-onednn
+#   RUSTFLAGS='-C target-cpu=znver5' cargo build --release -p drivers --bin eg2-onednn
 
 # cc-rs (tokenizers/esaxx-rs, native bridges) must use g++. On this image
 # `/usr/bin/c++` is clang looking for gcc-14 headers that are not installed.

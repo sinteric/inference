@@ -5,7 +5,6 @@ assets/local/
 native/**/build/
 native/**/sdk/
 native/**/.sdk-src/
-crates/candle-mlas/vendor/
 /vendor/
 *.safetensors
 *.safetensors.onednn-*

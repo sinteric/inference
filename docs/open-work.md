@@ -1,6 +1,7 @@
 # Open work
 
-Checked against the tree on 2026-11-19. Each item says what is missing and why
+Checked against the tree on 2026-11-19; the items about Vela 2.0 and worker
+processes left with them on 2026-11-20. Each item says what is missing and why
 it matters; none of it is scheduled. When an item lands, delete it here in the
 same change.
 
@@ -9,34 +10,21 @@ same change.
 A host that runs these models behind a server needs these more than speed.
 
 - **Input limits.** EmbeddingGemma 2 bounds a text only by the workspace limit,
-  so a large text is tokenized before it is rejected. Vela's `max_batch` and
-  `max_seq_len` steer batching but reject nothing, and the questions and
-  windows in one request are unbounded. The OCR detector's 64 Mpx cap answers
-  with `Error::Shape`, not a "too large" error.
-- **Errors a host can map to a status.** `Error::Shape` covers both bad input
-  and broken internal invariants, and there is no `TooLarge` variant and no
-  `kind()` or `is_retryable()`. A host cannot tell a 400 from a 413 from a 500.
-- **Worker processes.** Only the `Config`, `Shape` and `Request` error kinds
-  cross the process boundary; every other kind arrives as `Message`, so the same
-  input can get a different status in process and isolated. The client waits on
-  the worker without a timeout, so a hung worker blocks its caller for good. A
-  model that fails to load is reloaded on every call, with no backoff and no
-  restart count. `main_if_worker` takes fd 3 without checking that it is a
-  socket.
+  so a large text is tokenized before it is refused or cut to the window.
 - **Deadlines and cancellation.** Every call blocks, and the compute lock waits
   without a timeout; a dropped async future still runs to completion.
-- **Observability.** `backend_stats()` is hidden and returns untyped JSON with an
-  unbounded list; there are no compute-lock wait stats and no `tracing`
-  feature. Only OCR reports per-stage timings.
-- **Warmup and readiness.** EmbeddingGemma 2 and the OCR models warm up; Vela has
-  no warmup, a worker has no ping, and no model reports what it loaded (name,
-  revision, limits).
-- **Config consistency.** Only the OCR configs verify weights against a
-  manifest; only the text-model configs take environment overrides.
+- **Observability.** `backend_stats()` lists every primitive implementation
+  it has run, with no bound; there are no compute-lock wait stats and no
+  `tracing` feature. Only OCR reports per-stage timings.
+- **Warmup and readiness.** Every model can warm up at load, and
+  `load_report()` says where its weights came from, but no model reports its
+  revision or its limits.
+- **Config consistency.** Each model pins its weights its own way: EG2 and the
+  OCR models through a TOML manifest, the guard through a SHA-256 field.
 - **Hot reload.** Swapping a model under load and unloading the old one after it
   drains is left to each host.
 - **Docs and versioning.** Doctests are `ignore`, so drift does not fail the
-  build; switch them to `no_run`. The crates are 0.1.0 with no tags.
+  build; switch them to `no_run`. The crate is 0.1.0 with no tags.
 
 ## Numerics
 
@@ -48,24 +36,26 @@ A host that runs these models behind a server needs these more than speed.
   nondeterministic tile-state fault the probe guards against. The pinned
   AVX-512 BF16 and FP32 passes are exact across thread counts on the same
   host. Unexplained; the suspect is a different oneDNN kernel choice per
-  thread count.
+  thread count. The same cosine, to every digit, before and after the fold
+  into one crate (a5804b4 and ca10c37, 2026-11-20).
 
 ## Speed and memory
 
 Measured on a 4-core Zen 5 (Ryzen 7 9700X) box unless noted; *est.* marks an
 estimate that was never measured.
 
-- **Request coalescing (EmbeddingGemma 2, maybe Vela).** Compute is serialized
+- **Request coalescing (EmbeddingGemma 2, the guard).** Compute is serialized
   per process, so requests queued behind the compute lock could run as one
   batch with no added wait. One padded batch of 4 ran 2.7× faster than four
   single forwards. Exactness needs a BF16 test that a row's result does not
   depend on how many rows share the matmul (proven today for FP32 only).
 - **Shape-free matmuls (oneDNN ukernel brgemm).** Every new sequence length
-  costs a plan (~150 ms for Vela) and plan memory is what the memory budget
+  costs a plan (~150 ms for Vela 2.0, the encoder the guard replaced) and plan
+  memory is what the memory budget
   evicts. oneDNN's experimental ukernel API runs on AVX-512 without AMX and
   would let one kernel cover every length. It needs
-  `ONEDNN_EXPERIMENTAL_UKERNEL=ON`, new bindings, and a re-gate of Vela (1e-4)
-  and EmbeddingGemma 2 (cosine). Also the base for a fused attention kernel.
+  `ONEDNN_EXPERIMENTAL_UKERNEL=ON`, new bindings, and a re-gate of the guard
+  and EmbeddingGemma 2 against their PyTorch references. Also the base for a fused attention kernel.
 - **OCR recognizer plans independent of width.** Per-width depthwise, stem, pool
   and SE convolutions hold ~399 MiB of plans and cost 150–370 ms on a cold
   page. Padding to width buckets failed before (426/437 lines exact) because
@@ -82,12 +72,9 @@ estimate that was never measured.
 - **Long EmbeddingGemma 2 inputs (2k+ tokens).** Recomputing per-layer
   embeddings from a saved input would save ~370 MB at 8,192 tokens (*est.*);
   the attention buffers could stay BF16.
-- **Vela small items.** Global layers use 64-query tiles where one tile of the
-  whole length would need one plan per length instead of two; head linears get
-  a plan per gather count where padding to 16 would share them.
-- **Packed weights shared across worker processes.** The packed-weight cache
-  bodies are unaligned and copied to the heap. Page-aligned, read-only mapped
-  bodies would share weights between workers and across restarts.
+- **Packed weights shared across processes.** The packed-weight cache bodies
+  are unaligned and copied to the heap. Page-aligned, read-only mapped bodies
+  would share weights between processes and across restarts.
 - **Allocator and huge pages.** Untried: a 2 MiB-aligned weight arena with
   `MADV_HUGEPAGE`, and jemalloc or mimalloc as the host allocator (which would
   also address the glibc arena growth `MALLOC_ARENA_MAX=2` works around).
@@ -120,7 +107,6 @@ Tried or checked, with the reason; do not retry without new evidence.
 - **Persistent JIT cache (`cache_blob`).** GPU only in oneDNN.
 - **oneDNN 3.14.** Its release candidate had nothing for AVX-512, Zen 5, brgemm,
   ukernels or memory (checked 2026-10-19).
-- **BF16 or int8 for Vela.** ~1e-2 logit error against a 1e-4 gate.
 - **int8 for EmbeddingGemma 2.** ~2 ms saved on short queries; Gemma's activation
   outliers put the cosine gate at risk.
 - **Winograd, K-split or BF16 for OCR.** Each changes accumulation order and
@@ -129,7 +115,5 @@ Tried or checked, with the reason; do not retry without new evidence.
 - **Padded recognizer batches.** 426/437 lines exact.
 - **Pool spin and caller-drain knobs, forked convolution tile copies.** No gain,
   or slower (tile copies on the pool cost 10%).
-- **Row padding or chunking for Vela.** 1–15% slower on repeated lengths; the
-  real cost was the plan cache evicting at random, fixed by an LRU.
 - **FP32-packed EmbeddingGemma 2 weights.** +260 MiB RSS and 1.2–1.5× slower on
   short inputs, for 0–4% on inputs of 512 tokens or more.

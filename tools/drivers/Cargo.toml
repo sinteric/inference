@@ -1,0 +1,38 @@
+[package]
+name = "drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Command-line drivers over the library's public API: the bench harness's persistent JSON workers and the OCR gate's JSONL runners."
+
+[lints]
+workspace = true
+
+[features]
+# `ppocr-ort`, the OCR gate's ONNX Runtime reference. Downloads ONNX Runtime.
+ort = ["dep:ort", "sinteric-inference/reference"]
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+png = "=0.17.16"
+serde.workspace = true
+serde_json.workspace = true
+sinteric-inference.workspace = true
+zune-jpeg = "=0.5.15"
+# 2.0.0-rc.13 bundles ONNX Runtime 1.28.0 (ort-sys dist.tsv ms@1.28.0).
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "ndarray", "download-binaries", "copy-dylibs", "tls-rustls"] }
+
+[[bin]]
+name = "eg2-onednn"
+path = "src/bin/eg2-onednn.rs"
+
+[[bin]]
+name = "ppocr-onednn"
+path = "src/bin/ppocr-onednn.rs"
+
+[[bin]]
+name = "ppocr-ort"
+path = "src/bin/ppocr-ort.rs"
+required-features = ["ort"]
