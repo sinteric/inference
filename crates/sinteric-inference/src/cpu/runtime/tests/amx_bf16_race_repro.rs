@@ -17,7 +17,7 @@
 //! by up to ~1.4.
 
 use crate::cpu::kernels::{f32_slice_to_bf16, f32_slice_to_bf16_nthreads};
-use crate::cpu::runtime::{CpuIsa, Runtime, RuntimeOptions};
+use crate::cpu::runtime::{IsaCap, Options, Runtime};
 
 fn random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed;
@@ -38,9 +38,9 @@ fn linear_bf16_src_runs_are_repeatable() {
     if std::env::var_os("AMX_REPRO_NO_PROBE").is_some() {
         crate::cpu::onednn::set_amx_probe(false);
     }
-    let mut options = RuntimeOptions::new().with_threads(4);
+    let mut options = Options::new().with_threads(4);
     if let Ok(name) = std::env::var("AMX_REPRO_ISA") {
-        options = options.with_cpu_isa(CpuIsa::from_name(&name).unwrap());
+        options = options.with_isa_cap(name.parse::<IsaCap>().unwrap());
     }
     let rt = Runtime::new(options).unwrap();
     let hw = rt.backend().unwrap();
@@ -76,8 +76,8 @@ fn linear_bf16_src_runs_are_repeatable() {
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
     });
-    eprintln!("{}: {differing}/1600 runs differ", rt.cpu_isa_name());
-    if crate::cpu::onednn::amx_probe_enabled() || !crate::cpu::onednn::isa_has_amx(rt.cpu_isa()) {
+    eprintln!("{}: {differing}/1600 runs differ", rt.isa());
+    if crate::cpu::onednn::amx_probe_enabled() || !rt.isa().has_amx() {
         assert_eq!(differing, 0, "BF16 matmul is not repeatable");
     }
 }

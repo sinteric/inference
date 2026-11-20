@@ -13,10 +13,10 @@ use anyhow::Result;
 use drivers::flags::Flags;
 use drivers::gate::{self, Line, Pages};
 use serde_json::{json, Value};
-use sinteric_inference::ppocr::{
+use sinteric_inference::cpu::{BackendOverrides, BackendStats, IsaCap, Options, Runtime};
+use sinteric_inference::ppocr::cpu::{
     DetConfig, Detector, RecConfig, Recognizer, DEFAULT_WORKSPACE_LIMIT_BYTES,
 };
-use sinteric_inference::{BackendOverrides, CpuIsa, Runtime, RuntimeOptions};
 
 const VALUED: &[&str] = &[
     "--model",
@@ -30,15 +30,15 @@ const VALUED: &[&str] = &[
 const SWITCHES: &[&str] = &["--profile"];
 
 /// The backend sizes `--profile` reports.
-fn backend_sizes(stats: &Value) -> Value {
+fn backend_sizes(stats: &BackendStats) -> Value {
     json!({
-        "cached_plans": stats["cached_plans"],
-        "conv_arena_bytes": stats["conv_arena_bytes"],
-        "conv_scratch_bytes": stats["conv_scratch_bytes"],
-        "execute_scratch_bytes": stats["execute_scratch_bytes"],
-        "conv_weight_bytes": stats["conv_packed_weight_bytes"],
-        "linear_weight_bytes": stats["packed_weight_bytes"],
-        "retained_pool_bytes": stats["retained_output_buffer_bytes"],
+        "cached_plans": stats.cached_plans,
+        "conv_arena_bytes": stats.conv_arena_bytes,
+        "conv_scratch_bytes": stats.conv_scratch_bytes,
+        "execute_scratch_bytes": stats.execute_scratch_bytes,
+        "conv_weight_bytes": stats.conv_packed_weight_bytes,
+        "linear_weight_bytes": stats.packed_weight_bytes,
+        "retained_pool_bytes": stats.retained_output_buffer_bytes,
     })
 }
 
@@ -50,9 +50,9 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "avx512_core_bf16".into());
     let profile = flags.switch("--profile");
     let rt = Runtime::new(
-        RuntimeOptions::new()
+        Options::new()
             .with_threads(flags.required("--threads")?)
-            .with_cpu_isa(CpuIsa::from_name(&isa)?),
+            .with_isa_cap(isa.parse::<IsaCap>()?),
     )?;
     // Detector and recognizer on one backend: one convolution arena sized
     // to the larger model.
@@ -65,8 +65,8 @@ fn main() -> Result<()> {
     )?;
     let det_config = DetConfig::new(model.join("det"));
     let max_pixels = det_config.options.max_pixels;
-    let det: Detector = shared.load(det_config)?;
-    let rec: Recognizer = shared.load(RecConfig::new(model.join("rec")))?;
+    let det = Detector::load(&shared, det_config)?;
+    let rec = Recognizer::load(&shared, RecConfig::new(model.join("rec")))?;
     let pages = Pages {
         images: flags.required("--images")?,
         out: flags.required("--out")?,

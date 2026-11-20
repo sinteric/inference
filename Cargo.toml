@@ -35,6 +35,10 @@ memmap2 = "0.9"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
 libc = "0.2"
 
+[workspace.lints.rust]
+# Every public type prints with `{:?}`, so a host can log what it holds.
+missing_debug_implementations = "warn"
+
 [workspace.lints.clippy]
 too_many_arguments = "allow"
 uninlined_format_args = "allow"

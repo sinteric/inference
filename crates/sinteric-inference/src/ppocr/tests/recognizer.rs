@@ -50,7 +50,8 @@ fn recognizer_parity() {
         .ocr_threads
         .unwrap_or(1);
     let cpu = backend(threads);
-    let rec = Recognizer::load(cpu.clone(), root.join("rec"), RecOptions::default(), true).unwrap();
+    let rec =
+        Recognizer::load_on(cpu.clone(), root.join("rec"), RecOptions::default(), true).unwrap();
     assert!(rec.forward(&[usize::MAX, 3, 48, 16], &[]).is_err());
     assert!(rec
         .forward(&[1, 3, 48, 16], &vec![f32::NAN; 3 * 48 * 16])
@@ -113,10 +114,9 @@ fn recognizer_parity() {
             count += 1;
         }
     }
-    let stats = cpu.stats_json();
-    let implementations = stats["implementations"].as_array().unwrap();
-    for imp in implementations {
-        assert!(!imp.as_str().unwrap().contains("ref:"), "{imp}");
+    let implementations = cpu.stats().implementations;
+    for imp in &implementations {
+        assert!(!imp.contains("ref:"), "{imp}");
     }
     println!(
         "SVTR: {} inspected non-ref primitives",
@@ -166,7 +166,7 @@ fn padded_attention_and_ctc_span() {
         batching: crate::ppocr::rec::Batching::Bucketed,
         ..RecOptions::default()
     };
-    let rec = Recognizer::load(cpu, root.join("rec"), options, true).unwrap();
+    let rec = Recognizer::load_on(cpu, root.join("rec"), options, true).unwrap();
     let input = npy(directory.join("input.npy"));
     let expected = npy(directory.join("output.npy"));
     let output = rec

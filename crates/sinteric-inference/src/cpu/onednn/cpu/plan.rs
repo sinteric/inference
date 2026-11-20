@@ -508,7 +508,7 @@ impl OnednnCpu {
         let missing = !self
             .state
             .lock()
-            .map_err(|_| crate::Error::Poisoned("backend"))?
+            .map_err(|_| crate::Error::poisoned("backend"))?
             .plans
             .contains_key(&key);
         let mut built = None;
@@ -529,7 +529,7 @@ impl OnednnCpu {
         let mut s = self
             .state
             .lock()
-            .map_err(|_| crate::Error::Poisoned("backend"))?;
+            .map_err(|_| crate::Error::poisoned("backend"))?;
         if !s.plans.contains_key(&key) {
             // Evicted since the check above (budget), or built here first time.
             let (plan, t) = match built {
@@ -545,7 +545,7 @@ impl OnednnCpu {
                     s = self
                         .state
                         .lock()
-                        .map_err(|_| crate::Error::Poisoned("backend"))?;
+                        .map_err(|_| crate::Error::poisoned("backend"))?;
                     (plan, t)
                 }
             };
@@ -696,7 +696,7 @@ impl OnednnCpu {
             None => self
                 .state
                 .lock()
-                .map_err(|_| crate::Error::Poisoned("backend"))?,
+                .map_err(|_| crate::Error::poisoned("backend"))?,
         };
         if convert_dt > 0.0 {
             s.convert_s += convert_dt;

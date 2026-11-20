@@ -298,7 +298,6 @@ pub fn reflect_pad_nchw(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Error;
 
     /// The align-corners resize keeps corners exactly and interpolates
     /// linearly between them; equal sizes are the identity.
@@ -374,9 +373,7 @@ mod tests {
             pack_unit_nchw(&planes, 2, 1, PixelFormat::Gray8, 1).unwrap(),
             gray
         );
-        assert!(matches!(
-            pack_unit_nchw(&planes[..5], 2, 1, PixelFormat::Gray8, 1),
-            Err(Error::Shape(_))
-        ));
+        assert!(pack_unit_nchw(&planes[..5], 2, 1, PixelFormat::Gray8, 1)
+            .is_err_and(|e| e.kind() == crate::ErrorKind::Internal));
     }
 }

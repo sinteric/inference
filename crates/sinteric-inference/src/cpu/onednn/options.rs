@@ -23,19 +23,6 @@ pub enum CpuIsaCap {
 }
 
 impl CpuIsaCap {
-    /// Parses `best_available` (or `best`, `default`), `AVX512_CORE_BF16`
-    /// or `AVX2`, in any case.
-    pub fn from_name(name: &str) -> crate::Result<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "default" | "best" | "best_available" => Ok(Self::BestAvailable),
-            "avx512_core_bf16" => Ok(Self::Avx512CoreBf16),
-            "avx2" => Ok(Self::Avx2),
-            _ => Err(crate::Error::Config(format!(
-                "unknown CPU ISA cap {name:?}; supported: best_available, AVX512_CORE_BF16, AVX2"
-            ))),
-        }
-    }
-
     pub fn as_dnnl(self) -> dnnl_cpu_isa_t {
         match self {
             Self::BestAvailable => dnnl_cpu_isa_default,
@@ -125,20 +112,6 @@ mod tests {
         assert!(c.file.is_none());
         assert!(!c.verify_weights);
         assert!(c.manifest.is_none());
-    }
-
-    #[test]
-    fn isa_names() {
-        assert_eq!(
-            CpuIsaCap::from_name("AVX512_CORE_BF16").unwrap(),
-            CpuIsaCap::Avx512CoreBf16
-        );
-        assert_eq!(
-            CpuIsaCap::from_name("best_available").unwrap(),
-            CpuIsaCap::BestAvailable
-        );
-        assert_eq!(CpuIsaCap::from_name("avx2").unwrap(), CpuIsaCap::Avx2);
-        assert!(CpuIsaCap::from_name("AVX512_FP16").is_err());
     }
 
     #[test]

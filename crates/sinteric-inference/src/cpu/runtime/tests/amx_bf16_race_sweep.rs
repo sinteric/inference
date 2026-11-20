@@ -6,7 +6,7 @@
 //! unguarded; the default runtime falls back from AMX on an affected host).
 
 use crate::cpu::kernels::{f32_slice_to_bf16, f32_slice_to_bf16_nthreads, layout_qkv_rope};
-use crate::cpu::runtime::{CpuIsa, Runtime, RuntimeOptions};
+use crate::cpu::runtime::{IsaCap, Options, Runtime};
 
 fn random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed;
@@ -58,21 +58,22 @@ fn sweep() {
     if std::env::var_os("AMX_REPRO_NO_PROBE").is_some() {
         crate::cpu::onednn::set_amx_probe(false);
     }
-    let mut options = RuntimeOptions::new().with_threads(threads);
-    if let Some(v) = std::env::var("AMX_REPRO_VERBOSE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        options = options.with_verbose(v);
-    }
+    let mut options = Options::new().with_threads(threads);
     if let Some(name) = std::env::var("AMX_REPRO_ISA")
         .ok()
         .filter(|n| !n.is_empty())
     {
-        options = options.with_cpu_isa(CpuIsa::from_name(&name).unwrap());
+        options = options.with_isa_cap(name.parse::<IsaCap>().unwrap());
     }
     let rt = Runtime::new(options).unwrap();
     let hw = rt.backend().unwrap();
+    if let Some(v) = std::env::var("AMX_REPRO_VERBOSE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        // SAFETY: sets oneDNN's process-wide verbose level; takes no pointer.
+        unsafe { onednn_sys::dnnl_set_verbose(v) };
+    }
     let mut total_bad = 0;
     let mut total = 0;
     for sh in shapes.split(',') {
@@ -159,7 +160,7 @@ fn sweep() {
         }
         eprintln!(
             "RESULT isa={} thr={threads} mode={mode} m={m} k={k} n={n}: {bad}/{reps}",
-            rt.cpu_isa_name()
+            rt.isa()
         );
         eprintln!(
             "  CTX bad&switched={} bad&quiet={} good&switched={} good&quiet={}",
@@ -170,6 +171,6 @@ fn sweep() {
     }
     eprintln!(
         "TOTAL isa={} thr={threads} mode={mode}: {total_bad}/{total}",
-        rt.cpu_isa_name()
+        rt.isa()
     );
 }

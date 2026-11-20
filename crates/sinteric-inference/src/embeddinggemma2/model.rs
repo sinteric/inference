@@ -12,9 +12,10 @@ use crate::cpu::kernels::{
     SQRT_512_BF16,
 };
 use crate::cpu::onednn::{cache_path_with, CacheOptions, OnednnCpu, PackedWeight};
+use crate::cpu::runtime::{BackendStats, Isa, LoadReport, PackedWeights, WeightSource};
 use crate::tensor_file::Mapped;
 use crate::{check_shape, Result, ResultContext as Context};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -35,19 +36,33 @@ mod vision;
 use load::expected_weight_pin;
 use tower::TowerSource;
 
-pub use crate::cpu::runtime::Precision;
+/// What EmbeddingGemma 2's matmuls compute in on a CPU. RMSNorm, softmax,
+/// RoPE, the residual stream, pooling and the output stay FP32 either way,
+/// and the weights are the BF16 checkpoint either way: FP32 widens them
+/// exactly, so only the matmul inputs differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Precision {
+    /// BF16 matmul inputs, FP32 accumulation. The default where the CPU has
+    /// BF16 matmul kernels ([`Isa::has_bf16_matmul`]): faster than FP32 at
+    /// every length but the shortest texts on a Zen 5.
+    Bf16,
+    /// FP32 matmuls, matching the PyTorch FP32 reference. The default, and
+    /// the only precision, on AVX2.
+    Fp32,
+}
 
-/// Precisions EG2 implements; the first is the default. Weights are the BF16
-/// checkpoint either way: [`Precision::Fp32`] widens them exactly (BF16
-/// storage), so only activations differ.
-pub const PRECISIONS: &[Precision] = &[Precision::Bf16, Precision::Fp32];
+crate::cpu::runtime::precision_names!(Precision);
 
-/// Stats label of a precision EG2 runs.
-fn precision_label(p: Precision) -> &'static str {
-    if p == Precision::Fp32 {
-        "FP32"
-    } else {
-        "BF16-matmul/FP32-stream"
+impl Precision {
+    /// The precisions EmbeddingGemma 2 runs on `isa`, its default first.
+    pub(crate) fn on(isa: Isa) -> &'static [Self] {
+        if isa.has_bf16_matmul() {
+            &[Self::Bf16, Self::Fp32]
+        } else {
+            &[Self::Fp32]
+        }
     }
 }
 
@@ -72,7 +87,7 @@ pub struct Model {
     tile: usize,
     max: usize,
     precision: Precision,
-    load_source: &'static str,
+    load_source: WeightSource,
     load_profile: BTreeMap<String, f64>,
 }
 
@@ -379,7 +394,7 @@ impl Model {
             &[
                 tokens
                     .checked_add(64)
-                    .ok_or(crate::Error::SizeOverflow("padded rows"))?,
+                    .ok_or(crate::Error::size_overflow("padded rows"))?,
                 N_LAYERS,
                 PLE_WIDTH,
                 4,
@@ -399,7 +414,7 @@ impl Model {
                 "EG2 reserved BF16 heads",
                 &[tokens, N_QUERY_HEADS, 512, 5, 2],
             )?)
-            .ok_or(crate::Error::SizeOverflow("EG2 workspace"))?;
+            .ok_or(crate::Error::size_overflow("EG2 workspace"))?;
         self.backend.validate_workspace(planned)?;
         self.backend.reserve(
             crate::checked_size("activation elements", &[m_pad, HIDDEN])?,
@@ -743,13 +758,9 @@ impl Model {
         &self,
         img: &crate::embeddinggemma2::media::ImagePatches,
     ) -> Result<Vec<f32>> {
-        let tower = self
-            .vision
-            .as_ref()
-            .ok_or_else(|| crate::Error::Unsupported {
-                what: "EG2 image input",
-                reason: "load with Config::image = true".into(),
-            })?;
+        let tower = self.vision.as_ref().ok_or_else(|| {
+            crate::Error::unsupported("EG2 image input", "load with Config::image = true")
+        })?;
         tower.forward(&self.backend, self.precision, self.tile, img)
     }
 
@@ -758,13 +769,9 @@ impl Model {
         &self,
         f: &crate::embeddinggemma2::media::AudioFeatures,
     ) -> Result<Vec<f32>> {
-        let tower = self
-            .audio
-            .as_ref()
-            .ok_or_else(|| crate::Error::Unsupported {
-                what: "EG2 audio input",
-                reason: "load with Config::audio = true".into(),
-            })?;
+        let tower = self.audio.as_ref().ok_or_else(|| {
+            crate::Error::unsupported("EG2 audio input", "load with Config::audio = true")
+        })?;
         tower.forward(&self.backend, self.precision, f)
     }
 
@@ -826,16 +833,32 @@ impl Model {
         self.precision
     }
 
-    pub fn stats(&self) -> Value {
-        let mut stats = self.backend.stats();
-        stats["load_source"] = serde_json::json!(self.load_source);
-        stats["load_profile_s"] = serde_json::json!(self.load_profile);
-        stats["precision"] = serde_json::json!(precision_label(self.precision));
-        stats["modalities"] = serde_json::json!({
-            "image": self.vision.as_ref().map(|t| t.load_source()),
-            "audio": self.audio.as_ref().map(|t| t.load_source()),
-        });
-        stats
+    pub fn backend_stats(&self) -> BackendStats {
+        self.backend.stats()
+    }
+
+    /// Where each part's packed weights came from, and the load's phases.
+    pub fn load_report(&self) -> LoadReport {
+        let mut packed = vec![PackedWeights {
+            part: "text",
+            source: self.load_source.clone(),
+        }];
+        if let Some(t) = &self.vision {
+            packed.push(PackedWeights {
+                part: "image",
+                source: t.load_source().clone(),
+            });
+        }
+        if let Some(t) = &self.audio {
+            packed.push(PackedWeights {
+                part: "audio",
+                source: t.load_source().clone(),
+            });
+        }
+        LoadReport {
+            packed,
+            phases_s: self.load_profile.clone(),
+        }
     }
 }
 

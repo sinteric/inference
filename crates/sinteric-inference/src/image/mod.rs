@@ -50,7 +50,7 @@ impl<'a> ImageView<'a> {
         let extent = (height as usize - 1)
             .checked_mul(stride)
             .and_then(|v| v.checked_add(row))
-            .ok_or(Error::SizeOverflow("image extent"))?;
+            .ok_or(Error::size_overflow("image extent"))?;
         crate::check_shape!(
             extent <= isize::MAX as usize && data.len() >= extent,
             "image buffer is shorter than strided extent"
@@ -105,7 +105,7 @@ pub fn detector_size(src: ImageSize, max_side: Option<u32>) -> Result<ImageSize>
     });
     let side = |s: u32| -> Result<u32> {
         let n = ((s as f64 * scale / 32.).round_ties_even().max(1.) * 32.) as u64;
-        u32::try_from(n).map_err(|_| Error::SizeOverflow("detector resize side"))
+        u32::try_from(n).map_err(|_| Error::size_overflow("detector resize side"))
     };
     Ok(ImageSize {
         width: side(src.width)?,

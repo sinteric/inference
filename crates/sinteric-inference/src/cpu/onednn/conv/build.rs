@@ -60,7 +60,7 @@ pub(super) fn native_key(node: &Node, specs: &[(i32, Md, Binding)]) -> Result<[u
         }
         Op::Prelu { .. } => int(9),
         Op::Reorder { .. } => int(10),
-        _ => return Err(Error::Backend("glue in native primitive cache".into())),
+        _ => return Err(Error::internal("glue in native primitive cache")),
     }
     int(node.post_ops.len() as i64);
     for post in &node.post_ops {
@@ -119,7 +119,7 @@ impl ConvNet {
         let mut caches = self
             .primitive_cache
             .lock()
-            .map_err(|_| Error::Poisoned("conv primitive cache"))?;
+            .map_err(|_| Error::poisoned("conv primitive cache"))?;
         let Caches {
             steps: primitive_cache,
             natives,
@@ -175,7 +175,7 @@ impl ConvNet {
                     first[dst] = first[dst].min(id);
                     offset = offset
                         .checked_add(tensors[id].md.bytes()?)
-                        .ok_or(Error::SizeOverflow("concat placement"))?;
+                        .ok_or(Error::size_overflow("concat placement"))?;
                 }
                 check_shape!(
                     offset == tensors[dst].md.bytes()?,
@@ -209,21 +209,21 @@ impl ConvNet {
             for (start, bytes) in conflicts {
                 let end = offset
                     .checked_add(sizes[id])
-                    .ok_or(Error::SizeOverflow("conv arena"))?;
+                    .ok_or(Error::size_overflow("conv arena"))?;
                 if end <= start {
                     break;
                 }
                 offset = offset.max(
                     start
                         .checked_add(bytes)
-                        .ok_or(Error::SizeOverflow("conv arena"))?,
+                        .ok_or(Error::size_overflow("conv arena"))?,
                 );
             }
             offsets[id] = offset;
             peak = peak.max(
                 offset
                     .checked_add(sizes[id])
-                    .ok_or(Error::SizeOverflow("conv arena"))?,
+                    .ok_or(Error::size_overflow("conv arena"))?,
             );
             placed.push(id);
         }
@@ -231,19 +231,19 @@ impl ConvNet {
             if parent[id] != id {
                 offsets[id] = offsets[parent[id]]
                     .checked_add(relative[id])
-                    .ok_or(Error::SizeOverflow("concat offset"))?;
+                    .ok_or(Error::size_overflow("concat offset"))?;
             }
         }
         peak = peak
             .checked_add(64)
-            .ok_or(Error::SizeOverflow("conv arena alignment"))?;
+            .ok_or(Error::size_overflow("conv arena alignment"))?;
         let limit = self.cpu.conv_limit();
         if peak > limit {
-            return Err(Error::WorkspaceLimit {
-                operation: "ConvNet activation arena",
-                requested: peak,
+            return Err(Error::workspace_limit(
+                "ConvNet activation arena",
+                peak,
                 limit,
-            });
+            ));
         }
 
         let mut steps = Vec::new();
@@ -272,7 +272,7 @@ impl ConvNet {
             if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
                 let entry = cache
                     .remove(i)
-                    .ok_or_else(|| Error::Backend("conv primitive LRU index".into()))?;
+                    .ok_or_else(|| Error::internal("conv primitive LRU index"))?;
                 steps.push(entry.1.clone());
                 cache.push_front(entry);
                 continue;
@@ -600,16 +600,16 @@ impl ConvNet {
                         attr.0,
                     ),
                     Op::DepthToSpace2x => {
-                        return Err(Error::Backend("unexpected depth-to-space primitive".into()))
+                        return Err(Error::internal("unexpected depth-to-space primitive"))
                     }
                     Op::SpatialMean(_) => {
-                        return Err(Error::Backend("unexpected spatial mean primitive".into()))
+                        return Err(Error::internal("unexpected spatial mean primitive"))
                     }
                     Op::ZeroPad { .. } => {
-                        return Err(Error::Backend("unexpected zero pad primitive".into()))
+                        return Err(Error::internal("unexpected zero pad primitive"))
                     }
                     Op::UpsampleNearest { .. } => {
-                        return Err(Error::Backend("unresolved resize scale".into()))
+                        return Err(Error::internal("unresolved resize scale"))
                     }
                     Op::ConcatAlignedChannels | Op::Concat { .. } => {
                         let axis = if let Op::Concat { axis } = node.op {
@@ -700,11 +700,11 @@ impl ConvNet {
                 tile.destination_offset = tile
                     .source_offset
                     .checked_add(src_md.bytes()?)
-                    .ok_or(Error::SizeOverflow("pointwise scratch"))?;
+                    .ok_or(Error::size_overflow("pointwise scratch"))?;
                 step.scratch_bytes = tile
                     .destination_offset
                     .checked_add(dst_md.bytes()?)
-                    .ok_or(Error::SizeOverflow("pointwise scratch"))?;
+                    .ok_or(Error::size_overflow("pointwise scratch"))?;
                 step.tile = Some(tile);
             }
             let step = Arc::new(step);
@@ -733,14 +733,14 @@ impl ConvNet {
         let scratch_bytes = steps.iter().map(|s| s.scratch_bytes).max().unwrap_or(64);
         let total = peak
             .checked_add(scratch_bytes)
-            .ok_or(Error::SizeOverflow("conv workspace"))?;
+            .ok_or(Error::size_overflow("conv workspace"))?;
         let limit = self.cpu.conv_limit();
         if total > limit {
-            return Err(Error::WorkspaceLimit {
-                operation: "ConvNet activation arena + scratch",
-                requested: total,
+            return Err(Error::workspace_limit(
+                "ConvNet activation arena + scratch",
+                total,
                 limit,
-            });
+            ));
         }
         Ok(Plan {
             shape,

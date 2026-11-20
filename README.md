@@ -8,16 +8,17 @@ and a model is added only when it is worth that work.
 It is a library and nothing else: an application links it and runs the
 models in its own process. It has no notion of environments, so there is no
 production or development setting and no default for one. The application
-chooses the model, the threads, the ISA cap and the caches through `Runtime`
-and each model's `Config` ([library guide](docs/library.md)).
+chooses the model, the threads, the ISA cap and the caches through
+`cpu::Runtime` and each model's `Config`; the library picks each model's
+precision for the CPU it runs on and says which ([library guide](docs/library.md)).
 
 ## Models
 
 | Model | What it does | Precision | Module |
 |---|---|---|---|
-| [`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2) | Embeddings: the text tower, with opt-in image and audio towers (`EmbeddingGemma2::embed_parts`) | BF16 matmuls with an FP32 residual stream, or FP32 | `embeddinggemma2` |
-| [`Horizon-Labs/prompt-injection-guard-base`](https://huggingface.co/Horizon-Labs/prompt-injection-guard-base) | Prompt-injection guard: a ModernBERT encoder with a two-label head (`Guard::classify`), and its hidden states for heads of a caller's own (`Guard::encode`) | FP32, or BF16 matmuls | `guard` |
-| PP-OCR | A detector, a Korean CTC recognizer and the UVDoc page unwarper, as three models (`ppocr::{Detector, Recognizer, Unwarper}`) | FP32 | `ppocr` |
+| [`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2) | Embeddings: the text tower, with opt-in image and audio towers (`EmbeddingGemma2::embed_parts`) | BF16 matmuls with an FP32 residual stream, or FP32; FP32 only below AVX-512 BF16 | `embeddinggemma2::cpu` |
+| [`Horizon-Labs/prompt-injection-guard-base`](https://huggingface.co/Horizon-Labs/prompt-injection-guard-base) | Prompt-injection guard: a ModernBERT encoder with a two-label head (`Guard::classify`), and its hidden states for heads of a caller's own (`Guard::encode`) | FP32, or BF16 matmuls where the CPU has BF16 kernels | `guard::cpu` |
+| PP-OCR | A detector, a Korean CTC recognizer and the UVDoc page unwarper, as three models (`Detector`, `Recognizer`, `Unwarper`) | FP32 | `ppocr::cpu` |
 
 EmbeddingGemma 2's 262k×512 embedding table stays a memory map, so only the
 rows a text reaches become resident. The PP-OCR unwarper's grid matches ONNX
@@ -60,7 +61,7 @@ flags alone:
 
 ```
 crates/onednn-sys          bindgen FFI for dnnl_* (oneDNN 3.13.4 C API, linked statically)
-crates/sinteric-inference  the library: Runtime + one module per model; internals private
+crates/sinteric-inference  the library: cpu::Runtime + one module per model, with a cpu submodule each; internals private
 tools/drivers              command-line drivers for the gates and benchmarks
 tools/golden               the refactor gate: every model's outputs bit for bit
 tools/ppocr-import         pinned ONNX importer and ORT fixture/qualification tools
@@ -97,8 +98,9 @@ physical core**, using the **lowest** SMT sibling (matching the harness;
 `1,3,5,7` on a 4-core SMT guest is rejected as over-budget). Pass
 `--cpuset 0,2,4,6` to override.
 The library does not read `available_parallelism` or the process
-environment. Configure threads, ISA, cache and affinity through `Runtime`
-and each model's `Config` (see [`docs/library.md`](docs/library.md)).
+environment, and it never sets the process's affinity: the drivers pin
+themselves to `Runtime::cpus`. Configure threads, ISA and caches through
+`cpu::Runtime` and each model's `Config` (see [`docs/library.md`](docs/library.md)).
 
 Weights are mmapped and packed into oneDNN blocked layouts. The packed-weight
 cache is **on by default** (`CacheConfig::enabled`). The file
@@ -110,7 +112,7 @@ the embedding table, which stays a zero-copy mmap view of safetensors
 of the cache and drops those pages after each copy. The cache
 auto-invalidates if size/mtime, the manifest sha, the oneDNN version, the
 effective ISA, or a packed layout tag change. If the cache path is not writable, load packs from safetensors,
-logs one stderr warning, and continues. Full sha256 is opt-in
+says why in the model's `load_report()`, and continues. Full sha256 is opt-in
 (`verify_weights`) and is already done at download. Safetensors remains the
 source of truth.
 

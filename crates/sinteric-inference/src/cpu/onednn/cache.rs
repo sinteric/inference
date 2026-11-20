@@ -8,6 +8,8 @@
 //! size and still be a different blocking), so a miss on ISA or layout tag
 //! rebuilds from safetensors. Packed tensors are streamed on write.
 
+use crate::cpu::onednn::{OnednnCpu, PackedWeight};
+use crate::cpu::runtime::CacheWrite;
 use crate::{check_shape, Result, ResultContext as Context};
 use memmap2::{Mmap, MmapOptions, UncheckedAdvice};
 use std::fs::File;
@@ -101,6 +103,8 @@ pub struct CacheWriter {
     dest: PathBuf,
     n_packed: u32,
     finished: bool,
+    /// Why this writer stopped writing, once it has.
+    failed: Option<String>,
 }
 
 impl CacheWriter {
@@ -124,23 +128,80 @@ impl CacheWriter {
             dest: path.to_path_buf(),
             n_packed: 0,
             finished: false,
+            failed: None,
         })
     }
 
-    pub fn dest(&self) -> &Path {
-        &self.dest
+    /// Like [`CacheWriter::create`], but a cache file that cannot be created
+    /// gives a writer that has already stopped, so the load packs from
+    /// safetensors and reports why ([`CacheWriter::close`]).
+    pub fn start(path: &Path, meta: &CacheMeta) -> Self {
+        Self::create(path, meta).unwrap_or_else(|e| Self {
+            file: None,
+            tmp: path.with_extension("v5.tmp"),
+            dest: path.to_path_buf(),
+            n_packed: 0,
+            finished: false,
+            failed: Some(e.to_string()),
+        })
     }
 
-    /// Like [`create`], but returns `None` if the cache path is not writable
-    /// so the caller can pack from safetensors and continue. Logs one stderr
-    /// warning on failure.
-    pub fn try_create(path: &Path, meta: &CacheMeta) -> Option<Self> {
-        match Self::create(path, meta) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                cache_write_failed(path, &e);
-                None
-            }
+    /// Whether this writer is still writing.
+    pub fn is_writing(&self) -> bool {
+        self.failed.is_none()
+    }
+
+    /// Stop writing and remove the partial file; the load goes on.
+    pub fn abandon(&mut self, reason: impl std::fmt::Display) {
+        if self.failed.is_none() {
+            self.failed = Some(reason.to_string());
+        }
+        self.file.take();
+        let _ = std::fs::remove_file(&self.tmp);
+    }
+
+    /// Write `w`, packed under `name`, unless this writer has stopped; a
+    /// failed write stops it.
+    pub fn record(
+        &mut self,
+        backend: &OnednnCpu,
+        w: &PackedWeight,
+        name: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if !self.is_writing() {
+            return Ok(());
+        }
+        let mut bytes = crate::try_vec::<u8>(w.bytes())?;
+        let written = backend.unpack_into(w, &mut bytes).and_then(|()| {
+            self.write_packed(PackedEntry {
+                name: name.to_string(),
+                n,
+                k,
+                bytes,
+                layout: w.layout_tag(),
+            })
+        });
+        if let Err(e) = written {
+            self.abandon(format!("writing {name}: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Finish the file with the small tensors `raw` and say what became of
+    /// it.
+    pub fn close(self, raw: &[RawTensor]) -> CacheWrite {
+        let path = self.dest.clone();
+        if let Some(reason) = self.failed.clone() {
+            return CacheWrite::Failed { path, reason };
+        }
+        match self.finish(raw) {
+            Ok(()) => CacheWrite::Written { path },
+            Err(e) => CacheWrite::Failed {
+                path,
+                reason: e.to_string(),
+            },
         }
     }
 
@@ -166,7 +227,7 @@ impl CacheWriter {
         {
             let f = self.file()?;
             let count = u32::try_from(raw.len())
-                .map_err(|_| crate::Error::SizeOverflow("raw cache tensor count"))?;
+                .map_err(|_| crate::Error::size_overflow("raw cache tensor count"))?;
             f.write_all(&count.to_le_bytes())?;
             for e in raw {
                 write_name(f, &e.name)?;
@@ -282,10 +343,9 @@ pub fn apply_cache(
         "cache raw tensor count {n_raw} exceeds remaining file"
     );
     let mut raw = Vec::new();
-    raw.try_reserve_exact(n_raw)
-        .map_err(|_| crate::Error::Allocation {
-            bytes: n_raw.saturating_mul(std::mem::size_of::<RawTensor>()),
-        })?;
+    raw.try_reserve_exact(n_raw).map_err(|_| {
+        crate::Error::out_of_memory(n_raw.saturating_mul(std::mem::size_of::<RawTensor>()))
+    })?;
     for _ in 0..n_raw {
         let name = cur.name()?;
         let nbytes = cur.u64()? as usize;
@@ -298,14 +358,6 @@ pub fn apply_cache(
         advise_unused(&mmap, body_off, nbytes);
     }
     Ok(Some(raw))
-}
-
-/// One-line stderr notice; load continues from safetensors.
-pub fn cache_write_failed(path: &Path, err: impl std::fmt::Display) {
-    eprintln!(
-        "warning: packed-weight cache not written at {}: {err}",
-        path.display()
-    );
 }
 
 struct Cursor<'a> {
@@ -332,7 +384,9 @@ impl<'a> Cursor<'a> {
     }
     fn name(&mut self) -> Result<String> {
         let nl = u16::from_le_bytes(self.take(2)?.try_into()?) as usize;
-        String::from_utf8(self.take(nl)?.to_vec()).context("cache name utf8")
+        String::from_utf8(self.take(nl)?.to_vec()).map_err(|e| {
+            crate::Error::with_source(crate::ErrorKind::ModelFiles, "cache name utf8", e)
+        })
     }
 }
 
@@ -366,7 +420,8 @@ fn write_name(f: &mut impl Write, name: &str) -> Result<()> {
 }
 
 fn parse_sha(hex: &str) -> Result<[u8; 32]> {
-    let raw = hex::decode(hex.trim()).context("sha256 hex")?;
+    let raw = hex::decode(hex.trim())
+        .map_err(|e| crate::Error::with_source(crate::ErrorKind::ModelFiles, "sha256 hex", e))?;
     check_shape!(raw.len() == 32, "sha256 length");
     let mut out = [0u8; 32];
     out.copy_from_slice(&raw);
@@ -659,14 +714,22 @@ mod tests {
     }
 
     #[test]
-    fn unwritable_cache_path_returns_none() {
+    fn unwritable_cache_path_is_reported_not_fatal() {
         let dir = std::env::temp_dir().join("sinteric-pk-cache-unwritable");
         let _ = std::fs::create_dir_all(&dir);
         let not_dir = dir.join("not-a-directory");
         std::fs::write(&not_dir, b"x").unwrap();
         let p = not_dir.join("model.safetensors.onednn-3.13.4.v5");
         let sha = "22".repeat(32);
-        assert!(CacheWriter::try_create(&p, &sample_meta(&sha, 1, 0)).is_none());
+        let writer = CacheWriter::start(&p, &sample_meta(&sha, 1, 0));
+        assert!(!writer.is_writing());
+        match writer.close(&[]) {
+            crate::cpu::CacheWrite::Failed { path, reason } => {
+                assert_eq!(path, p);
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected a failed cache write, got {other:?}"),
+        }
     }
 
     #[test]

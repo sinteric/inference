@@ -109,7 +109,7 @@ pub(crate) struct Index {
 impl Index {
     /// The header of the file `bytes`, checked as the module doc says.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        let asset = |m: String| Error::Asset(format!("safetensors: {m}"));
+        let asset = |m: String| Error::model_files(format!("safetensors: {m}"));
         let len: [u8; 8] = bytes
             .get(..8)
             .and_then(|b| b.try_into().ok())
@@ -187,7 +187,7 @@ impl Index {
     fn info(&self, name: &str) -> Result<&Info> {
         self.tensors
             .get(name)
-            .ok_or_else(|| Error::Missing(format!("tensor {name}")))
+            .ok_or_else(|| Error::missing(format!("tensor {name}")))
     }
 
     /// The tensor names, sorted.
@@ -213,7 +213,7 @@ impl Index {
     fn extent<T: Element>(&self, name: &str, shape: &[usize]) -> Result<(usize, usize)> {
         let i = self.info(name)?;
         if i.dtype != T::DTYPE || i.shape != shape {
-            return Err(Error::Asset(format!(
+            return Err(Error::model_files(format!(
                 "tensor {name}: {:?} {:?}, expected {:?} {shape:?}",
                 i.dtype,
                 i.shape,
@@ -314,7 +314,7 @@ impl<T: Element> Mapped<T> {
 
 fn aligned<T>(ptr: *const u8, name: &str) -> Result<()> {
     if !(ptr as usize).is_multiple_of(std::mem::align_of::<T>()) || cfg!(target_endian = "big") {
-        return Err(Error::Asset(format!(
+        return Err(Error::model_files(format!(
             "tensor {name}: misaligned or big-endian mapping"
         )));
     }
@@ -407,7 +407,7 @@ pub(crate) mod tests {
         ] {
             let bytes = encode(header.clone(), &vec![0; body]);
             assert!(
-                matches!(Index::parse(&bytes), Err(Error::Asset(_))),
+                Index::parse(&bytes).is_err_and(|e| e.kind() == crate::ErrorKind::ModelFiles),
                 "{header}"
             );
         }
@@ -444,18 +444,15 @@ pub(crate) mod tests {
         assert_eq!(file.view::<u16>("b", &[2]).unwrap(), [0x3f80, 0x4000]);
         assert!(file.view::<f32>("a", &[4]).is_err(), "wrong shape");
         assert!(file.view::<u16>("a", &[2, 2]).is_err(), "not BF16");
-        assert!(matches!(
-            file.view::<f32>("missing", &[1]),
-            Err(Error::Missing(_))
-        ));
+        assert!(file
+            .view::<f32>("missing", &[1])
+            .is_err_and(|e| e.kind() == crate::ErrorKind::ModelFiles));
         file.release("a");
         file.release("missing");
         let b = file.into_view::<u16>("b", &[2]).unwrap();
         assert_eq!(b.as_slice(), [0x3f80, 0x4000]);
-        assert!(matches!(
-            TensorFile::open(&dir.join("absent.safetensors")),
-            Err(Error::File { .. })
-        ));
+        assert!(TensorFile::open(&dir.join("absent.safetensors"))
+            .is_err_and(|e| e.kind() == crate::ErrorKind::ModelFiles));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

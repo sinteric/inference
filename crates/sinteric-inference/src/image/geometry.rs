@@ -28,10 +28,8 @@ pub fn convex_hull(points: &[Point]) -> Result<Vec<Point>> {
         return Ok(p);
     }
     let mut h = Vec::new();
-    h.try_reserve_exact(p.len().checked_mul(2).ok_or(Error::SizeOverflow("hull"))?)
-        .map_err(|_| Error::Allocation {
-            bytes: points.len().saturating_mul(16),
-        })?;
+    h.try_reserve_exact(p.len().checked_mul(2).ok_or(Error::size_overflow("hull"))?)
+        .map_err(|_| Error::out_of_memory(points.len().saturating_mul(16)))?;
     for &v in &p {
         while h.len() >= 2 && cross(h[h.len() - 2], h[h.len() - 1], v) <= 0. {
             h.pop();
@@ -215,10 +213,10 @@ pub fn contours(mask: &[u8], width: usize, height: usize) -> Result<Vec<Vec<Poin
     );
     let stride = width
         .checked_add(2)
-        .ok_or(Error::SizeOverflow("contour row"))?;
+        .ok_or(Error::size_overflow("contour row"))?;
     let rows = height
         .checked_add(2)
-        .ok_or(Error::SizeOverflow("contour rows"))?;
+        .ok_or(Error::size_overflow("contour rows"))?;
     let mut image = crate::try_vec::<i32>(crate::checked_size("contour image", &[stride, rows])?)?;
     for y in 0..height {
         for x in 0..width {
@@ -251,7 +249,7 @@ pub fn contours(mask: &[u8], width: usize, height: usize) -> Result<Vec<Vec<Poin
             };
             border = border
                 .checked_add(1)
-                .ok_or(Error::SizeOverflow("contour labels"))?;
+                .ok_or(Error::size_overflow("contour labels"))?;
             let first = (0..8)
                 .map(|k| (back + k) % 8)
                 .find(|&k| image[(start as isize + offsets[k]) as usize] != 0);
@@ -267,7 +265,7 @@ pub fn contours(mask: &[u8], width: usize, height: usize) -> Result<Vec<Vec<Poin
                     let back = offsets
                         .iter()
                         .position(|&o| current as isize + o == prev as isize)
-                        .ok_or_else(|| Error::Backend("contour predecessor".into()))?;
+                        .ok_or_else(|| Error::internal("contour predecessor"))?;
                     let mut east_zero = false;
                     let dir = (1..=8)
                         .map(|k| (back + 8 - k) % 8)
@@ -278,7 +276,7 @@ pub fn contours(mask: &[u8], width: usize, height: usize) -> Result<Vec<Vec<Poin
                             }
                             nonzero
                         })
-                        .ok_or_else(|| Error::Backend("contour neighbour".into()))?;
+                        .ok_or_else(|| Error::internal("contour neighbour"))?;
                     let next = (current as isize + offsets[dir]) as usize;
                     if east_zero {
                         image[current] = -border;
@@ -286,9 +284,9 @@ pub fn contours(mask: &[u8], width: usize, height: usize) -> Result<Vec<Vec<Poin
                         image[current] = border;
                     }
                     if last_dir != Some(dir) {
-                        contour.try_reserve(1).map_err(|_| Error::Allocation {
-                            bytes: contour.len().saturating_mul(8),
-                        })?;
+                        contour
+                            .try_reserve(1)
+                            .map_err(|_| Error::out_of_memory(contour.len().saturating_mul(8)))?;
                         contour.push(xy(current));
                         last_dir = Some(dir);
                     }
@@ -314,9 +312,9 @@ pub fn contours(mask: &[u8], width: usize, height: usize) -> Result<Vec<Vec<Poin
                 image[start] = -border;
                 contour.push(xy(start));
             }
-            result.try_reserve(1).map_err(|_| Error::Allocation {
-                bytes: result.len().saturating_mul(24),
-            })?;
+            result
+                .try_reserve(1)
+                .map_err(|_| Error::out_of_memory(result.len().saturating_mul(24)))?;
             result.push(contour);
         }
     }
@@ -366,12 +364,10 @@ pub fn unclip(q: Quad, ratio: f32) -> Result<Vec<Point>> {
     let (sin, cos) = angle.sin_cos();
     let capacity = (steps.ceil() as usize)
         .checked_add(8)
-        .ok_or(Error::SizeOverflow("unclip points"))?;
+        .ok_or(Error::size_overflow("unclip points"))?;
     let mut out = Vec::new();
     out.try_reserve_exact(capacity)
-        .map_err(|_| Error::Allocation {
-            bytes: capacity.saturating_mul(8),
-        })?;
+        .map_err(|_| Error::out_of_memory(capacity.saturating_mul(8)))?;
     for j in 0..4 {
         let k = (j + 3) % 4;
         let mut n = normals[k];

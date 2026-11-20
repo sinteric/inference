@@ -44,7 +44,7 @@ impl AssetRoot {
                 || value == ".."
                 || value.contains(['/', '\\', '\0'])
             {
-                return Err(Error::Asset(format!(
+                return Err(Error::model_files(format!(
                     "invalid manifest {name} for asset directory"
                 )));
             }
@@ -71,7 +71,7 @@ pub(crate) enum AssetStatus {
 pub(crate) fn locate(manifest: &Manifest, root: &AssetRoot, rel: &str) -> Result<AssetStatus> {
     let file = manifest
         .file(rel)
-        .ok_or_else(|| Error::Asset(format!("{rel} not in manifest")))?;
+        .ok_or_else(|| Error::model_files(format!("{rel} not in manifest")))?;
     let path = root.path_to(rel);
     if !path.is_file() {
         return Ok(AssetStatus::Missing {

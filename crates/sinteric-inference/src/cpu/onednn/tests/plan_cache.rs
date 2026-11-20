@@ -2,7 +2,7 @@
 use crate::cpu::onednn::{OnednnCpu, SessionOptions};
 
 fn creations(cpu: &OnednnCpu) -> u64 {
-    cpu.stats_json()["plan_creations"].as_u64().unwrap()
+    cpu.stats().plan_creations
 }
 
 #[test]
@@ -29,13 +29,13 @@ fn full_cache_evicts_least_recently_used_plan() {
     assert_eq!(creations(&cpu), 3);
     gelu(2);
     assert_eq!(creations(&cpu), 4);
-    let stats = cpu.stats_json();
-    assert_eq!(stats["cached_plans"], 2);
-    assert_eq!(stats["plan_capacity"], 2);
+    let stats = cpu.stats();
+    assert_eq!(stats.cached_plans, 2);
+    assert_eq!(stats.plan_capacity, 2);
     assert_eq!(cpu.primitive_capacity(), 2);
     // m = 3 and m = 2 each replaced a plan; the budget evicted nothing.
-    assert_eq!(stats["capacity_evictions"], 2);
-    assert_eq!(stats["budget_evictions"], 0);
+    assert_eq!(stats.capacity_evictions, 2);
+    assert_eq!(stats.budget_evictions, 0);
 }
 
 fn values(n: usize, mut seed: u32) -> Vec<f32> {
@@ -80,13 +80,13 @@ fn memory_budget_evicts_plans_without_changing_results() {
             "m={m}: results differ under a memory budget"
         );
     }
-    let (fs, ts) = (free.stats_json(), tight.stats_json());
-    assert_eq!(fs["budget_evictions"], 0);
-    assert!(fs["cached_plans"].as_u64().unwrap() > 5);
-    if ts["plan_bytes"].as_u64().unwrap() > 1 {
+    let (fs, ts) = (free.stats(), tight.stats());
+    assert_eq!(fs.budget_evictions, 0);
+    assert!(fs.cached_plans > 5);
+    if ts.plan_bytes > 1 {
         // Over budget the backend keeps only the plan that just ran.
-        assert_eq!(ts["cached_plans"], 1, "{ts}");
-        assert!(ts["budget_evictions"].as_u64().unwrap() >= 10, "{ts}");
+        assert_eq!(ts.cached_plans, 1, "{ts:?}");
+        assert!(ts.budget_evictions >= 10, "{ts:?}");
     }
 }
 
@@ -108,10 +108,7 @@ fn memory_budget_bounds_pooled_buffers() {
         cpu.recycle(buffer);
     }
     cpu.recycle(cpu.buffer(512 << 10).unwrap());
-    let stats = cpu.stats_json();
-    assert_eq!(stats["retained_output_buffer_bytes"], 1 << 20, "{stats}");
-    assert!(
-        stats["retained_bytes"].as_u64().unwrap() <= 1 << 20,
-        "{stats}"
-    );
+    let stats = cpu.stats();
+    assert_eq!(stats.retained_output_buffer_bytes, 1 << 20, "{stats:?}");
+    assert!(stats.retained_bytes <= 1 << 20, "{stats:?}");
 }

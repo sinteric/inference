@@ -1,6 +1,6 @@
-use crate::cpu::runtime::{BackendOverrides, CpuIsa, Runtime, RuntimeOptions};
+use crate::cpu::runtime::{BackendOverrides, IsaCap, Options, Runtime};
 use crate::image::{ImageView, PixelFormat, Quad};
-use crate::ppocr::api::{DetConfig, Detector, RecConfig, Recognizer};
+use crate::ppocr::cpu::{DetConfig, Detector, RecConfig, Recognizer};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 fn root() -> Option<PathBuf> {
@@ -143,23 +143,27 @@ fn det_then_rec_parity() {
         return;
     };
     let rt = Runtime::new(
-        RuntimeOptions::new()
+        Options::new()
             .with_threads(1)
-            .with_cpu_isa(CpuIsa::Avx512CoreBf16),
+            .with_isa_cap(IsaCap::Avx512CoreBf16),
     )
     .unwrap();
     let shared = rt
         .shared_backend(
             BackendOverrides::default()
-                .with_workspace_limit_bytes(Some(crate::ppocr::api::DEFAULT_WORKSPACE_LIMIT_BYTES)),
+                .with_workspace_limit_bytes(Some(crate::ppocr::cpu::DEFAULT_WORKSPACE_LIMIT_BYTES)),
         )
         .unwrap();
-    let det: Detector = shared
-        .load(DetConfig::new(root.join("det")).with_verify_weights(true))
-        .unwrap();
-    let rec: Recognizer = shared
-        .load(RecConfig::new(root.join("rec")).with_verify_weights(true))
-        .unwrap();
+    let det = Detector::load(
+        &shared,
+        DetConfig::new(root.join("det")).with_verify_weights(true),
+    )
+    .unwrap();
+    let rec = Recognizer::load(
+        &shared,
+        RecConfig::new(root.join("rec")).with_verify_weights(true),
+    )
+    .unwrap();
     let mut comparisons = Vec::new();
     let mut all_exact = 0;
     let mut all_lines = 0;

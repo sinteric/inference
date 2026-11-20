@@ -1,4 +1,5 @@
-//! What a driver reports about its own process: CPU time and memory.
+//! What a driver does to and reports about its own process: CPU affinity,
+//! CPU time and memory.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -27,6 +28,29 @@ pub fn affinity() -> Result<Vec<usize>> {
     Ok((0..libc::CPU_SETSIZE as usize)
         .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
         .collect())
+}
+
+/// Pin the calling thread, and every thread it starts from now on, to
+/// `cpus`. A driver calls it with [`sinteric_inference::cpu::Runtime::cpus`]
+/// right after the runtime starts, so its own threads stay on the pool's
+/// CPUs; the library never sets affinity itself.
+pub fn pin(cpus: &[usize]) -> Result<()> {
+    // SAFETY: a zeroed cpu_set_t is the empty set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for &cpu in cpus {
+        anyhow::ensure!(
+            cpu < libc::CPU_SETSIZE as usize,
+            "CPU {cpu} outside CPU_SETSIZE"
+        );
+        // SAFETY: `cpu` is below CPU_SETSIZE, so the bit is inside `set`.
+        unsafe { libc::CPU_SET(cpu, &mut set) };
+    }
+    // SAFETY: `set` is valid for the size passed; the call only reads it.
+    let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("sched_setaffinity");
+    }
+    Ok(())
 }
 
 /// A `kB` line of `/proc/self/status`, in KiB.

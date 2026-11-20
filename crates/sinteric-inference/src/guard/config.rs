@@ -2,8 +2,8 @@
 
 use serde_json::Value;
 
-use crate::cpu::runtime::Precision;
-use crate::{check_shape, Result, ResultContext as Context};
+use crate::guard::encoder::Precision;
+use crate::{check_files, Result, ResultContext as Context};
 
 /// The attention tile (query rows per chunk) the guard runs at: BF16 runs
 /// EmbeddingGemma 2's measured tile, FP32 the one value measured on every
@@ -47,22 +47,22 @@ fn uint(v: &Value, key: &str) -> Result<usize> {
 
 impl EncoderConfig {
     pub(crate) fn from_json(cfg: &Value) -> Result<Self> {
-        check_shape!(
+        check_files!(
             cfg["model_type"] == "modernbert",
             "config.json model_type {} is not modernbert",
             cfg["model_type"]
         );
         for key in ["attention_bias", "mlp_bias", "norm_bias", "classifier_bias"] {
-            check_shape!(
+            check_files!(
                 cfg[key].as_bool() == Some(false),
                 "config.json {key}: only bias-free ModernBERT is supported"
             );
         }
-        check_shape!(
+        check_files!(
             cfg["classifier_pooling"] == "mean" && cfg["classifier_activation"] == "gelu",
             "config.json: mean pooling with a GELU classifier head is required"
         );
-        check_shape!(
+        check_files!(
             cfg["hidden_activation"] == "gelu",
             "config.json hidden_activation must be gelu"
         );
@@ -71,34 +71,34 @@ impl EncoderConfig {
         let layers = uint(cfg, "num_hidden_layers")?;
         let intermediate = uint(cfg, "intermediate_size")?;
         let vocab = uint(cfg, "vocab_size")?;
-        check_shape!(
+        check_files!(
             heads > 0 && hidden % heads == 0 && layers > 0 && intermediate > 0 && vocab > 0,
             "config.json dimensions"
         );
         let head_dim = hidden / heads;
-        check_shape!(head_dim >= 2 && head_dim % 2 == 0, "RoPE width {head_dim}");
+        check_files!(head_dim >= 2 && head_dim % 2 == 0, "RoPE width {head_dim}");
         let eps = cfg["norm_eps"]
             .as_f64()
             .or_else(|| cfg["layer_norm_eps"].as_f64())
             .context("config.json norm_eps")? as f32;
         let window = uint(cfg, "local_attention")?;
-        check_shape!(window >= 2 && window % 2 == 0, "local_attention {window}");
+        check_files!(window >= 2 && window % 2 == 0, "local_attention {window}");
         let global = match cfg["layer_types"].as_array() {
             Some(types) => types
                 .iter()
                 .map(|t| match t.as_str() {
                     Some("full_attention") => Ok(true),
                     Some("sliding_attention") => Ok(false),
-                    _ => Err(crate::Error::Config(format!("layer type {t}"))),
+                    _ => Err(crate::Error::config(format!("layer type {t}"))),
                 })
                 .collect::<Result<Vec<_>>>()?,
             None => {
                 let every = uint(cfg, "global_attn_every_n_layers")?;
-                check_shape!(every > 0, "global_attn_every_n_layers");
+                check_files!(every > 0, "global_attn_every_n_layers");
                 (0..layers).map(|i| i % every == 0).collect()
             }
         };
-        check_shape!(
+        check_files!(
             global.len() == layers,
             "layer_types has {} entries for {layers} layers",
             global.len()
@@ -106,7 +106,7 @@ impl EncoderConfig {
         let theta = |kind: &str, legacy: &str| -> Result<f64> {
             let params = &cfg["rope_parameters"][kind];
             if params.is_object() {
-                check_shape!(
+                check_files!(
                     params["rope_type"] == "default",
                     "rope_parameters.{kind}.rope_type must be default"
                 );
@@ -120,7 +120,7 @@ impl EncoderConfig {
         };
         let global_theta = theta("full_attention", "global_rope_theta")?;
         let local_theta = theta("sliding_attention", "local_rope_theta")?;
-        check_shape!(
+        check_files!(
             global_theta.is_finite()
                 && global_theta > 1.0
                 && local_theta.is_finite()

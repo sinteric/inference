@@ -163,7 +163,6 @@ pub struct Api {
         u32,
         const_dnnl_primitive_attr_t,
     ) -> dnnl_status_t,
-    pub info: String,
 }
 
 unsafe impl Send for Api {}
@@ -194,19 +193,9 @@ impl Api {
                 ver.minor,
                 ver.patch
             );
-            let hash = if ver.hash.is_null() {
-                String::new()
-            } else {
-                CStr::from_ptr(ver.hash).to_string_lossy().into_owned()
-            };
             check_shape!(
                 dnnl_set_primitive_cache_capacity(0) == dnnl_success,
                 "primitive cache configuration"
-            );
-
-            let info = format!(
-                "oneDNN{}.{}.{} {hash}; Rust C API; statically linked; threadpool; standalone Rust-owned data; public primitives; FP32 strict",
-                ver.major, ver.minor, ver.patch
             );
 
             Ok(Self {
@@ -250,17 +239,13 @@ impl Api {
                 eltwise_pd: dnnl_eltwise_forward_primitive_desc_create,
                 softmax_pd: dnnl_softmax_forward_primitive_desc_create,
                 layernorm_pd: dnnl_layer_normalization_forward_primitive_desc_create,
-                info,
             })
         }
     }
 
     pub fn check(st: dnnl_status_t, what: &'static str) -> Result<()> {
         if st != dnnl_success {
-            return Err(crate::Error::BackendStatus {
-                operation: what,
-                status: st,
-            });
+            return Err(crate::Error::backend_status(what, st));
         }
         Ok(())
     }
@@ -293,9 +278,9 @@ pub fn threadpool_ptr() -> Result<*mut c_void> {
         })
         .0;
     if p.is_null() {
-        return Err(crate::Error::Allocation {
-            bytes: std::mem::size_of::<ThreadpoolPtr>(),
-        });
+        return Err(crate::Error::out_of_memory(std::mem::size_of::<
+            ThreadpoolPtr,
+        >()));
     }
     Ok(p)
 }
@@ -307,14 +292,14 @@ fn apply_tp_threads(n: i32) -> Result<()> {
             if TP_THREADS
                 .get()
                 .copied()
-                .ok_or_else(|| crate::Error::Config("threadpool initialization".into()))?
+                .ok_or_else(|| crate::Error::config("threadpool initialization"))?
                 == n => {}
         Err(_) => {
             let have = TP_THREADS
                 .get()
                 .copied()
-                .ok_or_else(|| crate::Error::Config("threadpool initialization".into()))?;
-            return Err(crate::Error::Config(format!(
+                .ok_or_else(|| crate::Error::config("threadpool initialization"))?;
+            return Err(crate::Error::config(format!(
                 "threadpool width is process-global ({have} already set; requested {n})"
             )));
         }
@@ -345,10 +330,10 @@ fn apply_max_cpu_isa_in(
 ) -> Result<()> {
     let mut slot = cell
         .lock()
-        .map_err(|_| crate::Error::Poisoned("oneDNN ISA cap"))?;
+        .map_err(|_| crate::Error::poisoned("oneDNN ISA cap"))?;
     if let Some(have) = *slot {
         if have != isa {
-            return Err(crate::Error::Config(format!(
+            return Err(crate::Error::config(format!(
                 "oneDNN ISA cap is process-global (already {have:?}; requested {isa:?})"
             )));
         }

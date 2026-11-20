@@ -15,10 +15,9 @@ mod media;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use sinteric_inference::embeddinggemma2::{
-    Config, EmbeddingGemma2, ImageView, Part, PixelFormat, Precision, PromptKind,
-};
-use sinteric_inference::{Runtime, RuntimeOptions};
+use sinteric_inference::cpu::{Options, Runtime};
+use sinteric_inference::embeddinggemma2::cpu::{Config, EmbeddingGemma2, Precision};
+use sinteric_inference::embeddinggemma2::{ImageView, Part, PixelFormat, PromptKind};
 use std::time::Instant;
 
 fn status_kib(key: &str) -> Option<u64> {
@@ -46,7 +45,7 @@ fn main() -> Result<()> {
     )
     .to_string();
     let mut threads = 4usize;
-    let mut precision = Precision::Bf16;
+    let mut precision = None;
     let mut modalities = "image,audio".to_string();
     let mut cases = None::<String>;
     let (mut warmup, mut repeat) = (2usize, 10usize);
@@ -58,11 +57,7 @@ fn main() -> Result<()> {
             "--fixture" => fixture = val()?,
             "--threads" => threads = val()?.parse()?,
             "--precision" => {
-                precision = match val()?.as_str() {
-                    "bf16" => Precision::Bf16,
-                    "fp32" => Precision::Fp32,
-                    p => bail!("unknown precision {p}"),
-                }
+                precision = Some(val()?.parse::<Precision>()?);
             }
             "--modalities" => modalities = val()?,
             "--cases" => cases = Some(val()?),
@@ -77,14 +72,13 @@ fn main() -> Result<()> {
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(&fixture)?)?;
 
     let rss_start = status_kib("VmRSS:");
-    let rt = Runtime::new(RuntimeOptions::new().with_threads(threads))?;
+    let rt = Runtime::new(Options::new().with_threads(threads))?;
     let t = Instant::now();
-    let eg2: EmbeddingGemma2 = rt.load(
-        Config::new(&model)
-            .with_precision(precision)
-            .with_image(image)
-            .with_audio(audio),
-    )?;
+    let mut config = Config::new(&model).with_image(image).with_audio(audio);
+    if let Some(precision) = precision {
+        config = config.with_precision(precision);
+    }
+    let eg2 = EmbeddingGemma2::load(&rt, config)?;
     let load_s = t.elapsed().as_secs_f64();
     let rss_loaded = status_kib("VmRSS:");
 
@@ -164,7 +158,7 @@ fn main() -> Result<()> {
         "{}",
         json!({
             "threads": threads,
-            "precision": format!("{precision:?}"),
+            "precision": eg2.precision(),
             "image": image,
             "audio": audio,
             "load_s": load_s,

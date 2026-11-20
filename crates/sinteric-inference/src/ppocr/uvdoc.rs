@@ -12,7 +12,6 @@
 //! The rectified page is a different raster from the one handed in: a box
 //! found on it does not address the caller's pixels. When to keep it is the
 //! caller's decision.
-use crate::cpu::onednn::conv::PlanInfo;
 use crate::cpu::onednn::OnednnCpu;
 use crate::image::{ImageView, PixelFormat};
 use crate::ppocr::net::{self, OcrNet, Tensor};
@@ -20,10 +19,9 @@ use crate::ppocr::uvdoc_graph::{
     self, Nets, BRIDGE_CHANNELS, GRID_HEIGHT, GRID_WIDTH, HEAD_CHANNELS, HEAD_PAD, INPUT_HEIGHT,
     INPUT_WIDTH,
 };
-use crate::ppocr::weights::{AssetConfig, Assets, ModelKind};
+use crate::ppocr::weights::Assets;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -50,14 +48,14 @@ impl UvdocOptions {
     /// Refuse a zero plan capacity or pixel bound.
     pub fn validate(&self) -> Result<()> {
         if self.plan_capacity == 0 || self.max_pixels == 0 {
-            return Err(Error::Config("invalid unwarper options".into()));
+            return Err(Error::config("invalid unwarper options"));
         }
         Ok(())
     }
     fn pixels(&self, w: usize, h: usize) -> Result<()> {
         let n = crate::checked_size("unwarper pixels", &[w, h])?;
         if n > self.max_pixels {
-            return Err(Error::Shape(format!(
+            return Err(Error::too_large(format!(
                 "unwarper {w}x{h} exceeds max_pixels {}",
                 self.max_pixels
             )));
@@ -105,22 +103,33 @@ pub struct UvdocTimings {
 /// `Send + Sync`; calls block. Values depend on the input and the ISA, never
 /// on the thread count.
 pub struct Unwarper {
-    assets: Assets,
     nets: Nets,
     options: UvdocOptions,
     threads: usize,
     cpu: Arc<OnednnCpu>,
 }
+impl std::fmt::Debug for Unwarper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Unwarper")
+            .field("options", &self.options)
+            .field("threads", &self.threads)
+            .finish_non_exhaustive()
+    }
+}
 impl Unwarper {
     /// Load and pack fixed-layout weights on an explicitly configured backend.
-    pub fn load(
+    #[cfg(test)]
+    pub(crate) fn load_on(
         cpu: Arc<OnednnCpu>,
-        model_dir: impl AsRef<Path>,
+        model_dir: impl AsRef<std::path::Path>,
         options: UvdocOptions,
         verify_weights: bool,
     ) -> Result<Self> {
         options.validate()?;
-        let mut config = AssetConfig::new(model_dir.as_ref(), ModelKind::Uvdoc);
+        let mut config = crate::ppocr::weights::AssetConfig::new(
+            model_dir.as_ref(),
+            crate::ppocr::weights::ModelKind::Uvdoc,
+        );
         config.verify_weights = verify_weights;
         let assets = Assets::load(&config)?;
         Self::from_assets(cpu, assets, options)
@@ -134,30 +143,24 @@ impl Unwarper {
         let threads = cpu.threads();
         let nets = uvdoc_graph::build(cpu.clone(), &assets, options.plan_capacity)?;
         Ok(Self {
-            assets,
             nets,
             options,
             threads,
             cpu,
         })
     }
-    /// The verified asset set the weights were packed from.
-    pub fn assets(&self) -> &Assets {
-        &self.assets
-    }
     /// The options the model was loaded with.
     pub fn options(&self) -> &UvdocOptions {
         &self.options
     }
-    /// Backend counters (arena, scratch, packed weights, cached plans) for
-    /// drivers and diagnostics.
-    #[doc(hidden)]
-    pub fn backend_stats(&self) -> serde_json::Value {
-        self.cpu.stats_json()
+    /// The backend's memory and counters now.
+    pub fn backend_stats(&self) -> crate::cpu::runtime::BackendStats {
+        self.cpu.stats()
     }
     /// Build every network's plan; the shapes are fixed, so this is every
     /// plan the model will use.
-    pub fn warmup(&self) -> Result<Vec<PlanInfo>> {
+    #[cfg(test)]
+    pub(crate) fn warmup(&self) -> Result<Vec<crate::cpu::onednn::conv::PlanInfo>> {
         let (ph, pw) = (GRID_HEIGHT + 2 * HEAD_PAD, GRID_WIDTH + 2 * HEAD_PAD);
         Ok(vec![
             self.nets
@@ -176,7 +179,7 @@ impl Unwarper {
         self.options.pixels(shape[3], shape[2])
     }
     /// The page as unit-range RGB planes, `[1, 3, H, W]`.
-    pub fn preprocess(&self, image: &ImageView<'_>) -> Result<Tensor> {
+    pub(crate) fn preprocess(&self, image: &ImageView<'_>) -> Result<Tensor> {
         self.options
             .pixels(image.width() as usize, image.height() as usize)?;
         Tensor::new(
@@ -187,7 +190,7 @@ impl Unwarper {
     /// The model's grid for a preprocessed page: `[1, 2, 45, 31]`, plane 0
     /// the normalized source x, plane 1 the source y, both in about
     /// `[-1, 1]`.
-    pub fn grid(&self, shape: &[usize], input: &[f32]) -> Result<Tensor> {
+    pub(crate) fn grid(&self, shape: &[usize], input: &[f32]) -> Result<Tensor> {
         self.validate_shape(shape, input.len())?;
         crate::check_shape!(
             crate::ppocr::rec::all_par(self.threads, input, f32::is_finite),
@@ -223,7 +226,7 @@ impl Unwarper {
         Tensor::new(shape.to_vec(), grid)
     }
     /// Sample unit-range planes `[1, 3, H, W]` through `grid`.
-    pub fn sample(&self, shape: &[usize], input: &[f32], grid: &Tensor) -> Result<Tensor> {
+    pub(crate) fn sample(&self, shape: &[usize], input: &[f32], grid: &Tensor) -> Result<Tensor> {
         self.validate_shape(shape, input.len())?;
         crate::check_shape!(
             grid.shape == [1, 2, GRID_HEIGHT, GRID_WIDTH],
@@ -323,7 +326,9 @@ mod tests {
             ..Default::default()
         };
         assert!(small.pixels(10, 10).is_ok());
-        assert!(matches!(small.pixels(11, 10), Err(Error::Shape(_))));
+        assert!(small
+            .pixels(11, 10)
+            .is_err_and(|e| e.kind() == crate::ErrorKind::TooLarge));
     }
 
     /// The grid's size is the backbone's four stride-2 stages applied to the

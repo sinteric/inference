@@ -3,12 +3,11 @@
 //! Media are synthetic and integer-defined, so these tests rebuild
 //! byte-identical inputs instead of committing media files.
 
-use crate::cpu::runtime::{Runtime, RuntimeOptions};
-use crate::embeddinggemma2::api::{
-    Config, EmbeddingGemma2, ImageView, Part, PixelFormat, Precision, PromptKind,
-};
-use crate::embeddinggemma2::media;
+use crate::cpu::runtime::{Options, Runtime};
+use crate::embeddinggemma2::cpu::{Config, EmbeddingGemma2, Precision};
+use crate::embeddinggemma2::{media, ImageView, Part, PixelFormat, PromptKind};
 use crate::test_support::media::{audio_samples, image_pixels};
+use crate::ErrorKind;
 use serde_json::Value;
 
 fn asset_dir() -> Option<std::path::PathBuf> {
@@ -185,15 +184,19 @@ fn parity(precision: Precision, gate: f32) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    let rt = Runtime::new(RuntimeOptions::new().with_threads(threads)).unwrap();
-    let model: EmbeddingGemma2 = rt
-        .load(
-            Config::new(&dir)
-                .with_precision(precision)
-                .with_image(true)
-                .with_audio(true),
-        )
-        .unwrap();
+    let rt = Runtime::new(Options::new().with_threads(threads)).unwrap();
+    if !EmbeddingGemma2::precisions(&rt).contains(&precision) {
+        eprintln!("skipping: {precision} does not run on {}", rt.isa());
+        return;
+    }
+    let model = EmbeddingGemma2::load(
+        &rt,
+        Config::new(&dir)
+            .with_precision(precision)
+            .with_image(true)
+            .with_audio(true),
+    )
+    .unwrap();
     let doc = fixture();
     let mut min_cos = 1f32;
     for case in doc["cases"].as_array().unwrap() {
@@ -278,20 +281,23 @@ fn text_only_load_rejects_media() {
     let Some(dir) = asset_dir() else {
         return;
     };
-    let rt = Runtime::new(RuntimeOptions::new().with_threads(1)).unwrap();
-    let model: EmbeddingGemma2 = rt.load(Config::new(&dir)).unwrap();
+    let rt = Runtime::new(Options::new().with_threads(1)).unwrap();
+    let model = EmbeddingGemma2::load(&rt, Config::new(&dir)).unwrap();
     assert!(!model.supports_image() && !model.supports_audio());
     let px = image_pixels(48, 48, 3);
     let img = [Part::Image(view(48, 48, 3, &px))];
-    assert!(matches!(
-        model.embed_parts(&[&img], None),
-        Err(crate::Error::Unsupported { .. })
-    ));
+    assert_eq!(
+        model.embed_parts(&[&img], None).unwrap_err().kind(),
+        ErrorKind::Unsupported
+    );
     let clip = vec![0f32; 16_000];
-    assert!(matches!(
-        model.embed_parts(&[&[Part::Audio(&clip)]], None),
-        Err(crate::Error::Unsupported { .. })
-    ));
+    assert_eq!(
+        model
+            .embed_parts(&[&[Part::Audio(&clip)]], None)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
     // Text-only parts match the text API.
     let a = model
         .embed_parts(

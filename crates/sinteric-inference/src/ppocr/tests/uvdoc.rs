@@ -66,7 +66,7 @@ fn load(root: &Path, threads: usize) -> Unwarper {
         )
         .unwrap()
     };
-    Unwarper::load(cpu, root.join("uvdoc"), UvdocOptions::default(), true).unwrap()
+    Unwarper::load_on(cpu, root.join("uvdoc"), UvdocOptions::default(), true).unwrap()
 }
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());

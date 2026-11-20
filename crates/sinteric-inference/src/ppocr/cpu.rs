@@ -1,25 +1,27 @@
-//! Public PP-OCR API: the detector, the recognizer and the UVDoc unwarper,
-//! each its own [`crate::cpu::runtime::Model`]. Composing them into page OCR (stage
-//! order, score threshold, when to keep an unwarped page, reading order) is
-//! the caller's job.
+//! The PP-OCR models tuned for CPUs: the [`Detector`], the [`Recognizer`] and
+//! the UVDoc [`Unwarper`], each loaded from a [`Runtime`]. They run FP32
+//! only, the precision they are qualified at (text identical to ONNX
+//! Runtime's), so no config has a precision. Composing them into page OCR
+//! (stage order, score threshold, when to keep an unwarped page, reading
+//! order) is the caller's job.
 //!
 //! ```ignore
-//! use crate::ppocr::api::{DetConfig, Detector, RecConfig, Recognizer};
-//! let det: Detector = rt.load(DetConfig::new("/models/ppocr/det"))?;
-//! let rec: Recognizer = rt.load(RecConfig::new("/models/ppocr/rec"))?;
+//! use sinteric_inference::ppocr::cpu::{DetConfig, Detector, RecConfig, Recognizer};
+//! let det = Detector::load(&rt, DetConfig::new("/models/ppocr/det"))?;
+//! let rec = Recognizer::load(&rt, RecConfig::new("/models/ppocr/rec"))?;
 //! let quads = det.detect(&image)?;
 //! let lines = rec.recognize(&image, &quads)?; // one per quad, same order
 //!
-//! let uvdoc: Unwarper = rt.load(UvdocConfig::new("/models/ppocr/uvdoc"))?;
+//! let uvdoc = Unwarper::load(&rt, UvdocConfig::new("/models/ppocr/uvdoc"))?;
 //! let flat = uvdoc.unwarp(&photo)?; // same size and pixel format
 //!
 //! // Both on one backend (one convolution arena sized to the larger model,
 //! // ~150 MiB less RSS than one backend each):
 //! let ocr_rt = rt.shared_backend(
-//!     BackendOverrides::default().with_workspace_limit_bytes(Some(1 << 30)),
+//!     cpu::BackendOverrides::default().with_workspace_limit_bytes(Some(1 << 30)),
 //! )?;
-//! let det: Detector = ocr_rt.load(DetConfig::new("/models/ppocr/det"))?;
-//! let rec: Recognizer = ocr_rt.load(RecConfig::new("/models/ppocr/rec"))?;
+//! let det = Detector::load(&ocr_rt, DetConfig::new("/models/ppocr/det"))?;
+//! let rec = Recognizer::load(&ocr_rt, RecConfig::new("/models/ppocr/rec"))?;
 //! ```
 //!
 //! A [`Detector`] or [`Recognizer`] loaded on a plain [`Runtime`] owns its
@@ -29,17 +31,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::cpu::onednn::OnednnCpu;
-use crate::cpu::runtime::{BackendOverrides, Precision, Runtime};
 use serde::{Deserialize, Serialize};
 
+use crate::cpu::onednn::OnednnCpu;
+use crate::cpu::runtime::{release_free_memory, BackendOverrides, Runtime};
 use crate::ppocr::weights::{AssetConfig, Assets, ModelKind};
 use crate::{Error, Result};
 
-pub use crate::image::{ImageView, PixelFormat, Quad};
 pub use crate::ppocr::det::{DetOptions, DetTimings, Detector};
-pub use crate::ppocr::rec::{Batching, DecodedLine, RecOptions, RecTimings, Recognizer};
-pub use crate::ppocr::uvdoc::{UnwarpedImage, Unwarper, UvdocOptions, UvdocTimings};
+pub use crate::ppocr::rec::{Batching, RecOptions, RecTimings, Recognizer};
+pub use crate::ppocr::uvdoc::{Unwarper, UvdocOptions, UvdocTimings};
 
 /// Backend workspace cap a model gets on its own backend when its config
 /// leaves `workspace_limit_bytes` unset.
@@ -56,15 +57,15 @@ macro_rules! model_config {
             /// Backend workspace cap: each planned convolution arena plus
             /// native scratch. `None` is [`DEFAULT_WORKSPACE_LIMIT_BYTES`]
             /// (independently of
-            /// [`crate::cpu::runtime::RuntimeOptions::workspace_limit_bytes`]), or the
-            /// handle's cap on a [`Runtime::shared_backend`] handle, where
-            /// setting it is an error.
+            /// [`Options::workspace_limit_bytes`](crate::cpu::Options::workspace_limit_bytes)),
+            /// or the handle's cap on a [`Runtime::shared_backend`] handle,
+            /// where setting it is an error.
             #[serde(default)]
             pub workspace_limit_bytes: Option<usize>,
             /// What the backend may keep between calls, in bytes; overrides
-            /// [`crate::cpu::runtime::RuntimeOptions::memory_budget_bytes`]. `Some(0)`
-            /// is unbounded. Set it on the handle instead when loading
-            /// through [`Runtime::shared_backend`].
+            /// [`Options::memory_budget_bytes`](crate::cpu::Options::memory_budget_bytes).
+            /// `Some(0)` is unbounded. Set it on the handle instead when
+            /// loading through [`Runtime::shared_backend`].
             #[serde(default)]
             pub memory_budget_bytes: Option<usize>,
             #[serde(default)]
@@ -74,12 +75,6 @@ macro_rules! model_config {
             /// Explicit pin manifest; `None` uses the embedded PP-OCR manifest.
             #[serde(default)]
             pub manifest: Option<PathBuf>,
-            /// Convolution/matmul precision. PP-OCR runs
-            /// [`Precision::Fp32`] only (`None` is the same; exact text
-            /// parity with ONNX Runtime); anything else is
-            /// [`Error::Unsupported`].
-            #[serde(default)]
-            pub precision: Option<Precision>,
         }
 
         impl $name {
@@ -91,7 +86,6 @@ macro_rules! model_config {
                     options: <$options>::default(),
                     verify_weights: false,
                     manifest: None,
-                    precision: None,
                 }
             }
             pub fn with_workspace_limit_bytes(mut self, bytes: usize) -> Self {
@@ -125,15 +119,10 @@ macro_rules! model_config {
                 self.manifest = Some(manifest.into());
                 self
             }
-            pub fn with_precision(mut self, precision: Precision) -> Self {
-                self.precision = Some(precision);
-                self
-            }
             pub fn validate(&self) -> Result<()> {
-                Precision::resolve(self.precision, $what, PRECISIONS)?;
                 if self.workspace_limit_bytes == Some(0) {
-                    return Err(Error::Config(
-                        concat!($what, " workspace_limit_bytes must be >= 1").into(),
+                    return Err(Error::config(
+                        concat!($what, " workspace_limit_bytes must be >= 1"),
                     ));
                 }
                 self.options.validate()
@@ -170,50 +159,37 @@ model_config!(
     "unwarper"
 );
 
-/// Precisions the PP-OCR models implement: FP32 only.
-const PRECISIONS: &[Precision] = &[Precision::Fp32];
+/// `load` and `unload` of a PP-OCR model and its config.
+macro_rules! model_load {
+    ($model:ty, $config:ty) => {
+        impl $model {
+            /// Load the pinned weights from the config's directory.
+            pub fn load(rt: &Runtime, config: $config) -> Result<Self> {
+                let model = (|| {
+                    config.validate()?;
+                    let assets = config.assets()?;
+                    let cpu = config.backend(rt)?;
+                    <$model>::from_assets(cpu, assets, config.options)
+                })();
+                release_free_memory();
+                model
+            }
 
-impl crate::cpu::runtime::Model for Detector {
-    type Config = DetConfig;
-    const PRECISIONS: &'static [Precision] = PRECISIONS;
-    fn precision(&self) -> Precision {
-        Precision::Fp32
-    }
-    fn load(rt: &Runtime, config: DetConfig) -> Result<Self> {
-        config.validate()?;
-        let assets = config.assets()?;
-        let cpu = config.backend(rt)?;
-        Detector::from_assets(cpu, assets, config.options)
-    }
+            /// Free this model's weights, oneDNN objects and buffers (its
+            /// backend too, unless a [`Runtime::shared_backend`] handle or
+            /// another model still holds it), and return the freed heap pages
+            /// to the OS.
+            pub fn unload(self) {
+                drop(self);
+                release_free_memory();
+            }
+        }
+    };
 }
 
-impl crate::cpu::runtime::Model for Recognizer {
-    type Config = RecConfig;
-    const PRECISIONS: &'static [Precision] = PRECISIONS;
-    fn precision(&self) -> Precision {
-        Precision::Fp32
-    }
-    fn load(rt: &Runtime, config: RecConfig) -> Result<Self> {
-        config.validate()?;
-        let assets = config.assets()?;
-        let cpu = config.backend(rt)?;
-        Recognizer::from_assets(cpu, assets, config.options)
-    }
-}
-
-impl crate::cpu::runtime::Model for Unwarper {
-    type Config = UvdocConfig;
-    const PRECISIONS: &'static [Precision] = PRECISIONS;
-    fn precision(&self) -> Precision {
-        Precision::Fp32
-    }
-    fn load(rt: &Runtime, config: UvdocConfig) -> Result<Self> {
-        config.validate()?;
-        let assets = config.assets()?;
-        let cpu = config.backend(rt)?;
-        Unwarper::from_assets(cpu, assets, config.options)
-    }
-}
+model_load!(Detector, DetConfig);
+model_load!(Recognizer, RecConfig);
+model_load!(Unwarper, UvdocConfig);
 
 #[cfg(test)]
 mod tests {
@@ -257,38 +233,5 @@ mod tests {
         assert!(u.validate().is_ok());
         u.options.plan_capacity = 0;
         assert!(u.validate().is_err());
-        fn model<T: crate::cpu::runtime::Model>() {}
-        model::<Detector>();
-        model::<Recognizer>();
-        model::<Unwarper>();
-    }
-
-    #[test]
-    fn only_fp32_is_accepted() {
-        assert_eq!(
-            <Detector as crate::cpu::runtime::Model>::PRECISIONS,
-            &[Precision::Fp32]
-        );
-        assert!(DetConfig::new("x")
-            .with_precision(Precision::Fp32)
-            .validate()
-            .is_ok());
-        let err = RecConfig::new("x")
-            .with_precision(Precision::Bf16)
-            .validate()
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::Unsupported {
-                    what: "precision",
-                    ..
-                }
-            ),
-            "{err:?}"
-        );
-        let c: RecConfig = serde_json::from_str(r#"{"model_dir":"x","precision":"bf16"}"#).unwrap();
-        assert_eq!(c.precision, Some(Precision::Bf16));
-        assert!(c.validate().is_err());
     }
 }

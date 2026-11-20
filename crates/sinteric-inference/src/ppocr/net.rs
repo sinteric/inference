@@ -14,11 +14,13 @@ impl Tensor {
 }
 pub(crate) fn validate(shape: &[usize], len: usize) -> Result<()> {
     if shape.is_empty() || shape.len() > 12 || shape.contains(&0) {
-        return Err(Error::Shape(format!("invalid OCR tensor shape {shape:?}")));
+        return Err(Error::internal(format!(
+            "invalid OCR tensor shape {shape:?}"
+        )));
     }
     let elements = checked_size("OCR input", shape)?;
     if elements > isize::MAX as usize / 4 || elements != len {
-        return Err(Error::Shape("OCR input extent mismatch".into()));
+        return Err(Error::internal("OCR input extent mismatch"));
     }
     Ok(())
 }

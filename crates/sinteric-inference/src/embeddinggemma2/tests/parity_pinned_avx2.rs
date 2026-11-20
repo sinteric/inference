@@ -6,7 +6,8 @@
 //! prove anything about an AVX2 CPU's speed.
 
 use crate::cpu::onednn::{CacheOptions, CpuIsaCap, SessionOptions};
-use crate::embeddinggemma2::{Frontend, Model, Precision, PromptKind};
+use crate::embeddinggemma2::cpu::Precision;
+use crate::embeddinggemma2::{Model, PromptKind, Tokenizer};
 
 /// oneDNN's `dnnl_cpu_isa_avx2`.
 const ISA_AVX2: u64 = 0x7;
@@ -53,7 +54,7 @@ fn parity_fp32_pinned_avx2() {
     let model =
         Model::load_with_precision(&dir, backend, 64, &CacheOptions::default(), Precision::Fp32)
             .expect("load");
-    let fe = Frontend::load(&dir).expect("tokenizer");
+    let fe = Tokenizer::load(&dir).expect("tokenizer");
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/fixtures/embeddinggemma2/parity.json"

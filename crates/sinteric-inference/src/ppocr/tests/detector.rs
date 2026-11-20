@@ -198,7 +198,7 @@ fn detector_parity() {
         },
     )
     .unwrap();
-    let det = Detector::load(cpu, root.parent().unwrap(), DetOptions::default(), true).unwrap();
+    let det = Detector::load_on(cpu, root.parent().unwrap(), DetOptions::default(), true).unwrap();
     assert!(det.forward(&[1, 3, 1, 1], &[0.; 3]).is_err());
     assert!(det.forward(&[usize::MAX, 3, 32, 32], &[]).is_err());
     assert!(det
@@ -375,7 +375,7 @@ fn dump_means() {
         },
     )
     .unwrap();
-    let det = Detector::load(cpu, root.parent().unwrap(), DetOptions::default(), true).unwrap();
+    let det = Detector::load_on(cpu, root.parent().unwrap(), DetOptions::default(), true).unwrap();
     let dir = root.join("kd0092");
     let meta = json(dir.join("index.json"));
     let shape: [usize; 4] =

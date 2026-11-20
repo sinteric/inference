@@ -1,19 +1,20 @@
-use crate::ppocr::{
-    DetConfig, Detector, ImageView, PixelFormat, RecConfig, Recognizer,
-    DEFAULT_WORKSPACE_LIMIT_BYTES,
+use crate::cpu::{BackendOverrides, IsaCap, Options, Runtime};
+use crate::ppocr::cpu::{
+    DetConfig, Detector, RecConfig, Recognizer, DEFAULT_WORKSPACE_LIMIT_BYTES,
 };
-use crate::{BackendOverrides, CpuIsa, Error, Model, Runtime, RuntimeOptions};
+use crate::ppocr::{ImageView, PixelFormat};
+use crate::ErrorKind;
 use std::path::Path;
-fn runtime(options: RuntimeOptions) -> Runtime {
+fn runtime(options: Options) -> Runtime {
     // Concurrent tests must finish process-global ISA setup before model loads.
     static STARTUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _startup = STARTUP.lock().unwrap();
     Runtime::new(options).unwrap()
 }
-fn options() -> RuntimeOptions {
-    RuntimeOptions::new()
+fn options() -> Options {
+    Options::new()
         .with_threads(1)
-        .with_cpu_isa(CpuIsa::Avx512CoreBf16)
+        .with_isa_cap(IsaCap::Avx512CoreBf16)
 }
 fn assets() -> Option<std::path::PathBuf> {
     let root = crate::test_support::env::TestOverrides::from_env()
@@ -22,12 +23,16 @@ fn assets() -> Option<std::path::PathBuf> {
     root.join("rec/model.safetensors").is_file().then_some(root)
 }
 fn load(rt: &Runtime, root: &Path, det_limit: usize, rec_limit: usize) -> (Detector, Recognizer) {
-    let det: Detector = rt
-        .load(DetConfig::new(root.join("det")).with_workspace_limit_bytes(det_limit))
-        .unwrap();
-    let rec: Recognizer = rt
-        .load(RecConfig::new(root.join("rec")).with_workspace_limit_bytes(rec_limit))
-        .unwrap();
+    let det = Detector::load(
+        rt,
+        DetConfig::new(root.join("det")).with_workspace_limit_bytes(det_limit),
+    )
+    .unwrap();
+    let rec = Recognizer::load(
+        rt,
+        RecConfig::new(root.join("rec")).with_workspace_limit_bytes(rec_limit),
+    )
+    .unwrap();
     (det, rec)
 }
 fn shared(rt: &Runtime, workspace: usize) -> Runtime {
@@ -41,31 +46,30 @@ fn decoded_page_api_and_missing_assets() {
     send_sync::<Detector>();
     send_sync::<Recognizer>();
     let rt = runtime(options());
-    assert!(rt
-        .load::<Detector>(DetConfig::new("/explicit/missing/ocr/det"))
-        .is_err());
-    assert!(rt
-        .load::<Recognizer>(RecConfig::new("/explicit/missing/ocr/rec"))
-        .is_err());
+    let missing = Detector::load(&rt, DetConfig::new("/explicit/missing/ocr/det")).unwrap_err();
+    assert_eq!(missing.kind(), ErrorKind::ModelFiles, "{missing}");
+    let missing = Recognizer::load(&rt, RecConfig::new("/explicit/missing/ocr/rec")).unwrap_err();
+    assert_eq!(missing.kind(), ErrorKind::ModelFiles, "{missing}");
     // A shared handle owns the backend settings.
     let ocr_rt = shared(&rt, DEFAULT_WORKSPACE_LIMIT_BYTES);
     assert!(ocr_rt.shares_backend());
-    assert!(matches!(
-        ocr_rt.shared_backend(BackendOverrides::default()),
-        Err(Error::Config(_))
-    ));
+    assert!(ocr_rt
+        .shared_backend(BackendOverrides::default())
+        .is_err_and(|e| e.kind() == ErrorKind::Config));
     let Some(root) = assets() else {
         return;
     };
     // Per-model backend settings on a shared handle are a config error.
-    assert!(matches!(
-        ocr_rt.load::<Detector>(DetConfig::new(root.join("det")).with_workspace_limit_bytes(1)),
-        Err(Error::Config(_))
-    ));
-    assert!(matches!(
-        ocr_rt.load::<Recognizer>(RecConfig::new(root.join("rec")).with_memory_budget_bytes(1)),
-        Err(Error::Config(_))
-    ));
+    assert!(Detector::load(
+        &ocr_rt,
+        DetConfig::new(root.join("det")).with_workspace_limit_bytes(1)
+    )
+    .is_err_and(|e| e.kind() == ErrorKind::Config));
+    assert!(Recognizer::load(
+        &ocr_rt,
+        RecConfig::new(root.join("rec")).with_memory_budget_bytes(1)
+    )
+    .is_err_and(|e| e.kind() == ErrorKind::Config));
     let bytes = [255; 32 * 32 * 3];
     let image = ImageView::new(&bytes, 32, 32, 32 * 3, PixelFormat::Rgb8).unwrap();
     let separate = load(
@@ -75,12 +79,8 @@ fn decoded_page_api_and_missing_assets() {
         DEFAULT_WORKSPACE_LIMIT_BYTES,
     );
     let together = (
-        ocr_rt
-            .load::<Detector>(DetConfig::new(root.join("det")))
-            .unwrap(),
-        ocr_rt
-            .load::<Recognizer>(RecConfig::new(root.join("rec")))
-            .unwrap(),
+        Detector::load(&ocr_rt, DetConfig::new(root.join("det"))).unwrap(),
+        Recognizer::load(&ocr_rt, RecConfig::new(root.join("rec"))).unwrap(),
     );
     for (det, rec) in [&separate, &together] {
         let quads = det.detect(&image).unwrap();
@@ -106,7 +106,7 @@ fn ocr_workspace_is_independent_and_fits_2400_square() {
     let rt = runtime(options.clone());
     let default = DEFAULT_WORKSPACE_LIMIT_BYTES;
     // An unset config cap is the OCR default, not the runtime's.
-    let det: Detector = rt.load(DetConfig::new(root.join("det"))).unwrap();
+    let det = Detector::load(&rt, DetConfig::new(root.join("det"))).unwrap();
     let plan = det.warmup(2400, 2400).unwrap();
     let requested = plan.arena_bytes + plan.scratch_bytes;
     println!(
@@ -120,17 +120,19 @@ fn ocr_workspace_is_independent_and_fits_2400_square() {
 
     // A caller's smaller text-model limit cannot shrink the OCR default.
     let rt = runtime(options.clone().with_workspace_limit_bytes(1024 * 1024));
-    let det: Detector = rt.load(DetConfig::new(root.join("det"))).unwrap();
+    let det = Detector::load(&rt, DetConfig::new(root.join("det"))).unwrap();
     assert!(det.warmup(2400, 2400).is_ok());
     det.unload();
 
     let smaller = requested - 1;
     let (det, rec) = load(&rt, &root, smaller, default);
     let err = det.warmup(2400, 2400).unwrap_err();
-    assert!(matches!(
-        err,
-        Error::WorkspaceLimit { requested, limit, .. } if requested > limit && limit == smaller
-    ));
+    assert_eq!(err.kind(), ErrorKind::TooLarge, "{err}");
+    assert!(
+        err.to_string()
+            .ends_with(&format!("workspace limit is {smaller} bytes")),
+        "{err}"
+    );
     det.unload();
     rec.unload();
 
@@ -138,17 +140,19 @@ fn ocr_workspace_is_independent_and_fits_2400_square() {
     let smaller = 1024 * 1024;
     let (det, rec) = load(&rt, &root, default, smaller);
     let err = rec.warmup(1, 1600).unwrap_err();
-    assert!(matches!(
-        err,
-        Error::WorkspaceLimit { requested, limit, .. } if requested > limit && limit == smaller
-    ));
+    assert_eq!(err.kind(), ErrorKind::TooLarge, "{err}");
+    assert!(
+        err.to_string()
+            .ends_with(&format!("workspace limit is {smaller} bytes")),
+        "{err}"
+    );
     det.unload();
     rec.unload();
 
     // A shared backend applies its one cap to both models.
     let ocr_rt = shared(&rt, smaller);
-    let det: Detector = ocr_rt.load(DetConfig::new(root.join("det"))).unwrap();
-    let rec: Recognizer = ocr_rt.load(RecConfig::new(root.join("rec"))).unwrap();
+    let det = Detector::load(&ocr_rt, DetConfig::new(root.join("det"))).unwrap();
+    let rec = Recognizer::load(&ocr_rt, RecConfig::new(root.join("rec"))).unwrap();
     assert!(det.warmup(2400, 2400).is_err());
     assert!(rec.warmup(1, 1600).is_err());
 }

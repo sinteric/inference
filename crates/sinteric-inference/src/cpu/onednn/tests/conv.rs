@@ -160,7 +160,7 @@ fn convolution_cases(cpu: Arc<OnednnCpu>) -> Vec<f32> {
         let packed = ConvWeights::pack(cpu.clone(), oc, ic, k, g, deconv, &w, Some(&b));
         if deconv && cpu.conv_block() != 16 {
             // oneDNN names no 8-channel deconvolution weight layout.
-            assert!(matches!(packed, Err(crate::Error::Unsupported { .. })));
+            assert!(packed.is_err_and(|e| e.kind() == crate::ErrorKind::Unsupported));
             continue;
         }
         let weights = packed.unwrap();
@@ -600,10 +600,9 @@ fn lru_liveness_bounds_and_invalid_input() {
     assert!(net.run(s, &[]).is_err());
     assert!(net.warmup([0, 16, 8, 8]).is_err());
     assert!(net.warmup([1, 16, usize::MAX, 8]).is_err());
-    assert!(matches!(
-        net.warmup([1, 16, 1024, 1024]),
-        Err(crate::Error::WorkspaceLimit { .. })
-    ));
+    assert!(net
+        .warmup([1, 16, 1024, 1024])
+        .is_err_and(|e| e.kind() == crate::ErrorKind::TooLarge));
     assert!(
         ConvNet::new(c.clone(), vec![Node::new(Op::Binary(Binary::Add), [0])], 1)
             .unwrap()
@@ -683,8 +682,8 @@ fn memory_budget_evicts_conv_plans_without_changing_results() {
     // A one-byte budget keeps only the plan of the last call.
     assert_eq!(plain.cached_shapes().unwrap().len(), 3);
     assert_eq!(tight.cached_shapes().unwrap(), vec![shapes[3]]);
-    let stats = tight_cpu.stats_json();
-    assert!(stats["budget_evictions"].as_u64().unwrap() >= 2, "{stats}");
+    let stats = tight_cpu.stats();
+    assert!(stats.budget_evictions >= 2, "{stats:?}");
 }
 
 // Each width has its own process because the library's pool width is immutable.

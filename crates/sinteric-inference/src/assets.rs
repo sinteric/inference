@@ -48,9 +48,9 @@ impl Manifest {
     /// Parse an embedded or caller-provided manifest without filesystem access.
     pub fn parse(text: &str) -> Result<Self> {
         let manifest: Self =
-            toml::from_str(text).map_err(|e| Error::Asset(format!("manifest parse: {e}")))?;
+            toml::from_str(text).map_err(|e| Error::model_files(format!("manifest parse: {e}")))?;
         if !manifest.revision.is_ascii() {
-            return Err(Error::Asset("revision must be ASCII".into()));
+            return Err(Error::model_files("revision must be ASCII"));
         }
         Ok(manifest)
     }
@@ -68,7 +68,7 @@ pub fn verify_sha256_mmap(path: &Path, expected: &str) -> Result<()> {
     hasher.update(&map[..]);
     let got = hex::encode(hasher.finalize());
     if !got.eq_ignore_ascii_case(expected) {
-        return Err(Error::Asset(format!(
+        return Err(Error::model_files(format!(
             "sha256 mismatch for {}: got {got} want {expected}",
             path.display()
         )));

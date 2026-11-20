@@ -8,8 +8,10 @@ mod parity_pinned_avx2;
 mod parity_pinned_avx512;
 
 use super::config::{is_global, DOC_PREFIX, QUERY_PREFIX};
+use super::cpu::Precision;
 use super::*;
 use crate::cpu::onednn::{isa_has_amx, CacheOptions};
+use crate::cpu::WeightSource;
 
 fn skip_assets() -> Option<std::path::PathBuf> {
     let path = concat!(
@@ -31,11 +33,11 @@ fn skip_assets() -> Option<std::path::PathBuf> {
     Some(p.parent().unwrap().to_path_buf())
 }
 
-fn run_parity(model: &Model, fe: &Frontend) {
+fn run_parity(model: &Model, fe: &Tokenizer) {
     run_parity_at(model, fe, 0.9999);
 }
 
-fn run_parity_at(model: &Model, fe: &Frontend, gate: f32) {
+fn run_parity_at(model: &Model, fe: &Tokenizer, gate: f32) {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/fixtures/embeddinggemma2/parity.json"
@@ -83,9 +85,9 @@ fn run_parity_at(model: &Model, fe: &Frontend, gate: f32) {
         }
     }
     eprintln!(
-        "eg2 parity precision={:?} isa=0x{:x} min cosine vs FP32={min_cos} (<0.9999: {below_9999}) max|Δ| vs BF16={max_abs_bf16}",
+        "eg2 parity precision={} isa={} min cosine vs FP32={min_cos} (<0.9999: {below_9999}) max|Δ| vs BF16={max_abs_bf16}",
         model.precision(),
-        model.stats()["cpu_isa"].as_u64().unwrap_or(0)
+        model.backend_stats().isa
     );
 }
 
@@ -132,7 +134,7 @@ fn parity_vs_pytorch_fixtures() {
     let budget = crate::cpu::threads::ThreadBudget::new(1).unwrap();
     let backend = crate::cpu::onednn::OnednnCpu::load(&budget).expect("libdnnl");
     let model = Model::load(&dir, backend, 64).expect("load");
-    let fe = Frontend::load(&dir).expect("tokenizer");
+    let fe = Tokenizer::load(&dir).expect("tokenizer");
     run_parity(&model, &fe);
 }
 
@@ -148,7 +150,7 @@ fn parity_fp32_vs_pytorch_fixtures() {
     let model =
         Model::load_with_precision(&dir, backend, 64, &CacheOptions::default(), Precision::Fp32)
             .expect("load");
-    let fe = Frontend::load(&dir).expect("tokenizer");
+    let fe = Tokenizer::load(&dir).expect("tokenizer");
     run_parity_at(&model, &fe, 0.99999);
 }
 
@@ -169,7 +171,7 @@ fn parity_amx_path_when_supported() {
     }
     eprintln!("AMX path isa=0x{:x}", backend.cpu_isa());
     let model = Model::load(&dir, backend, 64).expect("load");
-    let fe = Frontend::load(&dir).expect("tokenizer");
+    let fe = Tokenizer::load(&dir).expect("tokenizer");
     run_parity(&model, &fe);
 }
 
@@ -197,10 +199,10 @@ fn packed_cache_foreign_isa_miss() {
         let backend = crate::cpu::onednn::OnednnCpu::load(&budget).expect("libdnnl");
         let live = backend.cpu_isa();
         let model = Model::load_with(&dir, backend, 64, &cache).expect("empty-cache load");
-        let fe = Frontend::load(&dir).expect("tokenizer");
+        let fe = Tokenizer::load(&dir).expect("tokenizer");
         eprintln!(
-            "empty-cache load_source={} cpu_isa=0x{live:x}",
-            model.stats()["load_source"]
+            "empty-cache load_source={:?} cpu_isa=0x{live:x}",
+            model.load_report().packed[0].source
         );
         run_parity(&model, &fe);
     }
@@ -217,11 +219,12 @@ fn packed_cache_foreign_isa_miss() {
         let backend = crate::cpu::onednn::OnednnCpu::load(&budget).expect("libdnnl");
         let isa = backend.cpu_isa();
         let model = Model::load_with(&dir, backend, 64, &cache).expect("foreign-ISA miss rebuilds");
-        let fe = Frontend::load(&dir).expect("tokenizer");
-        let stats = model.stats();
-        let src = stats["load_source"].as_str().unwrap_or("");
-        assert_ne!(
-            src, "packed-cache",
+        let fe = Tokenizer::load(&dir).expect("tokenizer");
+        assert!(
+            !matches!(
+                model.load_report().packed[0].source,
+                WeightSource::Cache { .. }
+            ),
             "foreign-ISA cache must not restore under live ISA 0x{isa:x}"
         );
         run_parity(&model, &fe);

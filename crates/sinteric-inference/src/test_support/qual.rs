@@ -5,7 +5,7 @@ use crate::{Error, Result};
 /// Cosine similarity of two equal-length, finite vectors.
 pub fn cosine(a: &[f32], b: &[f32]) -> Result<f32> {
     if a.len() != b.len() || a.is_empty() {
-        return Err(Error::Shape(format!(
+        return Err(Error::internal(format!(
             "cosine length {} vs {}",
             a.len(),
             b.len()
@@ -16,7 +16,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> Result<f32> {
     let mut nb = 0.0f32;
     for (x, y) in a.iter().zip(b) {
         if !x.is_finite() || !y.is_finite() {
-            return Err(Error::Message("NaN/inf in cosine".into()));
+            return Err(Error::internal("NaN/inf in cosine"));
         }
         dot += x * y;
         na += x * x;
@@ -28,7 +28,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> Result<f32> {
 /// Largest absolute difference of two equal-length vectors.
 pub fn max_abs_diff(a: &[f32], b: &[f32]) -> Result<f32> {
     if a.len() != b.len() {
-        return Err(Error::Shape(format!(
+        return Err(Error::internal(format!(
             "absdiff length {} vs {}",
             a.len(),
             b.len()

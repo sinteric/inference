@@ -37,7 +37,7 @@ pub(super) fn validate_attention<T>(
     );
     s.checked_add(radius)
         .and_then(|n| n.checked_add(1))
-        .ok_or(crate::Error::SizeOverflow("attention radius"))?;
+        .ok_or(crate::Error::size_overflow("attention radius"))?;
     crate::checked_size("attention score bytes", &[b, nq, s, s.min(tile), 4])?;
     Ok(())
 }
@@ -182,7 +182,7 @@ pub(super) fn attention_gqa_bf16(
 ) -> Result<Vec<f32>> {
     validate_attention(q, k, v, b, s, nq, nkv, d, tile, radius, padding)?;
     if nq == 0 || nkv == 0 || !nq.is_multiple_of(nkv) {
-        return Err(crate::Error::Shape("GQA head grouping".into()));
+        return Err(crate::Error::internal("GQA head grouping"));
     }
     let threads = hw.threads.max(1) as usize;
     let q_scale = if (scale - 1.0).abs() > 0.0 {
@@ -241,7 +241,7 @@ pub(super) fn attention_gqa_from_bf16(
 ) -> Result<Vec<f32>> {
     validate_attention(q_bf, k_bf, v_bf, b, s, nq, nkv, d, tile, radius, padding)?;
     if nq == 0 || nkv == 0 || !nq.is_multiple_of(nkv) {
-        return Err(crate::Error::Shape("GQA head grouping".into()));
+        return Err(crate::Error::internal("GQA head grouping"));
     }
     let groups = nq / nkv;
     let threads = hw.threads.max(1) as usize;

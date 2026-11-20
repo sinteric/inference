@@ -23,6 +23,15 @@ pub struct Steps {
     dictionary: Vec<String>,
 }
 
+impl std::fmt::Debug for Steps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Steps")
+            .field("det", &self.det)
+            .field("rec", &self.rec)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Steps {
     /// `model_dir` holds the imported assets; the dictionary comes from
     /// `rec/`.

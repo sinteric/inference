@@ -67,7 +67,7 @@ impl Graph<'_> {
         if tensors.get(&format!("{key}.w")) != Some(&vec![oc, ic, k, k])
             || tensors.get(&format!("{key}.b")) != Some(&vec![oc])
         {
-            return Err(Error::Asset(format!(
+            return Err(Error::model_files(format!(
                 "compiled unwarper weight shape {key}"
             )));
         }
@@ -199,9 +199,9 @@ fn head(cpu: &Arc<OnednnCpu>, assets: &Assets, capacity: usize) -> Result<ConvNe
         .iter()
         .find(|n| n.op == "PRelu")
         .and_then(|n| n.inputs.get(1))
-        .ok_or_else(|| Error::Asset("compiled unwarper PReLU".into()))?;
+        .ok_or_else(|| Error::model_files("compiled unwarper PReLU"))?;
     if assets.graph().tensors.get(name) != Some(&vec![1, 1, 1]) {
-        return Err(Error::Asset("compiled unwarper PReLU slope".into()));
+        return Err(Error::model_files("compiled unwarper PReLU slope"));
     }
     let slope = assets.tensor(name)?;
     let mut g = Graph::new(assets, cpu);

@@ -580,7 +580,7 @@ impl OnednnCpu {
         eps: f32,
     ) -> Result<Vec<f32>> {
         if x.len() != m.saturating_mul(n) {
-            return Err(crate::Error::Shape("rmsnorm shape".into()));
+            return Err(crate::Error::internal("rmsnorm shape"));
         }
         let mut y = self.buffer(x.len())?;
         rmsnorm_nthreads(x, n, scale, eps, &mut y, self.threads.max(1) as usize)?;

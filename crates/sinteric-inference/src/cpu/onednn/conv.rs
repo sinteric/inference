@@ -30,13 +30,13 @@ fn dimensions(d: &[usize]) -> Result<Vec<i64>> {
     );
     let bytes = checked_size("convolution tensor", d)?
         .checked_mul(4)
-        .ok_or(Error::SizeOverflow("tensor bytes"))?;
+        .ok_or(Error::size_overflow("tensor bytes"))?;
     check_shape!(
         bytes <= isize::MAX as usize,
         "tensor extent exceeds address space"
     );
     d.iter()
-        .map(|&x| i64::try_from(x).map_err(|_| Error::SizeOverflow("oneDNN dimension")))
+        .map(|&x| i64::try_from(x).map_err(|_| Error::size_overflow("oneDNN dimension")))
         .collect()
 }
 
@@ -152,7 +152,7 @@ impl Spatial {
         {
             for j in 0..2 {
                 a[i][j] =
-                    i64::try_from(v[j]).map_err(|_| Error::SizeOverflow("spatial attributes"))?;
+                    i64::try_from(v[j]).map_err(|_| Error::size_overflow("spatial attributes"))?;
             }
         }
         Ok(a)
@@ -171,20 +171,20 @@ impl Spatial {
             let effective = (kernel[j] - 1)
                 .checked_mul(self.dilations[j])
                 .and_then(|v| v.checked_add(1))
-                .ok_or(Error::SizeOverflow("dilated kernel"))?;
+                .ok_or(Error::size_overflow("dilated kernel"))?;
             let pad = self.pads_begin[j]
                 .checked_add(self.pads_end[j])
-                .ok_or(Error::SizeOverflow("padding"))?;
+                .ok_or(Error::size_overflow("padding"))?;
             let v = if transpose {
                 (input[j + 2] - 1)
                     .checked_mul(self.strides[j])
                     .and_then(|v| v.checked_add(effective))
                     .and_then(|v| v.checked_sub(pad))
-                    .ok_or_else(|| Error::Shape("deconvolution output extent".into()))?
+                    .ok_or_else(|| Error::internal("deconvolution output extent"))?
             } else {
                 let padded = input[j + 2]
                     .checked_add(pad)
-                    .ok_or(Error::SizeOverflow("padded input"))?;
+                    .ok_or(Error::size_overflow("padded input"))?;
                 check_shape!(padded >= effective, "kernel exceeds padded input");
                 (padded - effective) / self.strides[j] + 1
             };
@@ -351,6 +351,8 @@ struct Step {
     specs: Vec<(i32, Md, Binding)>,
     scratch: Option<Md>,
     scratch_bytes: usize,
+    /// oneDNN's (or the glue's) name for what runs; tests check it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "only tests read plans' names"))]
     implementation: String,
     mean: Option<(usize, usize, SpatialMean)>,
     concat: Option<(usize, usize, Vec<usize>)>,
@@ -387,18 +389,18 @@ struct Plan {
     bytes: usize,
 }
 /// Inspectable cache/arena information, including primitive implementation names.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct PlanInfo {
-    pub shape: Shape,
     pub output_shape: Shape,
     pub arena_bytes: usize,
     pub scratch_bytes: usize,
     pub implementations: Vec<String>,
 }
 impl Plan {
+    #[cfg(test)]
     fn info(&self) -> PlanInfo {
         PlanInfo {
-            shape: self.shape,
             output_shape: self.output_shape,
             arena_bytes: self.arena_bytes,
             scratch_bytes: self.scratch_bytes,
@@ -450,7 +452,7 @@ impl Workspaces {
         let mut set = self
             .state
             .lock()
-            .map_err(|_| Error::Poisoned("conv workspace"))?;
+            .map_err(|_| Error::poisoned("conv workspace"))?;
         let parallel = crate::cpu::threads::in_parallel();
         loop {
             // Outside a job take the largest workspace, inside one the
@@ -479,7 +481,7 @@ impl Workspaces {
             set = self
                 .cv
                 .wait(set)
-                .map_err(|_| Error::Poisoned("conv workspace"))?;
+                .map_err(|_| Error::poisoned("conv workspace"))?;
         }
     }
 }
@@ -592,11 +594,13 @@ impl ConvNet {
         Ok(self
             .cache
             .lock()
-            .map_err(|_| Error::Poisoned("conv plan cache"))?
+            .map_err(|_| Error::poisoned("conv plan cache"))?
             .iter()
             .map(|p| p.shape)
             .collect())
     }
+    /// Build the plan for `shape` now and describe it.
+    #[cfg(test)]
     pub fn warmup(&self, shape: Shape) -> Result<PlanInfo> {
         Ok(self.plan(shape)?.info())
     }
@@ -623,13 +627,13 @@ impl ConvNet {
         let workspace = lease
             .workspace
             .as_mut()
-            .ok_or_else(|| Error::Backend("conv workspace missing".into()))?;
+            .ok_or_else(|| Error::internal("conv workspace missing"))?;
         let retained = workspace
             .arena
             .bytes
             .max(plan.arena_bytes)
             .checked_add(workspace.scratch.bytes.max(plan.scratch_bytes))
-            .ok_or(Error::SizeOverflow("retained convolution workspace"))?;
+            .ok_or(Error::size_overflow("retained convolution workspace"))?;
         // Over the backend's memory budget the arena is cut back to this
         // request's size instead of staying at the largest page seen.
         let trim = retained > self.cpu.conv_limit() || self.cpu.over_budget();
@@ -688,12 +692,10 @@ impl ConvNet {
                     Binding::Bias(w) => w
                         .bias
                         .as_ref()
-                        .ok_or_else(|| Error::Missing("conv bias".into()))?
+                        .ok_or_else(|| Error::missing("conv bias"))?
                         .as_ptr() as *mut c_void,
                     Binding::Slopes(s) => s.as_ptr() as *mut c_void,
-                    Binding::External => {
-                        return Err(Error::Backend("external binding in graph".into()))
-                    }
+                    Binding::External => return Err(Error::internal("external binding in graph")),
                 });
             }
             step.execute(
@@ -721,7 +723,7 @@ impl ConvNet {
         let lock = || {
             self.cache
                 .lock()
-                .map_err(|_| Error::Poisoned("conv plan cache"))
+                .map_err(|_| Error::poisoned("conv plan cache"))
         };
         if let Some(p) = lookup(&mut *lock()?) {
             return Ok(p);
@@ -778,7 +780,7 @@ impl ConvNet {
             let mut caches = self
                 .primitive_cache
                 .lock()
-                .map_err(|_| Error::Poisoned("conv primitive cache"))?;
+                .map_err(|_| Error::poisoned("conv primitive cache"))?;
             for steps in &mut caches.steps {
                 steps.retain(|(_, step)| Arc::strong_count(step) > 1);
             }

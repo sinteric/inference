@@ -20,6 +20,7 @@ use crate::process::{peak_rss_kib, rounded};
 pub const DROP_SCORE: f32 = 0.5;
 
 /// One recognized line of a page.
+#[derive(Debug)]
 pub struct Line {
     pub quad: Quad,
     pub text: String,
@@ -27,6 +28,7 @@ pub struct Line {
 }
 
 /// Where the pages come from and where results go.
+#[derive(Debug)]
 pub struct Pages {
     pub images: PathBuf,
     pub out: PathBuf,

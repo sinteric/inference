@@ -14,6 +14,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::cpu::onednn::CpuIsaCap;
+use crate::cpu::IsaCap;
 
 /// One read of every test variable. A malformed value fails the test.
 #[derive(Debug, Default)]
@@ -47,7 +48,9 @@ impl TestOverrides {
             assets: path("SINTERIC_ASSETS")?,
             ocr_assets: path("SINTERIC_OCR_ASSETS")?,
             conv_isa: scalar("SINTERIC_TEST_CPU_ISA", |v| {
-                CpuIsaCap::from_name(v).map_err(|e| e.to_string())
+                v.parse::<IsaCap>()
+                    .map(IsaCap::backend)
+                    .map_err(|e| e.to_string())
             })?,
             ocr_threads: scalar("PPOCR_TEST_THREADS", threads)?,
             ident_threads: scalar("EG2_IDENT_THREADS", threads)?,

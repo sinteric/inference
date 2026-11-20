@@ -147,7 +147,7 @@ def run_case(worker, case, cpus, threads):
         "first_call_ms": first_ms,
         "rss_bytes": mem.get("VmRSS"),
         "hwm_bytes": mem.get("VmHWM"),
-        "isa": prim.get("cpu_isa"),
+        "isa": prim.get("isa"),
         **stats,
     }
 
@@ -226,7 +226,7 @@ def main():
                                 "load_wall_s": ready.get("load_wall_s"),
                                 "rss_bytes": mem.get("VmRSS"),
                                 "hwm_bytes": mem.get("VmHWM"),
-                                "isa": ready.get("cpu_isa"),
+                                "isa": ready.get("isa"),
                                 "tile": ready.get("tile"),
                                 "affinity": ready.get("affinity"),
                             }
@@ -235,7 +235,7 @@ def main():
                         f"  chunk {ci + 1}/{len(chunks)} seq {chunk[0]['seq']}..{chunk[-1]['seq']} "
                         f"load_wall_s={ready.get('load_wall_s')} "
                         f"rss_mb={(mem.get('VmRSS') or 0)/1024/1024:.1f} "
-                        f"isa={ready.get('cpu_isa')}",
+                        f"isa={ready.get('isa')}",
                         flush=True,
                     )
                     for case in chunk:

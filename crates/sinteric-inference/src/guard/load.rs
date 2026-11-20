@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 
 use crate::cpu::kernels::f32_slice_to_bf16;
 use crate::cpu::onednn::{
-    apply_cache, cache_path_with, cache_write_failed, pinned_dnnl, CacheMeta, CacheOptions,
-    CacheWriter, FileStamp, OnednnCpu, PackedEntry, PackedWeight, RawTensor,
+    apply_cache, cache_path_with, pinned_dnnl, CacheMeta, CacheOptions, CacheWriter, FileStamp,
+    OnednnCpu, PackedWeight, RawTensor,
 };
 use crate::guard::config::EncoderConfig;
 use crate::guard::encoder::{Layer, Precision};
 use crate::tensor_file::TensorFile;
-use crate::{check_shape, Result, ResultContext as Context};
+use crate::{check_files, Result, ResultContext as Context};
 
 /// Packed matrices, by cache key.
 fn key(layer: usize, part: &str) -> String {
@@ -35,26 +35,8 @@ fn pack_weight(
     } else {
         backend.pack(n, k, src)?
     };
-    let failed = if let Some(c) = cache.as_mut() {
-        let mut bytes = crate::try_vec::<u8>(w.bytes())?;
-        let wrote = backend.unpack_into(&w, &mut bytes).is_ok()
-            && c.write_packed(PackedEntry {
-                name: name.to_string(),
-                n,
-                k,
-                bytes,
-                layout: w.layout_tag(),
-            })
-            .is_ok();
-        if !wrote {
-            cache_write_failed(c.dest(), "write interrupted");
-        }
-        !wrote
-    } else {
-        false
-    };
-    if failed {
-        *cache = None;
+    if let Some(c) = cache.as_mut() {
+        c.record(backend, &w, name, n, k)?;
     }
     Ok(w)
 }
@@ -201,7 +183,7 @@ pub(super) fn take_norm(
     let v = small
         .remove(name)
         .with_context(|| format!("missing tensor {name}"))?;
-    check_shape!(
+    check_files!(
         v.len() == width,
         "norm {name}: width {}, expected {width}",
         v.len()
@@ -224,7 +206,7 @@ pub(super) fn take_layers(
             let w = linears
                 .remove(&key(i, part))
                 .with_context(|| format!("missing packed weight {}", key(i, part)))?;
-            check_shape!(
+            check_files!(
                 w.n() == n && w.k() == k,
                 "packed {}: [{}, {}], expected [{n}, {k}]",
                 key(i, part),

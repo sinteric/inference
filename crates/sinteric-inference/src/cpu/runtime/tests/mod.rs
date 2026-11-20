@@ -5,43 +5,43 @@ mod amx_bf16_race_repro;
 mod amx_bf16_race_sweep;
 
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-static DROPPED: AtomicBool = AtomicBool::new(false);
-
-struct Dummy(#[allow(dead_code)] Vec<u8>);
-impl Drop for Dummy {
-    fn drop(&mut self) {
-        DROPPED.store(true, Ordering::SeqCst);
-    }
-}
-impl Model for Dummy {
-    type Config = usize;
-    const PRECISIONS: &'static [Precision] = &[Precision::Fp32];
-    fn load(_: &Runtime, bytes: usize) -> Result<Self> {
-        Ok(Self(vec![1; bytes]))
-    }
-    fn precision(&self) -> Precision {
-        Precision::Fp32
-    }
+#[test]
+fn runtime_reports_its_isa_threads_and_cpus() {
+    crate::test_support::own_process!(runtime_reports_its_isa_threads_and_cpus);
+    let rt = Runtime::new(Options::new().with_threads(2)).unwrap();
+    assert_eq!(rt.threads(), 2);
+    assert_eq!(rt.cpus().len(), 2);
+    // The library's floor: `Runtime::new` refuses anything below it.
+    assert!(rt.isa().bits() & Isa::Avx2.bits() == Isa::Avx2.bits());
+    assert_eq!(rt.options().threads, 2);
 }
 
 #[test]
-fn isa_names() {
-    assert_eq!(cpu_isa_name(0xe7), "AVX512_CORE_BF16");
-    assert_eq!(cpu_isa_name(0xfef), "AVX10_1_512_AMX");
-    assert_eq!(cpu_isa_name(0x12345), "UNKNOWN");
+fn a_capped_runtime_runs_at_most_its_cap() {
+    crate::test_support::own_process!(a_capped_runtime_runs_at_most_its_cap);
+    let rt = Runtime::new(Options::new().with_threads(1).with_isa_cap(IsaCap::Avx2)).unwrap();
+    assert_eq!(rt.isa(), Isa::Avx2);
+    assert!(!rt.isa().has_bf16_matmul());
+    assert_eq!(rt.amx_health(), AmxHealth::NotProbed);
 }
 
 #[test]
-fn unload_drops_model_and_shared_model_unloads_on_last_owner() {
-    let shared = Arc::new(Dummy(vec![1; 64 << 20]));
-    let other = Arc::clone(&shared);
-    assert!(Arc::into_inner(shared).is_none());
-    assert!(!DROPPED.load(Ordering::SeqCst));
-    if let Some(m) = Arc::into_inner(other) {
-        m.unload();
-    }
-    assert!(DROPPED.load(Ordering::SeqCst));
-    release_free_memory();
+fn a_shared_backend_handle_owns_its_settings() {
+    crate::test_support::own_process!(a_shared_backend_handle_owns_its_settings);
+    let rt = Runtime::new(Options::new().with_threads(1)).unwrap();
+    assert!(!rt.shares_backend());
+    let shared = rt.shared_backend(BackendOverrides::default()).unwrap();
+    assert!(shared.shares_backend());
+    let again = shared
+        .shared_backend(BackendOverrides::default())
+        .unwrap_err();
+    assert_eq!(again.kind(), ErrorKind::Config);
+    assert!(shared
+        .backend_with(BackendOverrides::default().with_threads(Some(1)))
+        .is_err_and(|e| e.kind() == ErrorKind::Config));
+    assert!(Arc::ptr_eq(
+        &shared.backend().unwrap(),
+        &shared.backend().unwrap()
+    ));
 }

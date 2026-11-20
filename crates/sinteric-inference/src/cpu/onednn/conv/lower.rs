@@ -43,9 +43,9 @@ pub(super) fn infer_shape(node: &Node, shapes: &[Shape], block: usize) -> Result
                 s[0],
                 s[1] / 4,
                 s[2].checked_mul(2)
-                    .ok_or(Error::SizeOverflow("depth-to-space height"))?,
+                    .ok_or(Error::size_overflow("depth-to-space height"))?,
                 s[3].checked_mul(2)
-                    .ok_or(Error::SizeOverflow("depth-to-space width"))?,
+                    .ok_or(Error::size_overflow("depth-to-space width"))?,
             ]
         }
         Op::Resize {
@@ -66,9 +66,9 @@ pub(super) fn infer_shape(node: &Node, shapes: &[Shape], block: usize) -> Result
                 s[0],
                 s[1],
                 s[2].checked_mul(scales[0])
-                    .ok_or(Error::SizeOverflow("resize height"))?,
+                    .ok_or(Error::size_overflow("resize height"))?,
                 s[3].checked_mul(scales[1])
-                    .ok_or(Error::SizeOverflow("resize width"))?,
+                    .ok_or(Error::size_overflow("resize width"))?,
             ]
         }
         Op::SpatialMean(_) => [s[0], s[1], 1, 1],
@@ -78,7 +78,7 @@ pub(super) fn infer_shape(node: &Node, shapes: &[Shape], block: usize) -> Result
                 o[j + 2] = s[j + 2]
                     .checked_add(begin[j])
                     .and_then(|v| v.checked_add(end[j]))
-                    .ok_or(Error::SizeOverflow("zero pad"))?;
+                    .ok_or(Error::size_overflow("zero pad"))?;
             }
             o
         }
@@ -102,7 +102,7 @@ pub(super) fn infer_shape(node: &Node, shapes: &[Shape], block: usize) -> Result
                 check_shape!((0..4).all(|i| i == axis || t[i] == s[i]), "concat shapes");
                 o[axis] = o[axis]
                     .checked_add(t[axis])
-                    .ok_or(Error::SizeOverflow("concat"))?;
+                    .ok_or(Error::size_overflow("concat"))?;
             }
             o
         }

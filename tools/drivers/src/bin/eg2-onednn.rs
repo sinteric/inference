@@ -16,12 +16,11 @@ use std::time::Instant;
 
 use anyhow::{ensure, Context, Result};
 use drivers::flags::Flags;
-use drivers::process::{affinity, cpu_seconds, memory};
+use drivers::process::{affinity, cpu_seconds, memory, pin};
 use serde_json::{json, Value};
-use sinteric_inference::embeddinggemma2::{
-    Batch, Config, EmbeddingGemma2, Embeddings, Precision, PromptKind,
-};
-use sinteric_inference::{CpuIsa, Runtime, RuntimeOptions};
+use sinteric_inference::cpu::{IsaCap, Options, Runtime};
+use sinteric_inference::embeddinggemma2::cpu::{Config, EmbeddingGemma2, Precision};
+use sinteric_inference::embeddinggemma2::{Batch, Embeddings, PromptKind};
 
 const VALUED: &[&str] = &[
     "--model",
@@ -136,7 +135,7 @@ fn answer(models: &[EmbeddingGemma2], exec_slots: usize, line: &str) -> Result<V
     let req: Value = serde_json::from_str(line)?;
     let operation = req["operation"].as_str().unwrap_or("tensor");
     let batch = match operation {
-        "stats" => return Ok(models[0].backend_stats()),
+        "stats" => return Ok(serde_json::to_value(models[0].backend_stats())?),
         "tensor" => Batch {
             input_ids: serde_json::from_value(req["input_ids"].clone())?,
             attention_mask: serde_json::from_value(req["attention_mask"].clone())?,
@@ -176,12 +175,10 @@ fn main() -> Result<()> {
     let exec_slots = flags.get("--exec-slots")?.unwrap_or(1usize);
     let instances = flags.get("--instances")?.unwrap_or(1usize);
     let warmup = flags.switch("--warmup");
-    let precision: Precision = flags.get("--precision")?.unwrap_or(Precision::Bf16);
+    let precision: Option<Precision> = flags.get("--precision")?;
     ensure!((1..=8).contains(&instances), "--instances outside 1..=8");
 
-    let mut options = RuntimeOptions::new()
-        .with_pin_process(true)
-        .with_exec_slots(exec_slots);
+    let mut options = Options::new().with_exec_slots(exec_slots);
     if let Some(threads) = flags.get("--threads")? {
         options = options.with_threads(threads);
     }
@@ -189,23 +186,23 @@ fn main() -> Result<()> {
         options = options.with_cpuset(cpuset);
     }
     if let Some(isa) = flags.get::<String>("--pin-isa")? {
-        options = options.with_cpu_isa(CpuIsa::from_name(&isa)?);
+        options = options.with_isa_cap(isa.parse::<IsaCap>()?);
     }
     let start = Instant::now();
     let cpu = cpu_seconds();
     let rt = Runtime::new(options)?;
-    let plan = rt.plan();
+    pin(rt.cpus())?;
     let tile: Option<usize> = flags.get("--tile")?;
-    let mut config = Config::new(&model_dir)
-        .with_precision(precision)
-        .with_warmup(warmup);
+    let mut config = Config::new(&model_dir).with_warmup(warmup);
+    if let Some(precision) = precision {
+        config = config.with_precision(precision);
+    }
     if let Some(tile) = tile {
         config = config.with_tile(tile);
     }
     let models = (0..instances)
-        .map(|_| rt.load::<EmbeddingGemma2>(config.clone()))
+        .map(|_| EmbeddingGemma2::load(&rt, config.clone()))
         .collect::<sinteric_inference::Result<Vec<_>>>()?;
-    let topology = plan.topology;
     println!(
         "{}",
         json!({
@@ -218,21 +215,15 @@ fn main() -> Result<()> {
             "exec_slots": exec_slots,
             "instances": instances,
             "warmup": warmup,
-            "tuning": {
-                "physical_cores": topology.physical_cores,
-                "l1d_bytes": topology.l1d_bytes,
-                "l2_bytes": topology.l2_bytes,
-                "l3_bytes": topology.l3_bytes,
-                "eltwise_grain": plan.eltwise_grain,
-            },
             "load_wall_s": start.elapsed().as_secs_f64(),
             "load_cpu_s": cpu_seconds() - cpu,
             "memory": memory(),
-            "cpu_isa": rt.cpu_isa(),
-            "cpu_isa_name": rt.cpu_isa_name(),
+            "isa": rt.isa(),
+            "amx": rt.amx_health(),
             "embedding_dim": models[0].embedding_dim(),
             "onednn": "static",
             "primitive_stats": models[0].backend_stats(),
+            "load": models[0].load_report(),
         })
     );
     io::stdout().flush()?;

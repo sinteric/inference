@@ -23,20 +23,11 @@ pub use pool::install as install_pool;
 pub use pool::{compute_contended, compute_lock, in_parallel, par_for};
 pub use topology::CpuTopology;
 
-/// How pool workers wait between parallel regions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaitPolicy {
-    /// Spin `spin_count` times, then condvar sleep. Matches prior benches.
-    Active,
-    /// Sleep on the condvar. Lower idle CPU, higher wake latency.
-    Passive,
-}
-
 /// Threading contract for one model session.
 #[derive(Clone, Debug)]
 pub struct ThreadBudget {
     pub nthreads: usize,
-    pub wait: WaitPolicy,
+    /// Times a worker spins for new work before it sleeps on the condvar.
     pub spin_count: u32,
     /// Explicit cpuset. `None` means "pick `nthreads` physical cores".
     pub cpuset: Option<String>,
@@ -47,23 +38,17 @@ pub struct ThreadBudget {
 impl ThreadBudget {
     pub fn new(nthreads: usize) -> Result<Self> {
         if nthreads == 0 || nthreads > libc::CPU_SETSIZE as usize {
-            return Err(crate::Error::Config(
-                "ThreadBudget.nthreads must be in 1..=CPU_SETSIZE".into(),
+            return Err(crate::Error::config(
+                "ThreadBudget.nthreads must be in 1..=CPU_SETSIZE",
             ));
         }
         let cpus = select_cpus(nthreads, None)?;
         Ok(Self {
             nthreads,
-            wait: WaitPolicy::Active,
             spin_count: 500,
             cpuset: None,
             cpus,
         })
-    }
-
-    pub fn with_wait(mut self, wait: WaitPolicy) -> Self {
-        self.wait = wait;
-        self
     }
 
     pub fn with_cpuset(mut self, cpuset: impl Into<String>) -> Result<Self> {
@@ -77,34 +62,11 @@ impl ThreadBudget {
         i32::try_from(self.nthreads).unwrap_or(i32::MAX)
     }
 
-    pub fn omp_places(&self) -> String {
-        self.cpus
-            .iter()
-            .map(|c| format!("{{{c}}}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-    fn pool_spin(&self) -> u32 {
-        match self.wait {
-            WaitPolicy::Active => self.spin_count,
-            WaitPolicy::Passive => 0,
-        }
-    }
-
-    /// Install the pinned pool (GEMMs + glue) without process affinity.
-    /// Library loads call this. Does not mutate process environment.
+    /// Install the pinned pool (GEMMs + glue). The pool's workers are
+    /// pinned; the calling process is not, and no environment variable is
+    /// set.
     pub fn install_library_workers(&self) -> Result<()> {
-        pool::install_or_check_with(self.nthreads, &self.cpus, self.pool_spin())
-    }
-
-    /// Pin the calling process to [`Self::cpus`] and install the pool.
-    /// Intended for process-owned drivers, not for embedding as a library.
-    /// Does not set `OMP_*` / `GOMP_*` / `RAYON_*` / tokenizer env.
-    pub fn apply_process_policy(&self) -> Result<()> {
-        pin_process(&self.cpus)?;
-        pool::install_or_check_with(self.nthreads, &self.cpus, self.pool_spin())?;
-        Ok(())
+        pool::install_or_check_with(self.nthreads, &self.cpus, self.spin_count)
     }
 }
 
@@ -216,12 +178,12 @@ fn parse_cpuset(s: &str) -> Result<Vec<usize>> {
         if let Some((a, b)) = part.split_once('-') {
             let lo: usize = a
                 .parse()
-                .map_err(|_| crate::Error::Message(format!("bad cpuset {s}")))?;
+                .map_err(|_| crate::Error::config(format!("bad cpuset {s}")))?;
             let hi: usize = b
                 .parse()
-                .map_err(|_| crate::Error::Message(format!("bad cpuset {s}")))?;
+                .map_err(|_| crate::Error::config(format!("bad cpuset {s}")))?;
             if lo > hi || hi >= libc::CPU_SETSIZE as usize {
-                return Err(crate::Error::Config(format!(
+                return Err(crate::Error::config(format!(
                     "cpuset range {part} outside CPU_SETSIZE"
                 )));
             }
@@ -231,33 +193,33 @@ fn parse_cpuset(s: &str) -> Result<Vec<usize>> {
         } else {
             out.push(
                 part.parse()
-                    .map_err(|_| crate::Error::Message(format!("bad cpuset {s}")))?,
+                    .map_err(|_| crate::Error::config(format!("bad cpuset {s}")))?,
             );
         }
     }
     if out.iter().any(|&c| c >= libc::CPU_SETSIZE as usize) {
-        return Err(crate::Error::Config(format!(
+        return Err(crate::Error::config(format!(
             "cpuset {s} outside CPU_SETSIZE"
         )));
     }
     out.sort_unstable();
     out.dedup();
     if out.is_empty() {
-        return Err(crate::Error::Message("empty cpuset".into()));
+        return Err(crate::Error::config("empty cpuset"));
     }
     Ok(out)
 }
 
 fn select_cpus(nthreads: usize, cpuset: Option<&str>) -> Result<Vec<usize>> {
     if nthreads == 0 || nthreads > libc::CPU_SETSIZE as usize {
-        return Err(Error::Config(format!("invalid thread count {nthreads}")));
+        return Err(Error::config(format!("invalid thread count {nthreads}")));
     }
     let allowed = allowed_cpus();
     let pool = if let Some(s) = cpuset {
         let cpus = parse_cpuset(s)?;
         if let Some(allowed) = &allowed {
             if let Some(c) = cpus.iter().find(|c| !allowed.contains(c)) {
-                return Err(Error::Config(format!(
+                return Err(Error::config(format!(
                     "cpuset {s}: CPU {c} is outside this process's affinity mask"
                 )));
             }
@@ -290,28 +252,6 @@ fn select_cpus(nthreads: usize, cpuset: Option<&str>) -> Result<Vec<usize>> {
         out.push(pool[i % pool.len()]);
     }
     Ok(out)
-}
-
-fn pin_process(cpus: &[usize]) -> Result<()> {
-    if cpus.is_empty() || cpus.iter().any(|&c| c >= libc::CPU_SETSIZE as usize) {
-        return Err(Error::Config("invalid CPU affinity set".into()));
-    }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        for &c in cpus {
-            libc::CPU_SET(c, &mut set);
-        }
-        if libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) != 0 {
-            return Err(crate::Error::Message(format!(
-                "CPU affinity: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-    }
-    let _ = cpus;
-    Ok(())
 }
 
 #[cfg(test)]

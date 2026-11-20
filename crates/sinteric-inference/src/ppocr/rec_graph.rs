@@ -30,7 +30,9 @@ impl Graph<'_> {
         if self.assets.graph().tensors.get(&format!("{key}.w"))
             != Some(&vec![oc, ic / groups, kernel[0], kernel[1]])
         {
-            return Err(Error::Asset(format!("compiled recognizer shape {key}")));
+            return Err(Error::model_files(format!(
+                "compiled recognizer shape {key}"
+            )));
         }
         let raw = self.assets.tensor(&format!("{key}.w"))?;
         let bias = self.assets.tensor(&format!("{key}.b"))?;

@@ -1,6 +1,5 @@
 use crate::ppocr::rec::CTC_CLASSES;
 use crate::ppocr::weights::{AssetConfig, Assets, ModelKind};
-use crate::Error;
 
 #[test]
 fn pinned_det_and_rec_assets() {
@@ -44,7 +43,9 @@ fn pinned_det_and_rec_assets() {
             assert_eq!(t.len(), shape.iter().product::<usize>());
             assert!(t.iter().all(|v| v.is_finite()));
         }
-        assert!(matches!(assets.tensor("missing"), Err(Error::Missing(_))));
+        assert!(assets
+            .tensor("missing")
+            .is_err_and(|e| e.kind() == crate::ErrorKind::ModelFiles));
         if kind == ModelKind::Rec {
             assert_eq!(assets.dictionary().len() + 2, CTC_CLASSES);
         }
@@ -61,13 +62,13 @@ fn pinned_det_and_rec_assets() {
 #[test]
 fn boundary_configs() {
     crate::test_support::own_process!(boundary_configs);
-    let det = crate::ppocr::api::DetConfig::new("explicit/det").options;
+    let det = crate::ppocr::cpu::DetConfig::new("explicit/det").options;
     assert_eq!(det.thresh, 0.2);
     assert_eq!(det.box_thresh, 0.45);
     assert_eq!(det.max_candidates, 1000);
     assert!(det.max_side.is_none());
     assert_eq!(
-        crate::ppocr::api::RecConfig::new("explicit/rec")
+        crate::ppocr::cpu::RecConfig::new("explicit/rec")
             .options
             .max_pixels,
         64 * 1024 * 1024

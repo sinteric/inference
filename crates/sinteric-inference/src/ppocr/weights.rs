@@ -20,6 +20,7 @@ pub enum ModelKind {
     Uvdoc,
 }
 impl ModelKind {
+    #[cfg(test)]
     pub fn name(self) -> &'static str {
         match self {
             Self::Det => "det",
@@ -76,7 +77,7 @@ impl Pin {
         self.files
             .iter()
             .find(|f| f.path == name)
-            .ok_or_else(|| Error::Asset(format!("missing OCR file pin {name}")))
+            .ok_or_else(|| Error::model_files(format!("missing OCR file pin {name}")))
     }
 }
 #[derive(Debug, Deserialize)]
@@ -102,10 +103,15 @@ pub struct InputSpec {
 #[serde(deny_unknown_fields)]
 pub struct NodeSpec {
     pub name: String,
+    /// Declared so `deny_unknown_fields` accepts the graph file; the
+    /// embedded pin hashes the whole file, and the build reads only the
+    /// fields below.
+    #[expect(dead_code, reason = "parsed for the schema, never read")]
     pub source_name: String,
     pub op: String,
     pub inputs: Vec<String>,
     pub output: String,
+    #[expect(dead_code, reason = "parsed for the schema, never read")]
     pub attrs: BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Deserialize)]
@@ -118,7 +124,7 @@ pub struct IntegerConstant {
 fn digest(bytes: &[u8], expected: &str) -> Result<()> {
     let got = hex::encode(Sha256::digest(bytes));
     if got != expected {
-        return Err(Error::Asset(format!(
+        return Err(Error::model_files(format!(
             "OCR SHA256 mismatch: got {got}, expected {expected}"
         )));
     }
@@ -129,7 +135,10 @@ fn mapped(path: &Path, pin: &PinnedFile, verify: bool) -> Result<Mmap> {
         let f = File::open(path)?;
         let len = f.metadata()?.len();
         if len != pin.size || len == 0 {
-            return Err(Error::Asset(format!("OCR file size {len} != {}", pin.size)));
+            return Err(Error::model_files(format!(
+                "OCR file size {len} != {}",
+                pin.size
+            )));
         }
         // Model files must remain immutable for the lifetime of this mapping.
         let map = unsafe { Mmap::map(&f) }?;
@@ -142,23 +151,25 @@ fn mapped(path: &Path, pin: &PinnedFile, verify: bool) -> Result<Mmap> {
 }
 fn checked_elements(shape: &[usize]) -> Result<usize> {
     if shape.len() > 12 {
-        return Err(Error::Asset(format!("invalid OCR tensor shape {shape:?}")));
+        return Err(Error::model_files(format!(
+            "invalid OCR tensor shape {shape:?}"
+        )));
     }
     let len = checked_size("OCR tensor", shape)?;
     if len > isize::MAX as usize / 4 {
-        return Err(Error::SizeOverflow("OCR tensor bytes"));
+        return Err(Error::size_overflow("OCR tensor bytes"));
     }
     Ok(len)
 }
 /// The file holds exactly the graph's tensors, each FP32 of its shape.
 fn check_tensors(index: &Index, spec: &GraphSpec) -> Result<()> {
     if index.len() != spec.tensors.len() {
-        return Err(Error::Asset("OCR tensor inventory mismatch".into()));
+        return Err(Error::model_files("OCR tensor inventory mismatch"));
     }
     for (name, shape) in &spec.tensors {
         checked_elements(shape)?;
         if index.dtype(name)? != Dtype::F32 || index.shape(name)? != shape {
-            return Err(Error::Asset(format!(
+            return Err(Error::model_files(format!(
                 "OCR tensor dtype/shape mismatch: {name}"
             )));
         }
@@ -172,9 +183,7 @@ impl GraphSpec {
             || self.model != kind
             || self.source_sha256 != source_sha256
         {
-            return Err(Error::Asset(
-                "OCR graph schema/model/source mismatch".into(),
-            ));
+            return Err(Error::model_files("OCR graph schema/model/source mismatch"));
         }
         if self.inputs.len() != 1
             || self.inputs[0].shape.len() != 4
@@ -183,8 +192,8 @@ impl GraphSpec {
             || self.nodes.is_empty()
             || self.outputs.len() != 1
         {
-            return Err(Error::Asset(
-                "OCR graph input/output contract mismatch".into(),
+            return Err(Error::model_files(
+                "OCR graph input/output contract mismatch",
             ));
         }
         let mut available = BTreeSet::new();
@@ -197,7 +206,9 @@ impl GraphSpec {
         }
         for (name, c) in &self.integer_constants {
             if checked_elements(&c.shape)? != c.values.len() {
-                return Err(Error::Asset(format!("OCR shape constant {name} extent")));
+                return Err(Error::model_files(format!(
+                    "OCR shape constant {name} extent"
+                )));
             }
             available.insert(name.as_str());
         }
@@ -213,7 +224,10 @@ impl GraphSpec {
                     .any(|s| !available.contains(s.as_str()))
                 || !available.insert(node.output.as_str())
             {
-                return Err(Error::Asset(format!("OCR graph topology at {}", node.name)));
+                return Err(Error::model_files(format!(
+                    "OCR graph topology at {}",
+                    node.name
+                )));
             }
             if !matches!(
                 node.op.as_str(),
@@ -245,11 +259,11 @@ impl GraphSpec {
             ) && !(kind == ModelKind::Uvdoc
                 && matches!(node.op.as_str(), "PRelu" | "Pad" | "GridSample"))
             {
-                return Err(Error::Asset(format!("unmatched OCR op {}", node.op)));
+                return Err(Error::model_files(format!("unmatched OCR op {}", node.op)));
             }
         }
         if self.outputs.iter().any(|s| !available.contains(s.as_str())) {
-            return Err(Error::Asset("OCR graph output missing".into()));
+            return Err(Error::model_files("OCR graph output missing"));
         }
         Ok(())
     }
@@ -265,33 +279,33 @@ pub struct Assets {
 impl Assets {
     pub fn load(config: &AssetConfig) -> Result<Self> {
         let compiled: Manifest = toml::from_str(ASSET_MANIFEST)
-            .map_err(|e| Error::Asset(format!("OCR embedded manifest: {e}")))?;
+            .map_err(|e| Error::model_files(format!("OCR embedded manifest: {e}")))?;
         let manifest: Manifest = if let Some(path) = &config.manifest {
             let file = File::open(path).map_err(|e| Error::from(e).at(path))?;
             if file.metadata().map_err(|e| Error::from(e).at(path))?.len() > 128 * 1024 * 1024 {
-                return Err(Error::Asset("OCR manifest exceeds 128 MiB".into()).at(path));
+                return Err(Error::model_files("OCR manifest exceeds 128 MiB").at(path));
             }
             let mut text = String::new();
             file.take(128 * 1024 * 1024 + 1)
                 .read_to_string(&mut text)
                 .map_err(|e| Error::from(e).at(path))?;
             if text.len() > 128 * 1024 * 1024 {
-                return Err(Error::Asset("OCR manifest exceeds 128 MiB".into()).at(path));
+                return Err(Error::model_files("OCR manifest exceeds 128 MiB").at(path));
             }
             toml::from_str(&text)
-                .map_err(|e| Error::Asset(format!("OCR manifest: {e}")).at(path))?
+                .map_err(|e| Error::model_files(format!("OCR manifest: {e}")).at(path))?
         } else {
             compiled
         };
         if manifest.schema_version != 1 {
-            return Err(Error::Asset("OCR manifest schema".into()));
+            return Err(Error::model_files("OCR manifest schema"));
         }
         let pin = manifest.pin(config.kind);
         let pin = &pin;
         // Explicit manifests may pin payloads but cannot select another graph
         // or dictionary for these hand-written networks.
         let expected: Manifest = toml::from_str(ASSET_MANIFEST)
-            .map_err(|e| Error::Asset(format!("OCR embedded manifest: {e}")))?;
+            .map_err(|e| Error::model_files(format!("OCR embedded manifest: {e}")))?;
         let expected = expected.pin(config.kind);
         for name in if config.kind == ModelKind::Rec {
             &["graph.json", "dict.txt"][..]
@@ -301,7 +315,7 @@ impl Assets {
             let a = pin.file(name)?;
             let b = expected.file(name)?;
             if a.sha256 != b.sha256 || a.size != b.size || pin.onnx_sha256 != expected.onnx_sha256 {
-                return Err(Error::Asset(format!(
+                return Err(Error::model_files(format!(
                     "manifest changes compiled OCR identity: {name}"
                 )));
             }
@@ -321,12 +335,11 @@ impl Assets {
             let path = config.model_dir.join("dict.txt");
             let bytes = mapped(&path, pin.file("dict.txt")?, true)?;
             let text = std::str::from_utf8(&bytes)
-                .map_err(|e| Error::Asset(format!("OCR dictionary UTF-8: {e}")).at(&path))?;
+                .map_err(|e| Error::model_files(format!("OCR dictionary UTF-8: {e}")).at(&path))?;
             let entries = text.lines().map(str::to_owned).collect::<Vec<_>>();
             if entries.len() != 11945 || entries.iter().any(|s| s.is_empty()) {
                 return Err(
-                    Error::Asset("OCR dictionary must have 11945 nonempty entries".into())
-                        .at(&path),
+                    Error::model_files("OCR dictionary must have 11945 nonempty entries").at(&path),
                 );
             }
             entries
@@ -350,7 +363,7 @@ impl Assets {
         let shape = self.weights.index().shape(name)?;
         let values = self.weights.view::<f32>(name, shape)?;
         if values.iter().any(|v| !v.is_finite()) {
-            return Err(Error::Asset(format!("nonfinite OCR weights: {name}")));
+            return Err(Error::model_files(format!("nonfinite OCR weights: {name}")));
         }
         let mut result = try_vec(values.len())?;
         result.copy_from_slice(values);
@@ -388,7 +401,7 @@ mod tests {
         };
         assert!(tensors(&encoded("F32", vec![2]), &spec).is_ok());
         for bytes in [encoded("F16", vec![4]), encoded("F32", vec![1, 2])] {
-            assert!(matches!(tensors(&bytes, &spec), Err(Error::Asset(_))));
+            assert!(tensors(&bytes, &spec).is_err_and(|e| e.kind() == crate::ErrorKind::ModelFiles));
         }
         spec.inputs.push(InputSpec {
             name: "x".into(),
@@ -405,15 +418,13 @@ mod tests {
         spec.outputs.push("y".into());
         assert!(spec.validate(ModelKind::Det, "").is_ok());
         spec.nodes[0].inputs[0] = "missing".into();
-        assert!(matches!(
-            spec.validate(ModelKind::Det, ""),
-            Err(Error::Asset(_))
-        ));
+        assert!(spec
+            .validate(ModelKind::Det, "")
+            .is_err_and(|e| e.kind() == crate::ErrorKind::ModelFiles));
         spec.nodes[0].inputs[0] = "x".into();
         spec.nodes[0].op = "Sin".into();
-        assert!(matches!(
-            spec.validate(ModelKind::Det, ""),
-            Err(Error::Asset(_))
-        ));
+        assert!(spec
+            .validate(ModelKind::Det, "")
+            .is_err_and(|e| e.kind() == crate::ErrorKind::ModelFiles));
     }
 }

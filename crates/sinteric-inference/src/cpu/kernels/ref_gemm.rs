@@ -17,7 +17,7 @@ pub fn sgemm_ref(
         || b.len() < (k.saturating_sub(1)).saturating_mul(ldb).saturating_add(n)
         || c.len() < (m.saturating_sub(1)).saturating_mul(ldc).saturating_add(n)
     {
-        return Err(Error::Shape("sgemm: buffer too small".into()));
+        return Err(Error::internal("sgemm: buffer too small"));
     }
     for i in 0..m {
         for j in 0..n {

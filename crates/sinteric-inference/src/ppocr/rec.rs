@@ -1,13 +1,11 @@
 //! Korean PP-OCRv5 mobile: PPLCNetV3, two SVTR blocks and greedy CTC.
-use crate::cpu::onednn::conv::PlanInfo;
 use crate::cpu::onednn::{OnednnCpu, PackedWeight};
 use crate::image::{ImageView, Quad, RecCrop};
 use crate::ppocr::net::{self, OcrNet, Tensor};
 use crate::ppocr::rec_graph::{self, Segments};
-use crate::ppocr::weights::{AssetConfig, Assets, ModelKind};
+use crate::ppocr::weights::Assets;
 use crate::{checked_size, try_vec, Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -60,8 +58,8 @@ impl RecOptions {
             || self.plan_capacity == 0
             || self.max_pixels == 0
         {
-            return Err(Error::Config(
-                "invalid recognizer options (height=48, widths 16..1600, batch 1..16)".into(),
+            return Err(Error::config(
+                "invalid recognizer options (height=48, widths 16..1600, batch 1..16)",
             ));
         }
         Ok(())
@@ -104,7 +102,7 @@ impl Linear {
     ) -> Result<Self> {
         let name = format!("rec.matmul{id:03}.w");
         if assets.graph().tensors.get(&name) != Some(&vec![k, n]) {
-            return Err(Error::Asset(format!("compiled projection {name}")));
+            return Err(Error::model_files(format!("compiled projection {name}")));
         }
         let raw = assets.tensor(&name)?;
         let mut transposed = try_vec(raw.len())?;
@@ -115,7 +113,7 @@ impl Linear {
         }
         let bias = assets.tensor(&format!("rec.const{bias_id:03}"))?;
         if bias.len() != n {
-            return Err(Error::Asset("recognizer linear bias".into()));
+            return Err(Error::model_files("recognizer linear bias"));
         }
         Ok(Self {
             weights: cpu.pack(n, k, &transposed)?,
@@ -277,6 +275,12 @@ impl Block {
         Ok(residual)
     }
 }
+
+/// The PP-OCR text recognizer: packed weights on one oneDNN backend and the
+/// recognition dictionary. It reads the text in each quadrilateral.
+///
+/// `Send + Sync`; calls block, one [`Recognizer::recognize`] at a time.
+/// Values depend on the input and the ISA, never on the thread count.
 pub struct Recognizer {
     assets: Assets,
     segments: Segments,
@@ -289,15 +293,26 @@ pub struct Recognizer {
     /// activations held at once.
     execute: Mutex<()>,
 }
+impl std::fmt::Debug for Recognizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recognizer")
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
+}
 impl Recognizer {
-    pub fn load(
+    #[cfg(test)]
+    pub(crate) fn load_on(
         cpu: Arc<OnednnCpu>,
-        model_dir: impl AsRef<Path>,
+        model_dir: impl AsRef<std::path::Path>,
         options: RecOptions,
         verify_weights: bool,
     ) -> Result<Self> {
         options.validate()?;
-        let mut config = AssetConfig::new(model_dir.as_ref(), ModelKind::Rec);
+        let mut config = crate::ppocr::weights::AssetConfig::new(
+            model_dir.as_ref(),
+            crate::ppocr::weights::ModelKind::Rec,
+        );
         config.verify_weights = verify_weights;
         let assets = Assets::load(&config)?;
         Self::from_assets(cpu, assets, options)
@@ -328,17 +343,12 @@ impl Recognizer {
             execute: Mutex::new(()),
         })
     }
-    pub fn assets(&self) -> &Assets {
-        &self.assets
-    }
     pub fn options(&self) -> &RecOptions {
         &self.options
     }
-    /// Backend counters (arena, scratch, packed weights, cached plans) for
-    /// drivers and diagnostics.
-    #[doc(hidden)]
-    pub fn backend_stats(&self) -> serde_json::Value {
-        self.cpu.stats_json()
+    /// The backend's memory and counters now.
+    pub fn backend_stats(&self) -> crate::cpu::runtime::BackendStats {
+        self.cpu.stats()
     }
     fn validate_shape(&self, shape: &[usize]) -> Result<()> {
         crate::check_shape!(
@@ -352,7 +362,12 @@ impl Recognizer {
         );
         Ok(())
     }
-    pub fn warmup(&self, batch: usize, width: usize) -> Result<Vec<PlanInfo>> {
+    #[cfg(test)]
+    pub(crate) fn warmup(
+        &self,
+        batch: usize,
+        width: usize,
+    ) -> Result<Vec<crate::cpu::onednn::conv::PlanInfo>> {
         self.validate_shape(&[batch, 3, 48, width])?;
         let a = self.segments.backbone.warmup([batch, 3, 48, width])?;
         let t = a.output_shape[3];
@@ -385,7 +400,7 @@ impl Recognizer {
             "invalid recognizer valid widths"
         );
         if self.options.batching == Batching::Exact && widths.iter().any(|&w| w != shape[3]) {
-            return Err(Error::Config("padding requires Bucketed batching".into()));
+            return Err(Error::config("padding requires Bucketed batching"));
         }
         let batch = shape[0];
         let (s, original) = self
@@ -413,7 +428,7 @@ impl Recognizer {
         Ok((transpose(&features, batch, 120, t, false)?, t))
     }
     /// Valid widths select attention keys and the CTC span for opt-in padding.
-    pub fn forward_padded(
+    pub(crate) fn forward_padded(
         &self,
         shape: &[usize],
         input: &[f32],
@@ -434,7 +449,7 @@ impl Recognizer {
     /// the CTC head, softmax and argmax run in blocks of up to `CHUNK_ROWS`
     /// time steps (rows padded to `ROW_TILE`), keeping one class id and its
     /// probability per step.
-    pub fn recognize_padded(
+    pub(crate) fn recognize_padded(
         &self,
         shape: &[usize],
         input: &[f32],
@@ -513,7 +528,8 @@ impl Recognizer {
             |b| lengths[b],
         ))
     }
-    pub fn decode(
+    #[cfg(test)]
+    pub(crate) fn decode(
         &self,
         probabilities: &Tensor,
         lengths: Option<&[usize]>,
@@ -527,7 +543,12 @@ impl Recognizer {
     }
     #[cfg(feature = "debug-dumps")]
     #[doc(hidden)]
-    pub fn debug_backbone(&self, count: usize, shape: [usize; 4], input: &[f32]) -> Result<Tensor> {
+    pub(crate) fn debug_backbone(
+        &self,
+        count: usize,
+        shape: [usize; 4],
+        input: &[f32],
+    ) -> Result<Tensor> {
         self.validate_shape(&shape)?;
         net::validate(&shape, input.len())?;
         let (s, v) = self.segments.backbone.prefix(count)?.run(shape, input)?;
@@ -551,18 +572,18 @@ impl Recognizer {
         let _execute = self
             .execute
             .lock()
-            .map_err(|_| Error::Poisoned("recognizer execution"))?;
+            .map_err(|_| Error::poisoned("recognizer execution"))?;
         let rec = &self.options;
         let threads = self.cpu.threads();
         let crop_start = Instant::now();
         let mut slots = Vec::new();
-        slots
-            .try_reserve_exact(quads.len())
-            .map_err(|_| Error::Allocation {
-                bytes: quads
+        slots.try_reserve_exact(quads.len()).map_err(|_| {
+            Error::out_of_memory(
+                quads
                     .len()
                     .saturating_mul(std::mem::size_of::<OnceLock<Result<RecCrop>>>()),
-            })?;
+            )
+        })?;
         slots.resize_with(quads.len(), OnceLock::new);
         // Each crop is independent. Fixed single-crop tasks preserve all pixel
         // operation orders and reading order at every thread count.
@@ -579,15 +600,13 @@ impl Recognizer {
             }
         });
         let mut crops = Vec::new();
-        crops
-            .try_reserve_exact(quads.len())
-            .map_err(|_| Error::Allocation {
-                bytes: quads.len().saturating_mul(std::mem::size_of::<RecCrop>()),
-            })?;
+        crops.try_reserve_exact(quads.len()).map_err(|_| {
+            Error::out_of_memory(quads.len().saturating_mul(std::mem::size_of::<RecCrop>()))
+        })?;
         for slot in slots {
             crops.push(
                 slot.into_inner()
-                    .ok_or_else(|| Error::Backend("missing OCR crop task".into()))??,
+                    .ok_or_else(|| Error::internal("missing OCR crop task"))??,
             );
         }
         let crop_ms = ms_since(crop_start);
@@ -627,7 +646,7 @@ impl Recognizer {
                 let w = widths[i];
                 valid.push(w);
                 let crop = std::mem::take(
-                    &mut *values[i].lock().map_err(|_| Error::Poisoned("OCR crop"))?,
+                    &mut *values[i].lock().map_err(|_| Error::poisoned("OCR crop"))?,
                 );
                 for c in 0..3 {
                     for y in 0..48 {
@@ -685,7 +704,7 @@ impl Recognizer {
         for (&(start, end, _), slot) in groups.iter().zip(results) {
             let batch = slot
                 .into_inner()
-                .ok_or_else(|| Error::Backend("missing OCR batch task".into()))??;
+                .ok_or_else(|| Error::internal("missing OCR batch task"))??;
             timings.pack_ms += batch.pack_ms;
             timings.forward_ms += batch.forward_ms;
             for (&i, line) in order[start..end].iter().zip(batch.lines) {
@@ -696,7 +715,7 @@ impl Recognizer {
         let lines = decoded
             .into_iter()
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| Error::Backend("missing recognized line".into()))?;
+            .ok_or_else(|| Error::internal("missing recognized line"))?;
         Ok((lines, timings))
     }
 }
@@ -809,9 +828,10 @@ pub(crate) fn ctc_steps(width: usize) -> usize {
     width.div_ceil(4) / 2
 }
 
-/// Greedy CTC: first argmax on ties; repeats collapse before removing blank.
-/// Greedy CTC decode. Row validation and argmax run on `threads` workers;
+/// Greedy CTC decode: first argmax on ties; repeats collapse before the
+/// blank is removed. Row validation and argmax run on `threads` workers;
 /// text and scores are assembled sequentially in the original order.
+#[cfg(any(test, feature = "reference"))]
 pub fn decode(
     prob: &Tensor,
     dictionary: &[String],

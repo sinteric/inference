@@ -5,6 +5,22 @@ mod capped_jobs;
 
 use super::*;
 
+/// Pins the calling thread to `cpu`, as `taskset -c <cpu>` would a host.
+fn pin_thread(cpu: usize) {
+    // SAFETY: `set` is a zeroed `cpu_set_t` with one bit set; the call reads
+    // it and changes only the calling thread's mask.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        assert_eq!(
+            libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 #[test]
 fn rejects_zero() {
     assert!(ThreadBudget::new(0).is_err());
@@ -65,12 +81,12 @@ fn cpu_selection_stays_inside_the_affinity_mask() {
     // A host started under `taskset -c <last>`: threads it spawns inherit
     // the mask, and the pool must not pin outside it.
     std::thread::spawn(move || {
-        pin_process(&[last]).unwrap();
+        pin_thread(last);
         assert_eq!(physical_cpu_ids().unwrap(), vec![last]);
         assert_eq!(ThreadBudget::new(2).unwrap().cpus, vec![last, last]);
         if last > 0 {
             let err = ThreadBudget::new(1).unwrap().with_cpuset("0").unwrap_err();
-            assert!(matches!(err, Error::Config(_)), "{err}");
+            assert_eq!(err.kind(), crate::ErrorKind::Config, "{err}");
         }
     })
     .join()
@@ -92,22 +108,20 @@ fn explicit_cpuset_is_honoured() {
         .with_cpuset(format!("{first},{last}"))
         .unwrap();
     assert_eq!(b.cpus, vec![first, last]);
-    assert_eq!(b.omp_places(), format!("{{{first}}},{{{last}}}"));
 }
 
 #[test]
 fn does_not_read_env_for_nthreads() {
     let b = ThreadBudget::new(3).unwrap();
     assert_eq!(b.nthreads, 3);
-    assert_eq!(b.wait, WaitPolicy::Active);
 }
 
 #[test]
-fn apply_process_policy_does_not_set_env() {
-    crate::test_support::own_process!(apply_process_policy_does_not_set_env);
+fn installing_the_pool_does_not_set_env() {
+    crate::test_support::own_process!(installing_the_pool_does_not_set_env);
     let before = crate::test_support::env::thread_environment_snapshot();
     let b = ThreadBudget::new(2).unwrap();
-    b.apply_process_policy().unwrap();
+    b.install_library_workers().unwrap();
     assert_eq!(
         crate::test_support::env::thread_environment_snapshot(),
         before

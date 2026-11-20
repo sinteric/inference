@@ -20,12 +20,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 
 use crate::cpu::kernels::{add_inplace, f32_slice_to_bf16_nthreads, for_ranges, layout_qkv_rope};
 use crate::cpu::onednn::{
-    cache_write_failed, file_stamp, CacheOptions, CacheWriter, OnednnCpu, PackedWeight, RawTensor,
+    file_stamp, CacheOptions, CacheWriter, OnednnCpu, PackedWeight, RawTensor,
 };
+use crate::cpu::runtime::{BackendStats, CacheWrite, Isa, LoadReport, PackedWeights, WeightSource};
 use crate::guard::config::EncoderConfig;
 use crate::guard::head::InjectionHead;
 use crate::guard::load::{
@@ -34,10 +35,33 @@ use crate::guard::load::{
 use crate::tensor_file::TensorFile;
 use crate::{check_shape, Result, ResultContext as Context};
 
-pub(crate) use crate::cpu::runtime::Precision;
+/// What the guard's matmuls compute in on a CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Precision {
+    /// Every matmul FP32 against FP32 weights, with a fused GeGLU: matches
+    /// PyTorch FP32. The default on every CPU.
+    Fp32,
+    /// The dense projections (QKV, attention output, both MLP matmuls) take
+    /// BF16 inputs with FP32 accumulation; attention, norms and the head
+    /// stay FP32. Faster, and on the public guard's gate it keeps every
+    /// decision. Only where the CPU has BF16 matmul kernels.
+    Bf16,
+}
 
-/// Precisions this encoder implements; the first is the default.
-pub(crate) const PRECISIONS: &[Precision] = &[Precision::Fp32, Precision::Bf16];
+crate::cpu::runtime::precision_names!(Precision);
+
+impl Precision {
+    /// The precisions the guard runs on `isa`, its default first.
+    pub(crate) fn on(isa: Isa) -> &'static [Self] {
+        if isa.has_bf16_matmul() {
+            &[Self::Fp32, Self::Bf16]
+        } else {
+            &[Self::Fp32]
+        }
+    }
+}
 
 const EMB_NAME: &str = "model.embeddings.tok_embeddings.weight";
 
@@ -227,7 +251,7 @@ pub(crate) struct Encoder {
     zero_shift: Vec<f32>,
     global_rope: Rope,
     local_rope: Rope,
-    load_source: &'static str,
+    load_source: WeightSource,
     load_profile: BTreeMap<String, f64>,
 }
 
@@ -260,13 +284,13 @@ impl Encoder {
         sha256: &str,
     ) -> Result<Self> {
         check_shape!(tile > 0, "tile must be > 0");
-        let precision = Precision::resolve(Some(precision), "guard", PRECISIONS)?;
         let cfg = EncoderConfig::from_json(&crate::read_json(dir.join("config.json"))?)?;
         let positions = cfg.positions;
-        check_shape!(
-            (2..=positions).contains(&max_len),
-            "max_len {max_len} outside 2..={positions}"
-        );
+        if !(2..=positions).contains(&max_len) {
+            return Err(crate::Error::config(format!(
+                "max_len {max_len} outside 2..={positions}"
+            )));
+        }
         let (h, inter) = (cfg.hidden, cfg.intermediate);
         crate::checked_size("guard largest projection", &[h, inter, 2, 4])?;
 
@@ -282,7 +306,7 @@ impl Encoder {
 
         let mut linears: HashMap<String, PackedWeight> = HashMap::new();
         let mut raw: Option<Vec<RawTensor>> = None;
-        let mut load_source = "safetensors";
+        let mut load_source = None;
         let stamp = file_stamp(&st_path).with_context(|| st_path.display().to_string())?;
         if cache.enabled {
             let t = Instant::now();
@@ -296,7 +320,9 @@ impl Encoder {
             );
             load_profile.insert("cache_read_s".into(), t.elapsed().as_secs_f64());
             if raw.is_some() {
-                load_source = "packed-cache";
+                load_source = Some(WeightSource::Cache {
+                    path: cache_file.clone(),
+                });
             }
         }
         let raw = match raw {
@@ -305,19 +331,21 @@ impl Encoder {
                 let t = Instant::now();
                 let writer = cache.enabled.then(|| {
                     let meta = cache_meta(sha256.to_string(), stamp, backend.cpu_isa());
-                    CacheWriter::try_create(&cache_file, &meta)
+                    CacheWriter::start(&cache_file, &meta)
                 });
-                let writer = writer.flatten();
                 let (raw, writer) =
                     pack_from_file(&backend, precision, &cfg, &file, writer, &mut linears)?;
                 load_profile.insert("pack_s".into(), t.elapsed().as_secs_f64());
-                if let Some(w) = writer {
-                    let t = Instant::now();
-                    if let Err(e) = w.finish(&raw) {
-                        cache_write_failed(&cache_file, &e);
+                let cache = match writer {
+                    Some(w) => {
+                        let t = Instant::now();
+                        let written = w.close(&raw);
+                        load_profile.insert("cache_write_s".into(), t.elapsed().as_secs_f64());
+                        written
                     }
-                    load_profile.insert("cache_write_s".into(), t.elapsed().as_secs_f64());
-                }
+                    None => CacheWrite::Off,
+                };
+                load_source = Some(WeightSource::Safetensors { cache });
                 raw
             }
         };
@@ -348,7 +376,8 @@ impl Encoder {
             zero_shift: vec![0.0; h],
             global_rope,
             local_rope,
-            load_source,
+            load_source: load_source
+                .ok_or_else(|| crate::Error::internal("guard load set no weight source"))?,
             load_profile,
         })
     }
@@ -405,17 +434,24 @@ impl Encoder {
         self.embeddings.file.view(name, shape)
     }
 
-    /// Backend counters plus load source and timings.
-    pub(crate) fn stats(&self) -> Value {
-        let mut stats = self.backend.stats();
-        stats["load_source"] = json!(self.load_source);
-        stats["load_profile_s"] = json!(self.load_profile);
-        stats["precision"] = json!(self.precision.as_str());
-        stats["padding"] = json!(match self.padding {
-            Padding::Buckets => "buckets".to_string(),
-            Padding::Multiple(n) => format!("multiple of {n}"),
-        });
-        stats
+    pub(crate) fn backend_stats(&self) -> BackendStats {
+        self.backend.stats()
+    }
+
+    /// Where the packed weights came from, and the load's phases.
+    pub(crate) fn load_report(&self) -> LoadReport {
+        LoadReport {
+            packed: vec![PackedWeights {
+                part: "encoder",
+                source: self.load_source.clone(),
+            }],
+            phases_s: self.load_profile.clone(),
+        }
+    }
+
+    /// Whether the mapped checkpoint has a tensor named `name`.
+    pub(crate) fn has_tensor(&self, name: &str) -> bool {
+        self.embeddings.file.index().shape(name).is_ok()
     }
 
     fn layer_norm(&self, x: &[f32], scale: &[f32]) -> Result<Vec<f32>> {

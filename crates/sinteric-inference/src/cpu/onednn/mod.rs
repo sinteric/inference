@@ -20,9 +20,7 @@
 //! On a host that loses AMX tile state when a thread is preempted
 //! ([`amx_health`]), a `BestAvailable` cap resolves to `AVX512_CORE_BF16`
 //! before it is applied.
-//! Process CPU affinity: only
-//! [`crate::cpu::threads::ThreadBudget::apply_process_policy`] (CLI/bench). That path
-//! does not mutate process environment.
+//! Nothing here sets the process's CPU affinity or environment.
 //!
 //! oneDNN is **statically linked** with `DNNL_CPU_RUNTIME=THREADPOOL`. Streams
 //! are created with `dnnl_threadpool_interop_stream_create`. `ONEDNN_MAX_CPU_ISA`
@@ -42,8 +40,8 @@ mod tuning;
 pub use amx_probe::set_amx_probe;
 pub use amx_probe::{amx_health, amx_probe_enabled, AmxHealth};
 pub use cache::{
-    apply_cache, cache_path_with, cache_write_failed, file_stamp, pinned_dnnl, CacheMeta,
-    CacheWriter, FileStamp, PackedEntry, RawTensor, CACHE_VERSION,
+    apply_cache, cache_path_with, file_stamp, pinned_dnnl, CacheMeta, CacheWriter, FileStamp,
+    RawTensor, CACHE_VERSION,
 };
 pub use cpu::{OnednnCpu, PackedWeight};
 pub use options::{CacheOptions, CpuIsaCap, SessionOptions, DEFAULT_WORKSPACE_LIMIT};
@@ -71,7 +69,7 @@ mod bad_input_tests {
         let hw = OnednnCpu::load(&budget).unwrap();
         assert!(hw.pack(0, 1, &[]).is_err());
         assert!(hw.pack(usize::MAX, 2, &[]).is_err());
-        assert!(hw.pack_from_cache(usize::MAX, 2, &[]).is_err());
+        assert!(hw.restore_packed_checked(usize::MAX, 2, &[], &[]).is_err());
         assert!(hw.mm(0, 1, 1, 1, 0, 1, 0, 1, false, &[], &[]).is_err());
         assert!(hw.mm(1, 1, 1, 1, 0, 1, 0, 1, false, &[], &[1.]).is_err());
         assert!(hw

@@ -1,13 +1,12 @@
 //! PP-OCRv6 tiny detector and its default DB post-processing settings.
-use crate::cpu::onednn::conv::{ConvNet, PlanInfo};
+use crate::cpu::onednn::conv::ConvNet;
 use crate::cpu::onednn::OnednnCpu;
 use crate::image::{ImageSize, PixelFormat};
 pub use crate::image::{ImageView, Quad};
 use crate::ppocr::net::{self, OcrNet, Tensor};
-use crate::ppocr::weights::{AssetConfig, Assets, ModelKind};
+use crate::ppocr::weights::Assets;
 use crate::ppocr::{det_graph, Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,14 +56,14 @@ impl DetOptions {
             || self.max_pixels == 0
             || self.max_side == Some(0)
         {
-            return Err(Error::Config("invalid detector options".into()));
+            return Err(Error::config("invalid detector options"));
         }
         Ok(())
     }
     fn pixels(&self, w: usize, h: usize) -> Result<()> {
         let n = crate::checked_size("detector pixels", &[w, h])?;
         if n > self.max_pixels {
-            return Err(Error::Shape(format!(
+            return Err(Error::too_large(format!(
                 "detector {w}x{h} exceeds max_pixels {}",
                 self.max_pixels
             )));
@@ -73,23 +72,39 @@ impl DetOptions {
     }
 }
 
+/// The PP-OCR text detector: packed weights on one oneDNN backend. It finds
+/// text lines as quadrilaterals.
+///
+/// `Send + Sync`; calls block. Values depend on the input and the ISA, never
+/// on the thread count.
 pub struct Detector {
-    assets: Assets,
     net: ConvNet,
     options: DetOptions,
     threads: usize,
     cpu: Arc<OnednnCpu>,
 }
+impl std::fmt::Debug for Detector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Detector")
+            .field("options", &self.options)
+            .field("threads", &self.threads)
+            .finish_non_exhaustive()
+    }
+}
 impl Detector {
     /// Load and pack fixed-layout weights on an explicitly configured backend.
-    pub fn load(
+    #[cfg(test)]
+    pub(crate) fn load_on(
         cpu: Arc<OnednnCpu>,
-        model_dir: impl AsRef<Path>,
+        model_dir: impl AsRef<std::path::Path>,
         options: DetOptions,
         verify_weights: bool,
     ) -> Result<Self> {
         options.validate()?;
-        let mut config = AssetConfig::new(model_dir.as_ref(), ModelKind::Det);
+        let mut config = crate::ppocr::weights::AssetConfig::new(
+            model_dir.as_ref(),
+            crate::ppocr::weights::ModelKind::Det,
+        );
         config.verify_weights = verify_weights;
         let assets = Assets::load(&config)?;
         Self::from_assets(cpu, assets, options)
@@ -103,7 +118,6 @@ impl Detector {
         let threads = cpu.threads();
         let net = det_graph::build(cpu.clone(), &assets, options.plan_capacity)?;
         Ok(Self {
-            assets,
             net,
             options,
             threads,
@@ -112,25 +126,30 @@ impl Detector {
     }
     #[doc(hidden)]
     #[cfg(feature = "debug-dumps")]
-    pub fn debug_prefix(&self, count: usize, shape: [usize; 4], input: &[f32]) -> Result<Tensor> {
+    pub(crate) fn debug_prefix(
+        &self,
+        count: usize,
+        shape: [usize; 4],
+        input: &[f32],
+    ) -> Result<Tensor> {
         self.validate_shape(&shape)?;
         net::validate(&shape, input.len())?;
         let (s, v) = self.net.prefix(count)?.run(shape, input)?;
         Tensor::new(s.to_vec(), v)
     }
-    pub fn assets(&self) -> &Assets {
-        &self.assets
-    }
     pub fn options(&self) -> &DetOptions {
         &self.options
     }
-    /// Backend counters (arena, scratch, packed weights, cached plans) for
-    /// drivers and diagnostics.
-    #[doc(hidden)]
-    pub fn backend_stats(&self) -> serde_json::Value {
-        self.cpu.stats_json()
+    /// The backend's memory and counters now.
+    pub fn backend_stats(&self) -> crate::cpu::runtime::BackendStats {
+        self.cpu.stats()
     }
-    pub fn warmup(&self, height: usize, width: usize) -> Result<PlanInfo> {
+    #[cfg(test)]
+    pub(crate) fn warmup(
+        &self,
+        height: usize,
+        width: usize,
+    ) -> Result<crate::cpu::onednn::conv::PlanInfo> {
         self.validate_shape(&[1, 3, height, width])?;
         self.net.warmup([1, 3, height, width])
     }
@@ -152,7 +171,7 @@ impl Detector {
         )
     }
     /// Prepare BGR ImageNet NCHW input. No side cap is applied by default.
-    pub fn preprocess(&self, image: &ImageView<'_>) -> Result<Tensor> {
+    pub(crate) fn preprocess(&self, image: &ImageView<'_>) -> Result<Tensor> {
         preprocess_threads(image, &self.options, self.threads)
     }
     /// Text-line quads on `image`, in reading order.
@@ -288,9 +307,7 @@ pub fn postprocess(
     let capacity = contours.len().min(options.max_candidates);
     boxes
         .try_reserve_exact(capacity)
-        .map_err(|_| Error::Allocation {
-            bytes: capacity.saturating_mul(32),
-        })?;
+        .map_err(|_| Error::out_of_memory(capacity.saturating_mul(32)))?;
     for contour in contours.iter().take(options.max_candidates) {
         let Some((rect, side)) = crate::image::min_area_rect(contour)? else {
             continue;

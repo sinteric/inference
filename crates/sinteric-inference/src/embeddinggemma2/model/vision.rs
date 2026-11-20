@@ -149,8 +149,8 @@ impl VisionTower {
         })
     }
 
-    pub fn load_source(&self) -> &'static str {
-        self.parts.source
+    pub fn load_source(&self) -> &crate::cpu::runtime::WeightSource {
+        &self.parts.source
     }
 
     fn lin(&self, hw: &OnednnCpu, precision: Precision, x: &[f32], name: &str) -> Result<Vec<f32>> {

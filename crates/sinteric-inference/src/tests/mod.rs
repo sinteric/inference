@@ -8,10 +8,8 @@ mod warmup;
 use super::*;
 #[test]
 fn checked_sizes_and_alignment_reject_overflow() {
-    assert!(matches!(
-        checked_size("test", &[usize::MAX, 2]),
-        Err(Error::SizeOverflow(_))
-    ));
+    assert!(checked_size("test", &[usize::MAX, 2])
+        .is_err_and(|e| e.kind() == crate::ErrorKind::TooLarge));
     assert!(align_up(usize::MAX, 64).is_err());
     assert!(align_up(1, 0).is_err());
     assert!(align_up(1, 3).is_err());

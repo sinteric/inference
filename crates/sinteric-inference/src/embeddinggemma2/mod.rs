@@ -1,21 +1,26 @@
-//! EmbeddingGemma 2 (text, image, audio): [`EmbeddingGemma2`].
+//! EmbeddingGemma 2 (`google/embeddinggemma-2`): text, image and audio in,
+//! one 768-wide unit vector per input out.
 //!
-//! oneDNN BF16 matmuls with an FP32 residual stream by default, or FP32
-//! matmuls with [`Precision::Fp32`]. Text is always loaded. The vision and
-//! audio towers load only when [`Config::image`] / [`Config::audio`] ask for
-//! them; their soft tokens replace the placeholder rows of the text residual.
+//! This module holds what is true of the model on any hardware: its prompt
+//! kinds, its tokenizer, what it returns. [`cpu`] holds the model tuned for
+//! CPUs. Text is always loaded; the image and audio towers load when asked
+//! for, and their soft tokens replace the placeholder rows of the text
+//! sequence.
 
-use crate::{Error, Result};
-
-mod api;
 mod config;
+pub mod cpu;
+mod embeddings;
 mod frontend;
 mod media;
 mod model;
 #[cfg(test)]
 mod tests;
 
-pub use api::*;
+pub use crate::image::{ImageView, PixelFormat};
+pub use config::EMBED_DIM as EMBEDDING_DIM;
+pub use embeddings::{Embeddings, Part};
+pub use frontend::{Batch, PromptKind, Tokenizer};
+pub use media::{ImageTokens, MAX_SAMPLES, SAMPLE_RATE};
 
 /// Pinned asset identity embedded at build time; no source-tree path is
 /// needed at runtime.

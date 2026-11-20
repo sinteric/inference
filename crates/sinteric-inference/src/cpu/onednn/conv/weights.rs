@@ -27,10 +27,10 @@ impl ConvWeights {
             "invalid conv channels/groups"
         );
         if groups != 1 && (groups != input || groups != output) {
-            return Err(Error::Unsupported {
-                what: "grouped convolution",
-                reason: "groups=1 or depthwise groups=C only".into(),
-            });
+            return Err(Error::unsupported(
+                "grouped convolution",
+                "groups=1 or depthwise groups=C only",
+            ));
         }
         let dims = if groups == 1 {
             vec![output, input, kernel[0], kernel[1]]
@@ -62,11 +62,10 @@ impl ConvWeights {
             // expects the opposite inner block order to forward convolution;
             // oneDNN names that layout for 16-channel blocks only.
             if !wide {
-                return Err(Error::Unsupported {
-                    what: "deconvolution",
-                    reason: "oneDNN has no 8-channel deconvolution weight layout; needs AVX-512"
-                        .into(),
-                });
+                return Err(Error::unsupported(
+                    "deconvolution",
+                    "oneDNN has no 8-channel deconvolution weight layout; needs AVX-512",
+                ));
             }
             dnnl_IOhw16i16o
         } else if groups == 1 && input < cpu.conv_block() {

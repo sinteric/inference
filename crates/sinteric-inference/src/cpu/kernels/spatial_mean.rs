@@ -27,7 +27,7 @@ pub fn spatial_mean(
                 == output
                     .len()
                     .checked_mul(plane)
-                    .ok_or(Error::SizeOverflow("spatial mean"))?,
+                    .ok_or(Error::size_overflow("spatial mean"))?,
         "invalid spatial mean extent"
     );
     let ptr = output.as_mut_ptr() as usize;

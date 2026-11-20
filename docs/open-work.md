@@ -10,18 +10,15 @@ same change.
 A host that runs these models behind a server needs these more than speed.
 
 - **Input limits.** EmbeddingGemma 2 bounds a text only by the workspace limit,
-  so a large text is tokenized before it is rejected. The OCR detector's 64 Mpx cap answers
-  with `Error::Shape`, not a "too large" error.
-- **Errors a host can map to a status.** `Error::Shape` covers both bad input
-  and broken internal invariants, and there is no `TooLarge` variant and no
-  `kind()` or `is_retryable()`. A host cannot tell a 400 from a 413 from a 500.
+  so a large text is tokenized before it is refused or cut to the window.
 - **Deadlines and cancellation.** Every call blocks, and the compute lock waits
   without a timeout; a dropped async future still runs to completion.
-- **Observability.** `backend_stats()` is hidden and returns untyped JSON with an
-  unbounded list; there are no compute-lock wait stats and no `tracing`
-  feature. Only OCR reports per-stage timings.
-- **Warmup and readiness.** Every model can warm up at load, but no model
-  reports what it loaded (name, revision, limits).
+- **Observability.** `backend_stats()` lists every primitive implementation
+  it has run, with no bound; there are no compute-lock wait stats and no
+  `tracing` feature. Only OCR reports per-stage timings.
+- **Warmup and readiness.** Every model can warm up at load, and
+  `load_report()` says where its weights came from, but no model reports its
+  revision or its limits.
 - **Config consistency.** Each model pins its weights its own way: EG2 and the
   OCR models through a TOML manifest, the guard through a SHA-256 field.
 - **Hot reload.** Swapping a model under load and unloading the old one after it

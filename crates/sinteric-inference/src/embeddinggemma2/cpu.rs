@@ -1,18 +1,19 @@
-//! Public EmbeddingGemma 2 API: load from a [`crate::cpu::runtime::Runtime`], share
-//! across threads.
+//! EmbeddingGemma 2 tuned for CPUs: [`EmbeddingGemma2`], loaded from a
+//! [`Runtime`] and shared across threads.
 //!
 //! ```ignore
-//! use crate::embeddinggemma2::api::{Config, EmbeddingGemma2, PromptKind};
-//! let model: EmbeddingGemma2 = rt.load(Config::new("/models/embeddinggemma2"))?;
-//! let vectors = model.embed(["what is sinteric?"], PromptKind::Query)?;
+//! use sinteric_inference::{cpu::{Options, Runtime}, embeddinggemma2 as eg2};
+//! let rt = Runtime::new(Options::new())?;
+//! let model = eg2::cpu::EmbeddingGemma2::load(&rt, eg2::cpu::Config::new(dir).with_truncate(true))?;
+//! let vectors = model.embed(["what is sinteric?"], eg2::PromptKind::Query)?;
 //! ```
 //!
 //! Images and audio are opt-in at load ([`Config::with_image`],
 //! [`Config::with_audio`]) and embed through [`EmbeddingGemma2::embed_parts`]:
 //!
 //! ```ignore
-//! use crate::embeddinggemma2::api::{Config, EmbeddingGemma2, ImageView, Part, PixelFormat};
-//! let model: EmbeddingGemma2 = rt.load(Config::new(dir).with_image(true).with_audio(true))?;
+//! use sinteric_inference::embeddinggemma2::{cpu, ImageView, Part, PixelFormat};
+//! let model = cpu::EmbeddingGemma2::load(&rt, cpu::Config::new(dir).with_image(true).with_audio(true))?;
 //! let photo = ImageView::new(&rgb, width, height, width as usize * 3, PixelFormat::Rgb8)?;
 //! let vectors = model.embed_parts(
 //!     &[&[Part::Text("a photo of"), Part::Image(photo)], &[Part::Audio(&samples_16k)]],
@@ -22,24 +23,24 @@
 
 use std::path::PathBuf;
 
-use crate::cpu::onednn::CacheOptions;
-use crate::cpu::runtime::{BackendOverrides, CacheConfig, Runtime};
 use serde::{Deserialize, Serialize};
 
-use crate::embeddinggemma2::{mrl_truncate, Error, Model, Result, EMBED_DIM, MAX_SEQ, MRL_DIMS};
-
-pub use crate::embeddinggemma2::model::Precision;
-
-pub use crate::embeddinggemma2::config::EMBED_DIM as EMBEDDING_DIM;
-pub use crate::embeddinggemma2::frontend::{Batch, Frontend, PromptKind};
-pub use crate::embeddinggemma2::media::{ImageTokens, MAX_SAMPLES, SAMPLE_RATE};
-pub use crate::image::{ImageView, PixelFormat};
-
+use crate::cpu::onednn::CacheOptions;
+use crate::cpu::runtime::{
+    release_free_memory, resolve_precision, BackendOverrides, BackendStats, CacheConfig,
+    LoadReport, Runtime,
+};
 use crate::embeddinggemma2::config::{
     AUDIO_CLOSE_ID, AUDIO_OPEN_ID, AUDIO_TOKEN_ID, BOS_ID, EOS_ID, IMAGE_CLOSE_ID, IMAGE_OPEN_ID,
     IMAGE_TOKEN_ID,
 };
-use crate::embeddinggemma2::media;
+use crate::embeddinggemma2::{
+    media, mrl_truncate, Batch, Embeddings, ImageTokens, Model, Part, PromptKind, Tokenizer,
+    EMBED_DIM, MAX_SEQ, MRL_DIMS,
+};
+use crate::{Error, Result};
+
+pub use crate::embeddinggemma2::model::Precision;
 
 /// Hidden EG2 knobs (attention tile and load warmup). Prefer omitting this.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,11 +56,9 @@ pub struct Advanced {
     pub warmup: bool,
 }
 
-/// EmbeddingGemma 2 load config. Matmul precision defaults to BF16 (FP32
-/// stream); [`Precision::Fp32`] runs FP32 matmuls on the same weights.
-/// [`EmbeddingGemma2::precision`] reports what a loaded model runs. The
-/// image and audio towers load only when enabled, since each adds resident
-/// weights (about 0.3 GB for images, 0.6 GB for audio).
+/// What [`EmbeddingGemma2::load`] loads. Every field but the directory has
+/// a default. The image and audio towers load only when enabled, since each
+/// adds resident weights (about 0.3 GB for images, 0.6 GB for audio).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Config {
@@ -67,9 +66,16 @@ pub struct Config {
     pub model_dir: PathBuf,
     #[serde(default)]
     pub cache: CacheConfig,
-    /// Encode/forward sequence cap. `None` is the model default (8192).
+    /// The window: the most tokens one input may have, prompt and special
+    /// tokens included. `None` is the model's 8,192.
     #[serde(default)]
     pub max_seq_len: Option<usize>,
+    /// Cut a text past the window to its first `window - 1` tokens and close
+    /// it with `<eos>`, as Sentence Transformers truncates, instead of
+    /// refusing it ([`crate::ErrorKind::TooLarge`]). Multimodal inputs are
+    /// never cut. Default: false.
+    #[serde(default)]
+    pub truncate: bool,
     /// Reject embed batches larger than this.
     #[serde(default)]
     pub max_batch: Option<usize>,
@@ -82,12 +88,13 @@ pub struct Config {
     #[serde(default)]
     pub verify_weights: bool,
     /// What this model may keep between calls, in bytes; overrides
-    /// [`RuntimeOptions::memory_budget_bytes`](crate::cpu::runtime::RuntimeOptions::memory_budget_bytes).
+    /// [`Options::memory_budget_bytes`](crate::cpu::Options::memory_budget_bytes).
     /// `Some(0)` is unbounded.
     #[serde(default)]
     pub memory_budget_bytes: Option<usize>,
-    /// Matmul precision: [`Precision::Bf16`] or [`Precision::Fp32`]. `None`
-    /// is the model default, BF16.
+    /// Matmul precision. `None` lets the library pick for the runtime's CPU:
+    /// [`Precision::Bf16`] where it has BF16 matmul kernels, else
+    /// [`Precision::Fp32`] ([`EmbeddingGemma2::precisions`]).
     #[serde(default)]
     pub precision: Option<Precision>,
     /// Load the image tower so [`Part::Image`] can be embedded.
@@ -111,6 +118,7 @@ impl Config {
             model_dir: model_dir.into(),
             cache: CacheConfig::default(),
             max_seq_len: None,
+            truncate: false,
             max_batch: None,
             mrl_dim: None,
             manifest: None,
@@ -130,6 +138,10 @@ impl Config {
     }
     pub fn with_max_seq_len(mut self, n: usize) -> Self {
         self.max_seq_len = Some(n);
+        self
+    }
+    pub fn with_truncate(mut self, yes: bool) -> Self {
+        self.truncate = yes;
         self
     }
     pub fn with_max_batch(mut self, n: usize) -> Self {
@@ -178,7 +190,7 @@ impl Config {
     fn tile(&self, auto: usize) -> Result<usize> {
         let tile = self.advanced.tile.unwrap_or(auto);
         if tile == 0 {
-            return Err(Error::Config("tile must be > 0".into()));
+            return Err(Error::config("tile must be > 0"));
         }
         Ok(tile)
     }
@@ -189,101 +201,17 @@ impl Config {
     }
 }
 
-/// Flat embedding matrix: `data.len() == n * dim`, row-major.
-#[derive(Clone, Debug, PartialEq)]
-#[non_exhaustive]
-pub struct Embeddings {
-    pub dim: usize,
-    pub data: Vec<f32>,
-}
-
-impl Embeddings {
-    /// Rows of `dim` floats; `data.len()` must be a multiple of `dim`.
-    pub fn new(dim: usize, data: Vec<f32>) -> Result<Self> {
-        if dim == 0 || data.len() % dim != 0 {
-            return Err(Error::Shape(format!(
-                "{} floats do not form rows of {dim}",
-                data.len()
-            )));
-        }
-        Ok(Self { dim, data })
-    }
-
-    pub fn n(&self) -> usize {
-        self.data.len().checked_div(self.dim).unwrap_or(0)
-    }
-
-    pub fn row(&self, i: usize) -> Result<&[f32]> {
-        let n = self.n();
-        if i >= n {
-            return Err(Error::Shape(format!("row {i} >= n {n}")));
-        }
-        let start = i * self.dim;
-        Ok(&self.data[start..start + self.dim])
-    }
-
-    pub fn rows(&self) -> impl Iterator<Item = &[f32]> {
-        let dim = self.dim;
-        self.data
-            .chunks_exact(dim.max(1))
-            .take(if dim == 0 { 0 } else { self.n() })
-    }
-
-    pub fn into_inner(self) -> Vec<f32> {
-        self.data
-    }
-}
-
-/// One piece of a multimodal input. Parts concatenate in order, as
-/// Sentence Transformers joins them.
-#[derive(Clone, Copy, Debug)]
-#[non_exhaustive]
-pub enum Part<'a> {
-    Text(&'a str),
-    /// Any [`PixelFormat`]; resized to [`Config::image_tokens`].
-    Image(ImageView<'a>),
-    /// 16 kHz mono samples; past 30 s ([`MAX_SAMPLES`]) is truncated.
-    Audio(&'a [f32]),
-}
-
-/// Pluggable tokenizer. The bundled Gemma tokenizer implements this.
-pub trait Tokenizer: Send + Sync {
-    fn encode(&self, texts: &[String], kind: PromptKind) -> Result<Batch>;
-    fn set_max_seq(&mut self, _max: usize) {}
-    /// Ids of `text` alone (no BOS/EOS, no prefix), for
-    /// [`EmbeddingGemma2::embed_parts`]. Must reject media placeholder tokens.
-    fn encode_text(&self, _text: &str) -> Result<Vec<u32>> {
-        Err(Error::Unsupported {
-            what: "EG2 multimodal input",
-            reason: "this tokenizer does not implement encode_text".into(),
-        })
-    }
-}
-
-impl Tokenizer for Frontend {
-    fn encode(&self, texts: &[String], kind: PromptKind) -> Result<Batch> {
-        Frontend::encode(self, texts, kind)
-    }
-    fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
-        Frontend::encode_text(self, text)
-    }
-    fn set_max_seq(&mut self, max: usize) {
-        self.max_seq = max;
-    }
-}
-
-/// Loaded EmbeddingGemma 2 text tower. `Send + Sync`; share with `Arc`.
+/// EmbeddingGemma 2 loaded on a CPU. `Send + Sync`; share it with `Arc`.
 ///
 /// # Concurrency
 ///
-/// `embed` / `embed_ids` / `embed_batch` / `embed_into` are **blocking** (run
-/// them on `tokio::task::spawn_blocking`). Concurrent calls on one model
-/// acquire a slot from the runtime's bounded execute pool
-/// ([`crate::cpu::runtime::RuntimeOptions::exec_slots`], default 1). Parallel GEMM/glue
-/// regions share the process-global thread pool.
-pub struct EmbeddingGemma2<T = Frontend> {
+/// Every call blocks (from async code, run it on
+/// `tokio::task::spawn_blocking`). Concurrent calls each take one of the
+/// model's execute slots ([`Options::exec_slots`](crate::cpu::Options::exec_slots),
+/// default 1); their parallel regions share the runtime's one pool.
+pub struct EmbeddingGemma2 {
     model: Model,
-    tokenizer: T,
+    tokenizer: Tokenizer,
     mrl_dim: usize,
     max_batch: Option<usize>,
     max_seq_len: usize,
@@ -291,54 +219,65 @@ pub struct EmbeddingGemma2<T = Frontend> {
     image_tokens: ImageTokens,
 }
 
-impl EmbeddingGemma2<Frontend> {
-    /// Load weights and the bundled tokenizer from the configured directory.
-    /// If enabled with [`Config::with_warmup`], a discarded 16-token forward
-    /// completes before this returns. Warmup errors retain the model path.
-    pub fn load(rt: &Runtime, config: Config) -> Result<Self> {
-        let tokenizer = Frontend::load(&config.model_dir)?;
-        Self::load_with_tokenizer(rt, config, tokenizer)
+impl std::fmt::Debug for EmbeddingGemma2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingGemma2")
+            .field("precision", &self.model.precision())
+            .field("mrl_dim", &self.mrl_dim)
+            .field("max_seq_len", &self.max_seq_len)
+            .field("truncates", &self.tokenizer.truncates())
+            .field("image", &self.model.has_image())
+            .field("audio", &self.model.has_audio())
+            .finish_non_exhaustive()
     }
 }
 
-impl crate::cpu::runtime::Model for EmbeddingGemma2<Frontend> {
-    type Config = Config;
-    const PRECISIONS: &'static [Precision] = crate::embeddinggemma2::model::PRECISIONS;
-    fn load(rt: &Runtime, config: Config) -> Result<Self> {
-        Self::load(rt, config)
+impl EmbeddingGemma2 {
+    /// The precisions this model runs on `rt`'s CPU, the one it picks when
+    /// a config names none first.
+    pub fn precisions(rt: &Runtime) -> &'static [Precision] {
+        Precision::on(rt.isa())
     }
-    fn precision(&self) -> Precision {
-        EmbeddingGemma2::precision(self)
-    }
-}
 
-impl<T: Tokenizer> EmbeddingGemma2<T> {
-    /// Load with a caller-provided tokenizer. Optional load warmup uses
-    /// synthetic token IDs and does not call the tokenizer.
-    pub fn load_with_tokenizer(rt: &Runtime, mut config: Config, mut tokenizer: T) -> Result<Self> {
+    /// Load the weights and the tokenizer from [`Config::model_dir`]. With
+    /// [`Config::with_warmup`], one discarded 16-token forward runs before
+    /// this returns.
+    pub fn load(rt: &Runtime, mut config: Config) -> Result<Self> {
         let mrl_dim = resolve_mrl(config.mrl_dim)?;
         if config.max_batch == Some(0) {
-            return Err(Error::Config("max_batch must be >= 1".into()));
+            return Err(Error::config("max_batch must be >= 1"));
         }
-        if let Some(max) = config.max_seq_len {
-            if max == 0 || max > MAX_SEQ {
-                return Err(Error::Config(format!(
-                    "max_seq_len {max} out of range 1..={MAX_SEQ}"
-                )));
-            }
-            tokenizer.set_max_seq(max);
+        let max_seq_len = config.max_seq_len.unwrap_or(MAX_SEQ);
+        let min = if config.truncate { 2 } else { 1 };
+        if !(min..=MAX_SEQ).contains(&max_seq_len) {
+            return Err(Error::config(format!(
+                "max_seq_len {max_seq_len} out of range {min}..={MAX_SEQ}"
+            )));
         }
+        let mut tokenizer = Tokenizer::load(&config.model_dir)?;
+        tokenizer.set_window(max_seq_len, config.truncate);
         let image_tokens = config.image_tokens.unwrap_or_default();
-        let inner = load_model(rt, &mut config)?;
+        let model = load_model(rt, &mut config);
+        release_free_memory();
         Ok(Self {
             image_tokens,
-            model: inner,
+            model: model?,
             tokenizer,
             mrl_dim,
             max_batch: config.max_batch,
-            max_seq_len: config.max_seq_len.unwrap_or(MAX_SEQ),
+            max_seq_len,
             workspace_limit: rt.workspace_limit(),
         })
+    }
+
+    /// Free this model's weights, oneDNN objects and buffers, and return the
+    /// freed heap pages to the OS. The runtime stays. For a model shared by
+    /// `Arc`, the last owner unloads:
+    /// `if let Some(m) = Arc::into_inner(model) { m.unload() }`. Dropping it
+    /// frees the same memory but may leave it in the allocator.
+    pub fn unload(self) {
+        drop(self);
+        release_free_memory();
     }
 
     pub fn embed(
@@ -358,18 +297,6 @@ impl<T: Tokenizer> EmbeddingGemma2<T> {
         attention_mask: Option<Vec<Vec<u32>>>,
     ) -> Result<Embeddings> {
         self.check_batch(input_ids.len())?;
-        if input_ids.is_empty() {
-            return Err(Error::Shape("empty embed batch".into()));
-        }
-        for row in &input_ids {
-            if row.is_empty() || row.len() > self.max_seq_len {
-                return Err(Error::Shape(format!(
-                    "EG2 sequence length {} outside 1..={}",
-                    row.len(),
-                    self.max_seq_len
-                )));
-            }
-        }
         let attention_mask = match attention_mask {
             Some(m) => m,
             None => input_ids.iter().map(|row| vec![1u32; row.len()]).collect(),
@@ -387,11 +314,11 @@ impl<T: Tokenizer> EmbeddingGemma2<T> {
         let need = crate::checked_size("embedding output", &[n, self.mrl_dim])?;
         let bytes = crate::checked_size("embedding output bytes", &[need, 4])?;
         if bytes > self.workspace_limit {
-            return Err(Error::WorkspaceLimit {
-                operation: "embedding output",
-                requested: bytes,
-                limit: self.workspace_limit,
-            });
+            return Err(Error::workspace_limit(
+                "embedding output",
+                bytes,
+                self.workspace_limit,
+            ));
         }
         let mut data = crate::try_vec::<f32>(need)?;
         self.embed_batch_into(batch, &mut data)?;
@@ -420,9 +347,9 @@ impl<T: Tokenizer> EmbeddingGemma2<T> {
         let n = batch.input_ids.len();
         let need = n
             .checked_mul(self.mrl_dim)
-            .ok_or_else(|| Error::Shape("embed output size overflow".into()))?;
+            .ok_or_else(|| Error::internal("embed output size overflow"))?;
         if out.len() != need {
-            return Err(Error::Shape(format!(
+            return Err(Error::invalid_input(format!(
                 "embed_into buffer {} != n {n} * dim {}",
                 out.len(),
                 self.mrl_dim
@@ -436,7 +363,7 @@ impl<T: Tokenizer> EmbeddingGemma2<T> {
     fn write_rows(&self, rows: &[Vec<f32>], out: &mut [f32]) -> Result<()> {
         let n = out.len() / self.mrl_dim;
         if rows.len() != n {
-            return Err(Error::Shape(format!(
+            return Err(Error::internal(format!(
                 "forward returned {} rows, expected {n}",
                 rows.len()
             )));
@@ -446,12 +373,12 @@ impl<T: Tokenizer> EmbeddingGemma2<T> {
             if self.mrl_dim < EMBED_DIM {
                 let truncated = mrl_truncate(row, self.mrl_dim);
                 if truncated.len() != self.mrl_dim {
-                    return Err(Error::Shape("mrl truncate width".into()));
+                    return Err(Error::internal("mrl truncate width"));
                 }
                 dst.copy_from_slice(&truncated);
             } else {
                 if row.len() != self.mrl_dim {
-                    return Err(Error::Shape(format!(
+                    return Err(Error::internal(format!(
                         "row width {} != dim {}",
                         row.len(),
                         self.mrl_dim
@@ -477,11 +404,11 @@ impl<T: Tokenizer> EmbeddingGemma2<T> {
         let need = crate::checked_size("embedding output", &[n, self.mrl_dim])?;
         let bytes = crate::checked_size("embedding output bytes", &[need, 4])?;
         if bytes > self.workspace_limit {
-            return Err(Error::WorkspaceLimit {
-                operation: "embedding output",
-                requested: bytes,
-                limit: self.workspace_limit,
-            });
+            return Err(Error::workspace_limit(
+                "embedding output",
+                bytes,
+                self.workspace_limit,
+            ));
         }
         let mut rows = Vec::with_capacity(n);
         for parts in inputs {
@@ -541,7 +468,7 @@ impl<T: Tokenizer> EmbeddingGemma2<T> {
         prompt: Option<PromptKind>,
     ) -> Result<(Vec<u32>, Vec<(usize, Media)>)> {
         if parts.is_empty() {
-            return Err(Error::Shape("EG2 input has no parts".into()));
+            return Err(Error::invalid_input("an input has no parts"));
         }
         let threads = self.model.threads();
         let mut media = Vec::new();
@@ -586,7 +513,7 @@ impl<T: Tokenizer> EmbeddingGemma2<T> {
         flush(&mut text, &mut ids)?;
         ids.push(EOS_ID);
         if ids.len() > self.max_seq_len {
-            return Err(Error::Shape(format!(
+            return Err(Error::too_large(format!(
                 "{} tokens exceed max_seq_len {}",
                 ids.len(),
                 self.max_seq_len
@@ -604,7 +531,8 @@ impl<T: Tokenizer> EmbeddingGemma2<T> {
         self.model.has_audio()
     }
 
-    pub fn tokenizer(&self) -> &T {
+    /// The tokenizer, with this model's window and truncation.
+    pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
     }
 
@@ -617,20 +545,24 @@ impl<T: Tokenizer> EmbeddingGemma2<T> {
         self.model.precision()
     }
 
-    /// Backend counters (packed weights, cached plans, retained buffers and
-    /// scratch) for drivers and diagnostics.
-    #[doc(hidden)]
-    pub fn backend_stats(&self) -> serde_json::Value {
-        self.model.stats()
+    /// Where each part's packed weights came from, and how long the load's
+    /// phases took.
+    pub fn load_report(&self) -> LoadReport {
+        self.model.load_report()
+    }
+
+    /// The backend's memory and counters now.
+    pub fn backend_stats(&self) -> BackendStats {
+        self.model.backend_stats()
     }
 
     fn check_batch(&self, n: usize) -> Result<()> {
         if n == 0 {
-            return Err(Error::Shape("empty embed batch".into()));
+            return Err(Error::invalid_input("empty batch"));
         }
         if let Some(max) = self.max_batch {
             if n > max {
-                return Err(Error::Shape(format!("batch {n} > max_batch {max}")));
+                return Err(Error::too_large(format!("batch {n} > max_batch {max}")));
             }
         }
         Ok(())
@@ -643,14 +575,14 @@ enum Media {
 }
 
 fn not_loaded(what: &'static str) -> Error {
-    Error::Unsupported {
-        what: if what == "image" {
+    Error::unsupported(
+        if what == "image" {
             "EG2 image input"
         } else {
             "EG2 audio input"
         },
-        reason: format!("load with Config::with_{what}(true)"),
-    }
+        format!("load with Config::with_{what}(true)"),
+    )
 }
 
 fn resolve_mrl(dim: Option<usize>) -> Result<usize> {
@@ -658,7 +590,7 @@ fn resolve_mrl(dim: Option<usize>) -> Result<usize> {
     if MRL_DIMS.contains(&d) {
         Ok(d)
     } else {
-        Err(Error::Config(format!("mrl_dim {d} not in {MRL_DIMS:?}")))
+        Err(Error::config(format!("mrl_dim {d} not in {MRL_DIMS:?}")))
     }
 }
 
@@ -668,10 +600,11 @@ fn load_model(rt: &Runtime, config: &mut Config) -> Result<Model> {
     )?;
     let tile = config.tile(crate::embeddinggemma2::config::attn_tile(rt.cpu_isa()))?;
     let cache = config.cache_options();
-    let precision = Precision::resolve(
+    let precision = resolve_precision(
         config.precision,
+        Precision::on(rt.isa()),
         "EmbeddingGemma 2",
-        crate::embeddinggemma2::model::PRECISIONS,
+        rt.isa(),
     )?;
     let mut model =
         Model::load_with_precision(&config.model_dir, backend, tile, &cache, precision)?;
@@ -695,7 +628,7 @@ fn collect_texts(
         let text = text.as_ref();
         let n = out.len() + 1;
         if max_batch.is_some_and(|max| n > max) {
-            return Err(Error::Shape(format!(
+            return Err(Error::too_large(format!(
                 "batch {n} > max_batch {}",
                 max_batch.unwrap_or(0)
             )));
@@ -703,20 +636,16 @@ fn collect_texts(
         bytes = bytes
             .checked_add(text.len())
             .and_then(|n| n.checked_add(std::mem::size_of::<String>()))
-            .ok_or(Error::SizeOverflow("text batch"))?;
+            .ok_or(Error::size_overflow("text batch"))?;
         if bytes > limit {
-            return Err(Error::WorkspaceLimit {
-                operation: "text batch",
-                requested: bytes,
-                limit,
-            });
+            return Err(Error::workspace_limit("text batch", bytes, limit));
         }
         out.try_reserve(1)
-            .map_err(|_| Error::Allocation { bytes })?;
+            .map_err(|_| Error::out_of_memory(bytes))?;
         let mut owned = String::new();
         owned
             .try_reserve_exact(text.len())
-            .map_err(|_| Error::Allocation { bytes: text.len() })?;
+            .map_err(|_| Error::out_of_memory(text.len()))?;
         owned.push_str(text);
         out.push(owned);
     }
@@ -729,31 +658,14 @@ mod tests {
 
     #[test]
     fn batch_and_byte_caps_apply_during_collection() {
-        assert!(collect_texts(std::iter::repeat("x"), Some(1), 1024).is_err());
-        assert!(collect_texts(["hello"], None, 1).is_err());
+        let e = collect_texts(std::iter::repeat("x"), Some(1), 1024).unwrap_err();
+        assert_eq!(e.kind(), crate::ErrorKind::TooLarge);
+        let e = collect_texts(["hello"], None, 1).unwrap_err();
+        assert_eq!(e.kind(), crate::ErrorKind::TooLarge);
         assert_eq!(
             collect_texts(["a", "b"], Some(2), 1024).unwrap(),
             ["a", "b"]
         );
-        let e = Embeddings {
-            dim: 0,
-            data: vec![1.],
-        };
-        assert!(e.row(0).is_err());
-        assert_eq!(e.rows().count(), 0);
-    }
-    #[test]
-    fn embeddings_rows() {
-        let e = Embeddings {
-            dim: 2,
-            data: vec![1.0, 2.0, 3.0, 4.0],
-        };
-        assert_eq!(e.n(), 2);
-        assert_eq!(e.row(0).unwrap(), &[1.0, 2.0]);
-        assert_eq!(e.row(1).unwrap(), &[3.0, 4.0]);
-        assert!(e.row(2).is_err());
-        let rows: Vec<&[f32]> = e.rows().collect();
-        assert_eq!(rows, vec![&[1.0, 2.0][..], &[3.0, 4.0][..]]);
     }
 }
 

@@ -230,8 +230,7 @@ fn malformed_graphs_weights_and_spatial_options_return_errors() {
     let node = Node::new(Op::Prelu { slopes: vec![0.] }, vec![0]);
     assert!(ConvNet::new(cpu.clone(), vec![node.clone()], 0).is_err());
     let net = ConvNet::new(cpu, vec![node], 1).unwrap();
-    assert!(matches!(
-        net.warmup([1, 16, 128, 128]),
-        Err(crate::Error::WorkspaceLimit { .. })
-    ));
+    assert!(net
+        .warmup([1, 16, 128, 128])
+        .is_err_and(|e| e.kind() == crate::ErrorKind::TooLarge));
 }

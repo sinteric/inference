@@ -6,12 +6,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::embeddinggemma2::{self as eg2, EmbeddingGemma2};
-use crate::ppocr::{
-    DetConfig, Detector, ImageView, PixelFormat, RecConfig, Recognizer,
-    DEFAULT_WORKSPACE_LIMIT_BYTES,
+use crate::cpu::{BackendOverrides, Options, Runtime};
+use crate::embeddinggemma2::cpu::EmbeddingGemma2;
+use crate::embeddinggemma2::{self as eg2};
+use crate::ppocr::cpu::{
+    DetConfig, Detector, RecConfig, Recognizer, DEFAULT_WORKSPACE_LIMIT_BYTES,
 };
-use crate::{BackendOverrides, Model, Runtime, RuntimeOptions};
+use crate::ppocr::{ImageView, PixelFormat};
 
 fn model_dir(manifest: &str) -> Option<PathBuf> {
     let manifest = crate::assets::Manifest::parse(manifest).unwrap();
@@ -75,8 +76,8 @@ impl Ocr {
             )
             .unwrap();
         Self {
-            det: shared.load(DetConfig::new(root.join("det"))).unwrap(),
-            rec: shared.load(RecConfig::new(root.join("rec"))).unwrap(),
+            det: Detector::load(&shared, DetConfig::new(root.join("det"))).unwrap(),
+            rec: Recognizer::load(&shared, RecConfig::new(root.join("rec"))).unwrap(),
         }
     }
 }
@@ -131,12 +132,6 @@ fn jobs(eg2: Option<Arc<EmbeddingGemma2>>, ocr: Option<Arc<Ocr>>) -> Vec<(String
     out
 }
 
-fn unload<M: Model>(m: Option<Arc<M>>) {
-    if let Some(m) = m.and_then(Arc::into_inner) {
-        m.unload();
-    }
-}
-
 #[test]
 fn concurrent_mixed_calls_match_serial() {
     crate::test_support::own_process!(concurrent_mixed_calls_match_serial);
@@ -153,7 +148,7 @@ fn concurrent_mixed_calls_match_serial() {
     let mut first: Option<Vec<Vec<u8>>> = None;
     for (exec_slots, budget) in [(1, 0), (3, 0), (1, 32 << 20)] {
         let rt = Runtime::new(
-            RuntimeOptions::new()
+            Options::new()
                 .with_threads(2)
                 .with_exec_slots(exec_slots)
                 .with_memory_budget_bytes(budget),
@@ -161,7 +156,7 @@ fn concurrent_mixed_calls_match_serial() {
         .unwrap();
         let eg2 = eg2_dir
             .as_ref()
-            .map(|d| Arc::new(rt.load::<EmbeddingGemma2>(eg2::Config::new(d)).unwrap()));
+            .map(|d| Arc::new(EmbeddingGemma2::load(&rt, eg2::cpu::Config::new(d)).unwrap()));
         let ocr = ocr_dir.as_ref().map(|d| Arc::new(Ocr::load(&rt, d)));
         let jobs = jobs(eg2.clone(), ocr.clone());
         let reference: Vec<Vec<u8>> = jobs.iter().map(|(_, job)| job()).collect();
@@ -190,7 +185,9 @@ fn concurrent_mixed_calls_match_serial() {
             }
         });
         drop(jobs);
-        unload(eg2);
+        if let Some(m) = eg2.and_then(Arc::into_inner) {
+            m.unload();
+        }
         if let Some(Ocr { det, rec }) = ocr.and_then(Arc::into_inner) {
             det.unload();
             rec.unload();

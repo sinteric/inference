@@ -9,7 +9,7 @@
 //!
 //! Env: EG2_REPRO_THREADS (4), EG2_REPRO_CALLS (300 per op and shape),
 //! EG2_REPRO_NO_PROBE (AMX unguarded). Statistical, so ignored.
-use crate::cpu::runtime::{Runtime, RuntimeOptions};
+use crate::cpu::runtime::{Options, Runtime};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
@@ -46,7 +46,7 @@ fn eg2_bf16_ops_are_repeatable_under_load() {
     }
     let threads = env("EG2_REPRO_THREADS", 4);
     let calls = env("EG2_REPRO_CALLS", 300);
-    let rt = Runtime::new(RuntimeOptions::new().with_threads(threads)).unwrap();
+    let rt = Runtime::new(Options::new().with_threads(threads)).unwrap();
     let hw = rt.backend().unwrap();
     let tile = crate::embeddinggemma2::config::attn_tile(rt.cpu_isa());
     let stop = AtomicBool::new(false);
@@ -122,9 +122,9 @@ fn eg2_bf16_ops_are_repeatable_under_load() {
     });
     eprintln!(
         "TOTAL isa={} threads={threads}: {total_bad}/{total} calls differ",
-        rt.cpu_isa_name()
+        rt.isa()
     );
-    if crate::cpu::onednn::amx_probe_enabled() || !crate::cpu::onednn::isa_has_amx(rt.cpu_isa()) {
+    if crate::cpu::onednn::amx_probe_enabled() || !rt.isa().has_amx() {
         assert_eq!(total_bad, 0, "EG2 BF16 ops are not repeatable");
     }
 }

@@ -183,6 +183,8 @@ pub struct Pool {
 
 static POOL: OnceLock<Pool> = OnceLock::new();
 static NTHREADS: OnceLock<usize> = OnceLock::new();
+/// The CPUs the installed pool's workers are pinned to, one per worker.
+static CPUS: OnceLock<Vec<usize>> = OnceLock::new();
 
 fn pin_to(cpu: usize) {
     #[cfg(target_os = "linux")]
@@ -276,7 +278,7 @@ pub fn install(nthreads: usize, cpus: &[usize]) -> crate::Result<()> {
     validate_pool(nthreads, cpus)?;
     let _lock = INSTALL
         .lock()
-        .map_err(|_| crate::Error::Poisoned("pool installation"))?;
+        .map_err(|_| crate::Error::poisoned("pool installation"))?;
     if NTHREADS.get().is_some() {
         return Ok(());
     }
@@ -287,7 +289,7 @@ fn validate_pool(nthreads: usize, cpus: &[usize]) -> crate::Result<()> {
         || nthreads > libc::CPU_SETSIZE as usize
         || cpus.iter().any(|&c| c >= libc::CPU_SETSIZE as usize)
     {
-        return Err(crate::Error::Config(format!(
+        return Err(crate::Error::config(format!(
             "invalid pool threads {nthreads} or CPU set"
         )));
     }
@@ -339,10 +341,12 @@ fn create_pool(nthreads: usize, cpus: &[usize], spin_count: u32) -> crate::Resul
         });
     }
     let _ = NTHREADS.set(nthreads);
+    let _ = CPUS.set(cpus.to_vec());
     Ok(())
 }
 
-/// Install or validate the process-global worker count.
+/// Install the process-global pool, or check that the installed one has
+/// this width and these CPUs.
 pub fn install_or_check_with(
     nthreads: usize,
     cpus: &[usize],
@@ -351,10 +355,17 @@ pub fn install_or_check_with(
     validate_pool(nthreads, cpus)?;
     let _lock = INSTALL
         .lock()
-        .map_err(|_| crate::Error::Poisoned("pool installation"))?;
+        .map_err(|_| crate::Error::poisoned("pool installation"))?;
     if let Some(&have) = NTHREADS.get() {
         if have != nthreads {
-            return Err(crate::Error::Config(format!("thread pool is process-global ({have} threads already installed; requested {nthreads})")));
+            return Err(crate::Error::config(format!("thread pool is process-global ({have} threads already installed; requested {nthreads})")));
+        }
+        // One thread has no worker to pin: the caller computes.
+        let pinned = CPUS.get().map(Vec::as_slice).unwrap_or_default();
+        if nthreads > 1 && pinned != cpus {
+            return Err(crate::Error::config(format!(
+                "thread pool is process-global (pinned to CPUs {pinned:?}; requested {cpus:?})"
+            )));
         }
         return Ok(());
     }

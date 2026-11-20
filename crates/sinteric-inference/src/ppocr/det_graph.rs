@@ -66,7 +66,7 @@ impl Graph<'_> {
             vec![oc, ic / groups, k, k]
         };
         if self.assets.graph().tensors.get(&key) != Some(&expected) {
-            return Err(Error::Asset(format!(
+            return Err(Error::model_files(format!(
                 "compiled detector weight shape {key}"
             )));
         }

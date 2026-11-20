@@ -131,7 +131,7 @@ impl OnednnCpu {
         let s = self
             .state
             .lock()
-            .map_err(|_| crate::Error::Poisoned("backend"))?;
+            .map_err(|_| crate::Error::poisoned("backend"))?;
         if let Some(l) = s.layouts.get(&(n, k, dt)) {
             return Ok(l.clone());
         }
@@ -140,7 +140,7 @@ impl OnednnCpu {
         let mut s = self
             .state
             .lock()
-            .map_err(|_| crate::Error::Poisoned("backend"))?;
+            .map_err(|_| crate::Error::poisoned("backend"))?;
         s.layouts.insert((n, k, dt), l.clone());
         Ok(l)
     }
@@ -178,7 +178,7 @@ impl OnednnCpu {
         let mut s = self
             .state
             .lock()
-            .map_err(|_| crate::Error::Poisoned("backend"))?;
+            .map_err(|_| crate::Error::poisoned("backend"))?;
         let data = Aligned::new(layout.bytes)?;
         if ws.scratch.bytes < layout.scratch {
             ws.scratch = Aligned::new(layout.scratch)?;
@@ -232,14 +232,6 @@ impl OnednnCpu {
         })
     }
 
-    pub fn pack_from_cache(&self, n: usize, k: usize, bytes: &[u8]) -> AResult<PackedWeight> {
-        self.pack_from_cache_dt(n, k, bytes, MatDt::F32, None)
-    }
-
-    pub fn pack_from_cache_bf16(&self, n: usize, k: usize, bytes: &[u8]) -> AResult<PackedWeight> {
-        self.pack_from_cache_dt(n, k, bytes, MatDt::Bf16, None)
-    }
-
     fn pack_from_cache_dt(
         &self,
         n: usize,
@@ -261,7 +253,7 @@ impl OnednnCpu {
         let mut s = self
             .state
             .lock()
-            .map_err(|_| crate::Error::Poisoned("backend"))?;
+            .map_err(|_| crate::Error::poisoned("backend"))?;
         s.weight_bytes += layout.bytes;
         Ok(PackedWeight {
             layout,
@@ -290,7 +282,7 @@ impl OnednnCpu {
     pub(crate) fn unpack_into(&self, packed: &PackedWeight, dst: &mut [u8]) -> Result<()> {
         let src = packed.as_bytes();
         if dst.len() < src.len() {
-            return Err(crate::Error::Shape("packed unpack dest".into()));
+            return Err(crate::Error::internal("packed unpack dest"));
         }
         dst[..src.len()].copy_from_slice(src);
         Ok(())

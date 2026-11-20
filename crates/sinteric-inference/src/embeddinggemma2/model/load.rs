@@ -3,18 +3,19 @@
 //! safetensors file (Q, K and V as one matmul), the cache written as they
 //! pack, and the norms and per-layer scalars checked against the config.
 
-use super::{Linear, Model, Precision, PRECISIONS};
+use super::{Linear, Model, Precision};
 use crate::cpu::kernels::{bf16_bits_to_f32, DefaultRope};
 use crate::cpu::onednn::{
-    apply_cache, cache_path_with, cache_write_failed, file_stamp, pinned_dnnl, CacheMeta,
-    CacheOptions, CacheWriter, OnednnCpu, PackedEntry, PackedWeight, RawTensor,
+    apply_cache, cache_path_with, file_stamp, pinned_dnnl, CacheMeta, CacheOptions, CacheWriter,
+    OnednnCpu, PackedWeight, RawTensor,
 };
+use crate::cpu::runtime::{CacheWrite, WeightSource};
 use crate::embeddinggemma2::config::{
     head_dim, n_kv, EMBED_DIM, EMB_NAME, GLOBAL_THETA, HIDDEN, LOCAL_THETA, MAX_SEQ, N_LAYERS,
     N_QUERY_HEADS, PLE_WIDTH, VOCAB,
 };
 use crate::tensor_file::{Mapped, TensorFile};
-use crate::{check_shape, Result, ResultContext as Context};
+use crate::{check_files, check_shape, Error, Result, ResultContext as Context};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ pub(super) fn expected_weight_pin(manifest: Option<&Path>) -> Result<(String, u6
     };
     let f = m
         .file("model.safetensors")
-        .ok_or_else(|| crate::Error::Asset("model.safetensors not in manifest".into()))?;
+        .ok_or_else(|| crate::Error::model_files("model.safetensors not in manifest"))?;
     Ok((f.sha256.clone(), f.size))
 }
 
@@ -71,26 +72,8 @@ pub(super) fn pack_bf16(
     } else {
         backend.pack_bf16(n, k, src)?
     };
-    let failed = if let Some(c) = cache.as_mut() {
-        let mut bytes = crate::try_vec::<u8>(w.bytes())?;
-        let wrote = backend.unpack_into(&w, &mut bytes).is_ok()
-            && c.write_packed(PackedEntry {
-                name: key.to_string(),
-                n,
-                k,
-                bytes,
-                layout: w.layout_tag(),
-            })
-            .is_ok();
-        if !wrote {
-            cache_write_failed(c.dest(), "write interrupted");
-        }
-        !wrote
-    } else {
-        false
-    };
-    if failed {
-        *cache = None;
+    if let Some(c) = cache.as_mut() {
+        c.record(backend, &w, key, n, k)?;
     }
     Ok(w)
 }
@@ -109,7 +92,7 @@ fn assemble_raw(raw: Vec<RawTensor>) -> Result<Assembled> {
             let v = map
                 .remove(&key)
                 .with_context(|| format!("missing tensor {key}"))?;
-            check_shape!(v.len() == 1, "layer_scalar rank {key}");
+            check_files!(v.len() == 1, "layer_scalar rank {key}");
             scalars[i] = v[0];
         }
     }
@@ -128,7 +111,7 @@ fn validate_weights(
             .get(name)
             .with_context(|| format!("missing EG2 tensor {name}"))?
             .weight;
-        check_shape!(
+        check_files!(
             w.n() == n && w.k() == k,
             "EG2 tensor {name}: shape [{}, {}], expected [{n}, {k}]",
             w.n(),
@@ -140,7 +123,7 @@ fn validate_weights(
         let v = norms
             .get(name)
             .with_context(|| format!("missing EG2 tensor {name}"))?;
-        check_shape!(
+        check_files!(
             v.len() == width,
             "EG2 tensor {name}: width {}, expected {width}",
             v.len()
@@ -245,7 +228,6 @@ impl Model {
         precision: Precision,
     ) -> Result<Self> {
         check_shape!(tile > 0, "tile");
-        let precision = Precision::resolve(Some(precision), "EmbeddingGemma 2", PRECISIONS)?;
         let st_path = path.join("model.safetensors");
         let (sha, pinned_size) = expected_weight_pin(cache.manifest.as_deref())?;
         let mut cache_file = cache_path_with(&st_path, backend.cpu_isa(), cache.file.as_deref());
@@ -288,7 +270,7 @@ impl Model {
                         embeddings,
                         tile,
                         precision,
-                        "packed-cache",
+                        WeightSource::Cache { path: cache_file },
                         load_profile,
                     );
                 }
@@ -296,7 +278,7 @@ impl Model {
         }
 
         let stamp = file_stamp(&st_path).with_context(|| st_path.display().to_string())?;
-        check_shape!(
+        check_files!(
             stamp.size == pinned_size,
             "safetensors size {} != pinned {pinned_size}",
             stamp.size
@@ -314,7 +296,7 @@ impl Model {
         let mut linears = HashMap::new();
         let mut raw_out: Vec<RawTensor> = Vec::new();
         let mut cache_w = if cache.enabled {
-            CacheWriter::try_create(
+            Some(CacheWriter::start(
                 &cache_file,
                 &CacheMeta {
                     source_sha256: sha,
@@ -323,7 +305,7 @@ impl Model {
                     dnnl: pinned_dnnl(),
                     cpu_isa: backend.cpu_isa(),
                 },
-            )
+            ))
         } else {
             None
         };
@@ -369,20 +351,28 @@ impl Model {
                 });
                 file.release(&n);
             } else {
-                crate::invalid_shape!("unexpected text-tower tensor {n} shape {shape:?}");
+                return Err(Error::model_files(format!(
+                    "unexpected text-tower tensor {n} shape {shape:?}"
+                )));
             }
         }
         for (layer, parts) in qkv {
             let Some((qn, qk, q)) = parts[0].as_ref() else {
-                crate::invalid_shape!("missing q_proj for layer {layer}");
+                return Err(Error::model_files(format!(
+                    "missing q_proj for layer {layer}"
+                )));
             };
             let Some((kn, kk, k)) = parts[1].as_ref() else {
-                crate::invalid_shape!("missing k_proj for layer {layer}");
+                return Err(Error::model_files(format!(
+                    "missing k_proj for layer {layer}"
+                )));
             };
             let Some((vn, vk, v)) = parts[2].as_ref() else {
-                crate::invalid_shape!("missing v_proj for layer {layer}");
+                return Err(Error::model_files(format!(
+                    "missing v_proj for layer {layer}"
+                )));
             };
-            check_shape!(*qk == *kk && *kk == *vk, "qkv input width layer {layer}");
+            check_files!(*qk == *kk && *kk == *vk, "qkv input width layer {layer}");
             let mut cat = Vec::with_capacity(q.len() + k.len() + v.len());
             cat.extend_from_slice(q);
             cat.extend_from_slice(k);
@@ -401,13 +391,15 @@ impl Model {
         }
         load_profile.insert("pack_s".into(), t.elapsed().as_secs_f64());
         let embeddings = file.into_view(EMB_NAME, &[VOCAB, HIDDEN])?;
-        if let Some(w) = cache_w {
-            let t = Instant::now();
-            if let Err(e) = w.finish(&raw_out) {
-                cache_write_failed(&cache_file, &e);
+        let cache_write = match cache_w {
+            Some(w) => {
+                let t = Instant::now();
+                let written = w.close(&raw_out);
+                load_profile.insert("cache_write_s".into(), t.elapsed().as_secs_f64());
+                written
             }
-            load_profile.insert("cache_write_s".into(), t.elapsed().as_secs_f64());
-        }
+            None => CacheWrite::Off,
+        };
         let parts = assemble_raw(raw_out)?;
         Self::finish(
             backend,
@@ -416,7 +408,7 @@ impl Model {
             embeddings,
             tile,
             precision,
-            "safetensors",
+            WeightSource::Safetensors { cache: cache_write },
             load_profile,
         )
     }
@@ -428,11 +420,11 @@ impl Model {
         embeddings: Mapped<u16>,
         tile: usize,
         precision: Precision,
-        load_source: &'static str,
+        load_source: WeightSource,
         load_profile: BTreeMap<String, f64>,
     ) -> Result<Self> {
         validate_weights(&linears, &parts.norms)?;
-        check_shape!(parts.scalars.len() == N_LAYERS, "layer_scalar count");
+        check_files!(parts.scalars.len() == N_LAYERS, "layer_scalar count");
         Ok(Self {
             embeddings,
             vision: None,
@@ -474,8 +466,11 @@ mod malformed_file_tests {
         );
         let missing = test_path("round2-missing-manifest.toml");
         let _ = std::fs::remove_file(&missing);
+        let err = expected_weight_pin(Some(&missing)).unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::ModelFiles);
         assert!(
-            matches!(expected_weight_pin(Some(&missing)), Err(crate::Error::File { path, .. }) if path == missing)
+            err.to_string().contains(&missing.display().to_string()),
+            "{err}"
         );
         let explicit = test_path("round2-explicit-manifest.toml");
         std::fs::write(
@@ -488,8 +483,11 @@ mod malformed_file_tests {
             ("a".repeat(64), file.size)
         );
         std::fs::write(&explicit, "malformed manifest").unwrap();
+        let err = expected_weight_pin(Some(&explicit)).unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::ModelFiles);
         assert!(
-            matches!(expected_weight_pin(Some(&explicit)), Err(crate::Error::File { path, .. }) if path == explicit)
+            err.to_string().contains(&explicit.display().to_string()),
+            "{err}"
         );
         std::fs::remove_file(explicit).unwrap();
     }

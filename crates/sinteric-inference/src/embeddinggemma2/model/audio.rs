@@ -240,8 +240,8 @@ impl AudioTower {
         Ok(Self { parts })
     }
 
-    pub fn load_source(&self) -> &'static str {
-        self.parts.source
+    pub fn load_source(&self) -> &crate::cpu::runtime::WeightSource {
+        &self.parts.source
     }
 
     fn norm(&self, name: &str) -> Result<&[f32]> {

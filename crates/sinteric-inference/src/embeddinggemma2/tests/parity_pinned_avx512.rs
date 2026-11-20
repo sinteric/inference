@@ -2,7 +2,7 @@
 //! native-ISA lib tests (AMX on EMR). Used for Zen5-emulation benches/tests.
 
 use crate::cpu::onednn::{CpuIsaCap, SessionOptions};
-use crate::embeddinggemma2::{Frontend, Model, PromptKind};
+use crate::embeddinggemma2::{Model, PromptKind, Tokenizer};
 
 fn skip_assets() -> Option<std::path::PathBuf> {
     let path = concat!(
@@ -44,7 +44,7 @@ fn parity_pinned_avx512_core_bf16() {
         return;
     }
     let model = Model::load(&dir, backend, 64).expect("load");
-    let fe = Frontend::load(&dir).expect("tokenizer");
+    let fe = Tokenizer::load(&dir).expect("tokenizer");
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/fixtures/embeddinggemma2/parity.json"

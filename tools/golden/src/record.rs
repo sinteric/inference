@@ -10,10 +10,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use sinteric_inference::{
-    embeddinggemma2 as eg2, guard, ppocr, BackendOverrides, CpuIsa, Precision, Runtime,
-    RuntimeOptions,
-};
+use sinteric_inference::cpu::{BackendOverrides, IsaCap, Options, Runtime};
+use sinteric_inference::{embeddinggemma2 as eg2, guard, ppocr};
 
 use crate::inputs;
 
@@ -22,8 +20,8 @@ use crate::inputs;
 /// family's alone.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Family {
-    Eg2(Precision),
-    Guard(Precision),
+    Eg2(eg2::cpu::Precision),
+    Guard(guard::cpu::Precision),
     Ocr,
 }
 
@@ -32,7 +30,7 @@ pub struct Args {
     dir: PathBuf,
     pages: Option<PathBuf>,
     threads: usize,
-    isa: CpuIsa,
+    isa: IsaCap,
     reps: usize,
     out: PathBuf,
 }
@@ -40,10 +38,10 @@ pub struct Args {
 impl Args {
     pub fn parse(args: &[String]) -> Result<Self> {
         let family = match crate::flag(args, "--model").as_deref() {
-            Some("eg2-bf16") => Family::Eg2(Precision::Bf16),
-            Some("eg2-fp32") => Family::Eg2(Precision::Fp32),
-            Some("guard-bf16") => Family::Guard(Precision::Bf16),
-            Some("guard-fp32") => Family::Guard(Precision::Fp32),
+            Some("eg2-bf16") => Family::Eg2(eg2::cpu::Precision::Bf16),
+            Some("eg2-fp32") => Family::Eg2(eg2::cpu::Precision::Fp32),
+            Some("guard-bf16") => Family::Guard(guard::cpu::Precision::Bf16),
+            Some("guard-fp32") => Family::Guard(guard::cpu::Precision::Fp32),
             Some("ocr") => Family::Ocr,
             _ => bail!("--model eg2-bf16|eg2-fp32|guard-bf16|guard-fp32|ocr is required"),
         };
@@ -54,9 +52,9 @@ impl Args {
         };
         let threads = crate::flag(args, "--threads").map_or(Ok(4), |t| t.parse())?;
         let isa = match crate::flag(args, "--isa").as_deref().unwrap_or("best") {
-            "best" => CpuIsa::BestAvailable,
-            "avx512_core_bf16" => CpuIsa::Avx512CoreBf16,
-            "avx2" => CpuIsa::Avx2,
+            "best" => IsaCap::Best,
+            "avx512_core_bf16" => IsaCap::Avx512CoreBf16,
+            "avx2" => IsaCap::Avx2,
             other => bail!("--isa {other}: best, avx512_core_bf16 or avx2"),
         };
         let reps = crate::flag(args, "--reps").map_or(Ok(3), |t| t.parse())?;
@@ -162,13 +160,13 @@ impl Recorder {
 
 pub fn run(args: Args) -> Result<()> {
     let rt = Runtime::new(
-        RuntimeOptions::new()
+        Options::new()
             .with_threads(args.threads)
-            .with_cpu_isa(args.isa),
+            .with_isa_cap(args.isa),
     )?;
     let mut rec = Recorder {
         out: File::create(&args.out).with_context(|| format!("create {}", args.out.display()))?,
-        isa: rt.cpu_isa_name().to_string(),
+        isa: rt.isa().name().to_string(),
         threads: args.threads,
         reps: args.reps,
     };
@@ -184,22 +182,22 @@ fn embeddinggemma2(
     rt: &Runtime,
     args: &Args,
     rec: &mut Recorder,
-    precision: Precision,
+    precision: eg2::cpu::Precision,
 ) -> Result<()> {
-    let mut config = eg2::Config::new(&args.dir)
+    if !eg2::cpu::EmbeddingGemma2::precisions(rt).contains(&precision) {
+        eprintln!(
+            "skip EmbeddingGemma 2 {precision}: no {precision} kernels on {}",
+            rt.isa()
+        );
+        return Ok(());
+    }
+    let mut config = eg2::cpu::Config::new(&args.dir)
         .with_precision(precision)
         .with_image(true)
         .with_audio(true);
     config.cache.enabled = false;
     let t = Instant::now();
-    let model: eg2::EmbeddingGemma2 = match rt.load(config) {
-        Ok(m) => m,
-        Err(e @ sinteric_inference::Error::Unsupported { .. }) => {
-            eprintln!("skip EmbeddingGemma 2 {precision}: {e}");
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let model = eg2::cpu::EmbeddingGemma2::load(rt, config)?;
     let load_ms = ms(t);
     let name = format!("eg2-{precision}");
     for case in inputs::text_cases() {
@@ -257,18 +255,23 @@ fn embeddings(e: &eg2::Embeddings) -> (Vec<u8>, Value) {
     (raw, json!({"dim": e.dim, "data": e.data}))
 }
 
-fn guard(rt: &Runtime, args: &Args, rec: &mut Recorder, precision: Precision) -> Result<()> {
-    let mut config = guard::Config::new(&args.dir).with_precision(precision);
+fn guard(
+    rt: &Runtime,
+    args: &Args,
+    rec: &mut Recorder,
+    precision: guard::cpu::Precision,
+) -> Result<()> {
+    if !guard::cpu::Guard::precisions(rt).contains(&precision) {
+        eprintln!(
+            "skip guard {precision}: no {precision} kernels on {}",
+            rt.isa()
+        );
+        return Ok(());
+    }
+    let mut config = guard::cpu::Config::new(&args.dir).with_precision(precision);
     config.cache.enabled = false;
     let t = Instant::now();
-    let model: guard::Guard = match rt.load(config) {
-        Ok(m) => m,
-        Err(e @ sinteric_inference::Error::Unsupported { .. }) => {
-            eprintln!("skip guard {precision}: {e}");
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let model = guard::cpu::Guard::load(rt, config)?;
     let load_ms = ms(t);
     let name = format!("guard-{precision}");
     for case in inputs::text_cases() {
@@ -300,12 +303,17 @@ fn ocr(rt: &Runtime, args: &Args, rec: &mut Recorder) -> Result<()> {
     let pages = inputs::pages(args.pages.as_deref().context("--pages")?)?;
     let shared = rt.shared_backend(
         BackendOverrides::default()
-            .with_workspace_limit_bytes(Some(ppocr::DEFAULT_WORKSPACE_LIMIT_BYTES)),
+            .with_workspace_limit_bytes(Some(ppocr::cpu::DEFAULT_WORKSPACE_LIMIT_BYTES)),
     )?;
     let t = Instant::now();
-    let det: ppocr::Detector = shared.load(ppocr::DetConfig::new(args.dir.join("det")))?;
-    let recognizer: ppocr::Recognizer = shared.load(ppocr::RecConfig::new(args.dir.join("rec")))?;
-    let unwarper: ppocr::Unwarper = shared.load(ppocr::UvdocConfig::new(args.dir.join("uvdoc")))?;
+    let det =
+        ppocr::cpu::Detector::load(&shared, ppocr::cpu::DetConfig::new(args.dir.join("det")))?;
+    let recognizer =
+        ppocr::cpu::Recognizer::load(&shared, ppocr::cpu::RecConfig::new(args.dir.join("rec")))?;
+    let unwarper = ppocr::cpu::Unwarper::load(
+        &shared,
+        ppocr::cpu::UvdocConfig::new(args.dir.join("uvdoc")),
+    )?;
     let load_ms = ms(t);
     for page in &pages {
         let format = match page.channels {

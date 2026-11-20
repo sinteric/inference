@@ -6,6 +6,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context, Result};
 
 /// The flags of one command line, checked against what the driver accepts.
+#[derive(Debug)]
 pub struct Flags {
     values: HashMap<String, String>,
     switches: Vec<String>,

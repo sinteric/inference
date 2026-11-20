@@ -12,8 +12,8 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use super::{Config, Guard, Precision};
-use crate::{CpuIsa, Runtime, RuntimeOptions};
+use super::cpu::{Config, Guard, Precision};
+use crate::cpu::{Isa, IsaCap, Options, Runtime};
 
 /// The asset directory, or `None` (the test is skipped) when the pinned
 /// files are not in the cache.
@@ -130,10 +130,14 @@ fn compare(guard: &Guard) -> Gaps {
     gaps
 }
 
-fn load(isa: CpuIsa, precision: Precision) -> Option<(Runtime, Guard)> {
+fn load(cap: IsaCap, precision: Precision) -> Option<(Runtime, Guard)> {
     let dir = model_dir()?;
-    let rt = Runtime::new(RuntimeOptions::new().with_threads(2).with_cpu_isa(isa)).unwrap();
-    let guard = rt.load(Config::new(dir).with_precision(precision)).unwrap();
+    let rt = Runtime::new(Options::new().with_threads(2).with_isa_cap(cap)).unwrap();
+    if !Guard::precisions(&rt).contains(&precision) {
+        eprintln!("skipping: {precision} does not run on {}", rt.isa());
+        return None;
+    }
+    let guard = Guard::load(&rt, Config::new(dir).with_precision(precision)).unwrap();
     Some((rt, guard))
 }
 
@@ -142,11 +146,11 @@ fn load(isa: CpuIsa, precision: Precision) -> Option<(Runtime, Guard)> {
 #[test]
 fn fp32_matches_pytorch() {
     crate::test_support::own_process!(fp32_matches_pytorch);
-    let Some((rt, guard)) = load(CpuIsa::BestAvailable, Precision::Fp32) else {
+    let Some((rt, guard)) = load(IsaCap::Best, Precision::Fp32) else {
         return;
     };
     let gaps = compare(&guard);
-    eprintln!("guard fp32 {}: {gaps:?}", rt.cpu_isa_name());
+    eprintln!("guard fp32 {}: {gaps:?}", rt.isa());
     assert_fp32(&gaps);
 }
 
@@ -154,11 +158,11 @@ fn fp32_matches_pytorch() {
 #[test]
 fn fp32_matches_pytorch_pinned_avx2() {
     crate::test_support::own_process!(fp32_matches_pytorch_pinned_avx2);
-    let Some((rt, guard)) = load(CpuIsa::Avx2, Precision::Fp32) else {
+    let Some((rt, guard)) = load(IsaCap::Avx2, Precision::Fp32) else {
         return;
     };
-    if rt.cpu_isa_name() != "AVX2" {
-        eprintln!("skipping: effective ISA {} is not AVX2", rt.cpu_isa_name());
+    if rt.isa() != Isa::Avx2 {
+        eprintln!("skipping: effective ISA {} is not AVX2", rt.isa());
         return;
     }
     let gaps = compare(&guard);
@@ -170,11 +174,11 @@ fn fp32_matches_pytorch_pinned_avx2() {
 #[test]
 fn bf16_keeps_every_decision() {
     crate::test_support::own_process!(bf16_keeps_every_decision);
-    let Some((rt, guard)) = load(CpuIsa::BestAvailable, Precision::Bf16) else {
+    let Some((rt, guard)) = load(IsaCap::Best, Precision::Bf16) else {
         return;
     };
     let gaps = compare(&guard);
-    eprintln!("guard bf16 {}: {gaps:?}", rt.cpu_isa_name());
+    eprintln!("guard bf16 {}: {gaps:?}", rt.isa());
     assert!(gaps.logit <= BF16_LOGIT, "{gaps:?}");
     assert!(gaps.score <= BF16_SCORE, "{gaps:?}");
 }

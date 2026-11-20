@@ -5,10 +5,11 @@
 
 use crate::cpu::kernels::{bf16_bits_to_f32, for_ranges, rows_mut};
 use crate::cpu::onednn::{
-    apply_cache, cache_write_failed, file_stamp, pinned_dnnl, CacheMeta, CacheOptions, CacheWriter,
-    OnednnCpu, PackedWeight, RawTensor,
+    apply_cache, file_stamp, pinned_dnnl, CacheMeta, CacheOptions, CacheWriter, OnednnCpu,
+    PackedWeight, RawTensor,
 };
-use crate::{check_shape, Result, ResultContext as Context};
+use crate::cpu::runtime::{CacheWrite, WeightSource};
+use crate::{check_files, check_shape, Result, ResultContext as Context};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -52,7 +53,7 @@ pub(crate) struct Packer<'b> {
 impl Packer<'_> {
     /// Pack `[n, k]` BF16 rows (`y = x @ W^T`).
     pub fn pack(&mut self, key: &str, n: usize, k: usize, src: &[u16]) -> Result<()> {
-        check_shape!(src.len() == n * k, "pack {key}: {} != {n}x{k}", src.len());
+        check_files!(src.len() == n * k, "pack {key}: {} != {n}x{k}", src.len());
         let w = pack_bf16(
             self.backend,
             self.precision,
@@ -77,7 +78,7 @@ impl Packer<'_> {
 pub(crate) struct TowerParts {
     pub linears: HashMap<String, PackedWeight>,
     pub raw: HashMap<String, Vec<f32>>,
-    pub source: &'static str,
+    pub source: WeightSource,
 }
 
 impl TowerParts {
@@ -92,7 +93,7 @@ impl TowerParts {
             .raw
             .get(name)
             .with_context(|| format!("EG2 tower tensor {name}"))?;
-        check_shape!(
+        check_files!(
             v.len() == len,
             "EG2 tower tensor {name}: {} values, expected {len}",
             v.len()
@@ -124,7 +125,7 @@ impl TowerParts {
 
     pub fn check_linear(&self, name: &str, n: usize, k: usize) -> Result<()> {
         let w = self.linear(name)?;
-        check_shape!(
+        check_files!(
             w.n() == n && w.k() == k,
             "EG2 tower linear {name}: [{}, {}], expected [{n}, {k}]",
             w.n(),
@@ -181,14 +182,14 @@ pub(crate) fn load_tower(
             return Ok(TowerParts {
                 linears,
                 raw: raw.into_iter().map(|t| (t.name, t.data)).collect(),
-                source: "packed-cache",
+                source: WeightSource::Cache { path: cache_file },
             });
         }
     }
     let stamp = file_stamp(src.st_path).with_context(|| src.st_path.display().to_string())?;
     let file = TensorFile::open(src.st_path)?;
     let cache = if src.cache.enabled {
-        CacheWriter::try_create(
+        Some(CacheWriter::start(
             &cache_file,
             &CacheMeta {
                 source_sha256: src.sha.to_string(),
@@ -197,7 +198,7 @@ pub(crate) fn load_tower(
                 dnnl: pinned_dnnl(),
                 cpu_isa: backend.cpu_isa(),
             },
-        )
+        ))
     } else {
         None
     };
@@ -215,15 +216,14 @@ pub(crate) fn load_tower(
         raw,
         ..
     } = packer;
-    if let Some(w) = cache {
-        if let Err(e) = w.finish(&raw) {
-            cache_write_failed(&cache_file, &e);
-        }
-    }
+    let cache = match cache {
+        Some(w) => w.close(&raw),
+        None => CacheWrite::Off,
+    };
     Ok(TowerParts {
         linears,
         raw: raw.into_iter().map(|t| (t.name, t.data)).collect(),
-        source: "safetensors",
+        source: WeightSource::Safetensors { cache },
     })
 }
 

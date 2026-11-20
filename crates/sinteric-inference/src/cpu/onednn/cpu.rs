@@ -17,7 +17,6 @@ use crate::cpu::onednn::options::{CpuIsaCap, SessionOptions, DEFAULT_WORKSPACE_L
 use crate::cpu::threads::{compute_lock, ThreadBudget};
 use crate::{check_shape, Result, Result as AResult, ResultContext as Context};
 use onednn_sys::*;
-use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
@@ -429,7 +428,6 @@ pub struct OnednnCpu {
     pub(crate) retained: Retained,
     pub cpu_isa: u64,
     strategy: crate::cpu::onednn::IsaStrategy,
-    pub info: String,
 }
 
 unsafe impl Send for OnednnCpu {}
@@ -442,7 +440,7 @@ impl CappedThreadpool {
     fn new(n: i32) -> AResult<Self> {
         let p = unsafe { onednn_sys::sinteric_dnnl_threadpool_create_capped(n) };
         if p.is_null() {
-            return Err(crate::Error::Allocation { bytes: 16 });
+            return Err(crate::Error::out_of_memory(16));
         }
         Ok(Self(p))
     }
@@ -516,27 +514,15 @@ fn fill(dims: &[i64]) -> [i64; 12] {
 }
 
 /// `BestAvailable` becomes `Avx512CoreBf16` on a host whose AMX tile state is
-/// lost across preemption ([`crate::cpu::onednn::amx_health`]); explicit caps are kept.
+/// lost across preemption ([`crate::cpu::onednn::amx_health`]); explicit caps
+/// are kept. Nothing is printed: [`crate::cpu::Runtime::amx_health`] reports
+/// what the probe found.
 fn resolve_isa_cap(cap: CpuIsaCap) -> CpuIsaCap {
     if cap != CpuIsaCap::BestAvailable || !crate::cpu::onednn::amx_probe_enabled() {
         return cap;
     }
     match crate::cpu::onednn::amx_health() {
-        crate::cpu::onednn::AmxHealth::TileStateLoss {
-            corrupt,
-            iterations,
-            preemptions,
-        } => {
-            static WARN: std::sync::Once = std::sync::Once::new();
-            WARN.call_once(|| {
-                eprintln!(
-                    "warning: AMX tile state is lost when a thread is preempted on this host \
-                     ({corrupt} wrong results in {iterations} tile GEMMs, {preemptions} \
-                     preemptions); using AVX512_CORE_BF16 instead of AMX"
-                );
-            });
-            CpuIsaCap::Avx512CoreBf16
-        }
+        crate::cpu::onednn::AmxHealth::TileStateLoss { .. } => CpuIsaCap::Avx512CoreBf16,
         _ => cap,
     }
 }
@@ -551,7 +537,7 @@ impl OnednnCpu {
         let mut s = self
             .state
             .lock()
-            .map_err(|_| crate::Error::Poisoned("backend"))?;
+            .map_err(|_| crate::Error::poisoned("backend"))?;
         s.plans.clear();
         s.capacity = capacity;
         self.retained.plans.store(0, Ordering::Relaxed);
@@ -671,6 +657,7 @@ impl OnednnCpu {
         crate::checked_size(operation, dims)
     }
 
+    #[cfg(test)]
     pub fn load(budget: &ThreadBudget) -> AResult<Arc<Self>> {
         Self::load_with(budget, SessionOptions::default())
     }
@@ -681,7 +668,7 @@ impl OnednnCpu {
             || opts.exec_slots == 0
             || !(0..=2).contains(&opts.verbose)
         {
-            return Err(crate::Error::Config(format!(
+            return Err(crate::Error::config(format!(
                 "invalid session: threads {}, exec_slots {}, verbose {}",
                 budget.nthreads, opts.exec_slots, opts.verbose
             )));
@@ -693,11 +680,11 @@ impl OnednnCpu {
         };
         let slot_bytes = crate::checked_size("execute slots", &[opts.exec_slots, 192])?;
         if slot_bytes > limit {
-            return Err(crate::Error::WorkspaceLimit {
-                operation: "execute slots",
-                requested: slot_bytes,
+            return Err(crate::Error::workspace_limit(
+                "execute slots",
+                slot_bytes,
                 limit,
-            });
+            ));
         }
         budget.install_library_workers()?;
         let api = Arc::new(Api::init(
@@ -716,7 +703,7 @@ impl OnednnCpu {
             opts.threads.min(budget.nthreads)
         };
         let threads_i32 = i32::try_from(threads)
-            .map_err(|_| crate::Error::Config(format!("invalid threads {threads}")))?;
+            .map_err(|_| crate::Error::config(format!("invalid threads {threads}")))?;
         let capped_threadpool = if threads < budget.nthreads {
             Some(CappedThreadpool::new(threads_i32)?)
         } else {
@@ -726,12 +713,11 @@ impl OnednnCpu {
         let exec_slots = opts.exec_slots.max(1);
         let mut idle = Vec::new();
         idle.try_reserve_exact(exec_slots)
-            .map_err(|_| crate::Error::Allocation { bytes: slot_bytes })?;
+            .map_err(|_| crate::Error::out_of_memory(slot_bytes))?;
         for _ in 0..exec_slots {
             idle.push(ExecWorkspace::new(&api, engine, threadpool)?);
         }
         let cpu_isa = unsafe { (api.get_effective_cpu_isa)() as u32 as u64 };
-        let info = format!("{}; isa=0x{cpu_isa:x}", api.info);
         let workspace_limit = if opts.workspace_limit == 0 {
             DEFAULT_WORKSPACE_LIMIT
         } else {
@@ -776,11 +762,11 @@ impl OnednnCpu {
             workspace_limit,
             memory_budget: opts.memory_budget,
             retained: Retained::default(),
-            info,
         }))
     }
 
     /// Shape policy selected once from the effective (possibly pinned) ISA.
+    #[cfg(test)]
     pub fn strategy(&self) -> crate::cpu::onednn::IsaStrategy {
         self.strategy
     }
@@ -800,7 +786,7 @@ impl OnednnCpu {
         }
     }
 
-    pub fn stats_json(&self) -> Value {
+    pub(crate) fn stats(&self) -> crate::cpu::runtime::BackendStats {
         let (conv_arena, conv_scratch) = self
             .conv_workspace
             .state
@@ -820,38 +806,38 @@ impl OnednnCpu {
             .sum::<usize>();
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-        serde_json::json!({
-            "conv_packed_weight_bytes": self.conv_weight_bytes.load(Ordering::Relaxed),
-            "conv_arena_bytes": conv_arena,
-            "conv_scratch_bytes": conv_scratch,
-            "execute_scratch_bytes": execute_scratch_bytes,
-            "cached_plans": s.plans.len(),
-            "plan_capacity": s.capacity,
-            "plan_creations": s.creations,
-            "capacity_evictions": s.capacity_evictions,
-            "cached_weight_layouts": s.layouts.len(),
-            "primitive_setup_s": s.setup_s,
-            "primitive_exec_s": s.exec_s,
-            "bf16_convert_s": s.convert_s,
-            "category_exec_s": s.category_s,
-            "executions": s.executions,
-            "packed_weight_bytes": s.weight_bytes,
-            "retained_output_buffer_bytes": pool.buffer_bytes,
-            "memory_budget_bytes": self.memory_budget,
-            "retained_bytes": self.retained.total(),
-            "plan_bytes": self.retained.plans.load(Ordering::Relaxed),
-            "conv_plan_bytes": self.retained.conv_plans.load(Ordering::Relaxed),
-            "budget_evictions": s.evictions
+        crate::cpu::runtime::BackendStats {
+            isa: crate::cpu::runtime::Isa::from_bits(self.cpu_isa)
+                .unwrap_or(crate::cpu::runtime::Isa::Avx2),
+            exec_slots: self.exec_slots,
+            packed_weight_bytes: s.weight_bytes,
+            conv_packed_weight_bytes: self.conv_weight_bytes.load(Ordering::Relaxed),
+            retained_bytes: self.retained.total(),
+            memory_budget_bytes: self.memory_budget,
+            plan_bytes: self.retained.plans.load(Ordering::Relaxed),
+            conv_plan_bytes: self.retained.conv_plans.load(Ordering::Relaxed),
+            conv_arena_bytes: conv_arena,
+            conv_scratch_bytes: conv_scratch,
+            execute_scratch_bytes,
+            retained_output_buffer_bytes: pool.buffer_bytes,
+            active_pool_shape: pool.active_shape,
+            cached_plans: s.plans.len(),
+            plan_capacity: s.capacity,
+            plan_creations: s.creations,
+            capacity_evictions: s.capacity_evictions,
+            budget_evictions: s.evictions
                 + self.retained.conv_evictions.load(Ordering::Relaxed) as u64,
-            "budget_evicted_bytes": s.evicted_bytes
+            budget_evicted_bytes: s.evicted_bytes
                 + self.retained.conv_evicted.load(Ordering::Relaxed) as u64,
-            "budget_trims": self.retained.trims.load(Ordering::Relaxed),
-            "active_pool_shape": pool.active_shape,
-            "implementations": s.plans.values().map(|p| p.name.clone()).collect::<Vec<_>>(),
-            "cpu_isa": self.cpu_isa,
-            "exec_slots": self.exec_slots,
-            "session": "bounded execute pool (stream+scratch per slot); default 1 is serialized; parallel_for is process-global",
-        })
+            budget_trims: self.retained.trims.load(Ordering::Relaxed),
+            cached_weight_layouts: s.layouts.len(),
+            implementations: s.plans.values().map(|p| p.name.clone()).collect(),
+            primitive_setup_s: s.setup_s,
+            primitive_exec_s: s.exec_s.clone(),
+            executions: s.executions.clone(),
+            bf16_convert_s: s.convert_s,
+            category_exec_s: s.category_s.clone(),
+        }
     }
 }
 
@@ -881,8 +867,5 @@ impl OnednnCpu {
             pool.buffer_bytes = 0;
             pool.active_shape = Some((b, s));
         }
-    }
-    pub(crate) fn stats(&self) -> Value {
-        self.stats_json()
     }
 }
