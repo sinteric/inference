@@ -186,6 +186,12 @@ output is not required. The gates:
   ONNX Runtime 1.28.0 on the 100-page Korean document gate (60 real pages, 40
   synthetic; not distributed), which they pass today.
 
+A change that only restructures code is held to more than the gates: every
+model's output stays bit for bit what it was. `tools/golden` records each
+model's outputs on fixed inputs, with call times and peak RSS, and compares
+two records; record the base and the change on one machine, at the same ISA
+cap and thread count (its crate docs say how and what it cannot see).
+
 What is not done yet, and what was tried and ruled out, is in
 [`docs/open-work.md`](docs/open-work.md).
 

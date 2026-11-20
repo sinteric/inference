@@ -1,0 +1,19 @@
+[package]
+name = "golden"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Records every model's outputs on fixed inputs and compares two records: the refactor gate."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+sinteric-inference = { path = "../../crates/sinteric-inference" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+png = "=0.17.16"

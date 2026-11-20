@@ -40,8 +40,9 @@ jobs:
             -p rt-core -p rt-threads -p rt-assets -p rt-image -p rt-qual -p rt-kernels \
             -p onednn-sys -p rt-backend -p rt-onednn -p rt-runtime -p embeddinggemma2 \
             -p ppocr --all-targets -- -D warnings
-          # Vela graph + library API: --no-deps so the faithful rt-text port keeps original style.
-          cargo clippy --locked -p vela2-0p3b -p sinteric-inference --all-targets --no-deps -- -D warnings
+          # Vela graph, library API and the refactor gate: --no-deps so the faithful rt-text
+          # port keeps original style.
+          cargo clippy --locked -p vela2-0p3b -p sinteric-inference -p golden --all-targets --no-deps -- -D warnings
       - name: asset-free tests (default members; Candle/MLAS excluded)
         run: cargo test --locked --lib --bins --tests -- --test-threads=4
       - name: qualification skip (oracle is private)
