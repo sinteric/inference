@@ -5,8 +5,9 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 Builds of it statically link oneDNN (https://github.com/uxlfoundation/oneDNN),
 under the Apache License, Version 2.0; oneDNN's own third-party notices are in
-docs/onednn-THIRD_PARTY_NOTICES.md. crates/rt-image adapts code from OpenCV
-and Clipper; their notices are in crates/rt-image/NOTICE. The other
+docs/onednn-THIRD_PARTY_NOTICES.md. The library's image module adapts code
+from OpenCV and Clipper; their notices are in
+crates/sinteric-inference/src/image/NOTICE. The other
 third-party code and the models this runtime loads are listed, with their
 licences, in docs/THIRD_PARTY_NOTICES.md.
 

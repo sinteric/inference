@@ -4,19 +4,19 @@ This repo started as a port of earlier Vela 2.0 CPU experiments (a
 standalone oneDNN runtime and a Candle + MLAS runtime). A reconstructed
 skeleton came first, then faithful copies of the qualified sources, and then
 **Rust + oneDNN C API** became the only backend of the library crates and
-Candle left the default dependency graph.
-
-| Experiment | Now lives at |
-|---|---|
-| standalone oneDNN runtime | C API in `crates/onednn-sys` + `crates/rt-onednn`; graph in `models/vela2-0p3b/src/onednn/`; retired `native/onednn/bridge.cpp` |
-| Candle + MLAS runtime | `bench/vela-mlas/` behind its `bench-mlas` feature + `crates/candle-mlas/` |
-| native text frontend | `crates/rt-text` + `bench/vela-mlas/src/mlas/native_text.rs` |
-
-The qualification evidence and the frozen 227-case corpus are not part of
+Candle left the default dependency graph. Vela's frozen gate was 227 cases,
+zero mismatches, atol 1e-4 against FP32 ONNX; that corpus was never part of
 this repo.
 
-The frozen gate: **227 cases, zero mismatches, calibrated atol 1e-4** vs FP32
-ONNX. Asset-free C API primitives match the previous oneDNN path within 1e-6.
+On 2026-11-20 the repo was cut down to what it is now: one library crate
+over `onednn-sys`. Vela 2.0 left, since nothing linked it any more and the
+guard (a ModernBERT encoder like Vela) replaced it. So did the Candle + MLAS
+comparison crates, the `Hardware` trait every graph called through, the
+worker processes, the environment overrides and an axum test server. The
+porting notes of the Vela experiments (`docs/porting.md`) and those crates
+are in git history from that date back. The paragraphs below describe the
+EmbeddingGemma 2 port as it was made and still hold, except where a name
+they use has since gone.
 
 EmbeddingGemma 2 (`eg2-onednn`) is a separate per-model graph on the same
 `rt_backend::Hardware` / oneDNN C API path. Vela numerics are unchanged
@@ -58,8 +58,5 @@ stream+scratch workspaces (`exec_slots`, default 1 = serialized).
 
 `crates/sinteric-inference` is the in-process library API
 (`Runtime::new(RuntimeOptions)`, one module per model with its own `Config`).
-oneDNN 3.13.4 is statically linked (`onednn-sys` cmake). The library path
-never reads process env. CLI/bench explicitly capture
-`EnvOverrides::from_env()` and apply the snapshot with `with_overrides`.
-Vela numerics, EG2 GEMM path, and the 512 MiB
-workspace default are unchanged.
+oneDNN 3.13.4 is statically linked (`onednn-sys` cmake). The library never
+reads process env.

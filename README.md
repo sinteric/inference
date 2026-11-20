@@ -13,11 +13,11 @@ and each model's `Config` ([library guide](docs/library.md)).
 
 ## Models
 
-| Model | What it does | Precision | Crate |
+| Model | What it does | Precision | Module |
 |---|---|---|---|
-| [`vllm-sr/Vela-2.0-0.3B`](https://huggingface.co/vllm-sr/Vela-2.0-0.3B) | ModernBERT encoder guard | FP32, strict | `models/vela2-0p3b` |
-| [`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2) | Embeddings: the text tower, with opt-in image and audio towers (`api::EmbeddingGemma2::embed_parts`) | BF16 matmuls with an FP32 residual stream, or FP32 | `models/embeddinggemma2` |
-| PP-OCR | A detector, a Korean CTC recognizer and the UVDoc page unwarper, as three models (`ppocr::{Detector, Recognizer, Unwarper}`) | FP32 | `models/ppocr` |
+| [`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2) | Embeddings: the text tower, with opt-in image and audio towers (`EmbeddingGemma2::embed_parts`) | BF16 matmuls with an FP32 residual stream, or FP32 | `embeddinggemma2` |
+| [`Horizon-Labs/prompt-injection-guard-base`](https://huggingface.co/Horizon-Labs/prompt-injection-guard-base) | Prompt-injection guard: a ModernBERT encoder with a two-label head (`Guard::classify`), and its hidden states for heads of a caller's own (`Guard::encode`) | FP32, or BF16 matmuls | `guard` |
+| PP-OCR | A detector, a Korean CTC recognizer and the UVDoc page unwarper, as three models (`ppocr::{Detector, Recognizer, Unwarper}`) | FP32 | `ppocr` |
 
 EmbeddingGemma 2's 262k×512 embedding table stays a memory map, so only the
 rows a text reaches become resident. The PP-OCR unwarper's grid matches ONNX
@@ -33,93 +33,75 @@ CPUs through oneDNN 3.13.4's C API, linked statically:
   targets the models are tuned and measured on. The benchmarks there showed
   oneDNN fastest or tied everywhere, at about a third to a fifth of ONNX
   Runtime's RSS ([`docs/results/`](docs/results)).
-- PP-OCR and EmbeddingGemma 2 (FP32) are also checked at AVX2, with oneDNN
+- PP-OCR, EmbeddingGemma 2 (FP32) and the guard (FP32) are also checked at AVX2, with oneDNN
   capped at AVX2 on an AVX-512 host rather than on an AVX2-only CPU. The
   [library guide](docs/library.md) says what was measured there and what it
   costs.
 
 CPUs are the current focus, not a limit. GPUs (AMD, NVIDIA, Intel) are not
 supported yet; when one is needed it gets the same treatment: a few selected
-models, each tuned for that hardware. Vela's and EmbeddingGemma 2's graphs are
-written over the `Hardware` trait in `rt-backend`, whose only implementation
-today is oneDNN's CPU backend in `rt-onednn`; PP-OCR's convolution graphs call
-`rt-onednn` directly.
+models, each tuned for that hardware. Every model's graph calls the oneDNN CPU
+backend directly; there is no layer that pretends another device would fit
+its shape.
 
 ## Drivers
 
-Each model has a thin command-line driver, used by the gates and benchmarks:
+The gates and benchmarks run each model through a thin command-line driver in
+`tools/drivers`, built only on the library's public API and configured by
+flags alone:
 
 | Driver | Model | Notes |
 |---|---|---|
-| `vela2-onednn` | Vela 2.0 | Strict fpmath, kind-7 GeGLU, packed reorder |
-| `eg2-onednn` | EmbeddingGemma 2, text tower | BF16 matmul, FP32 stream |
-| `ppocr-onednn` | PP-OCR | Decodes pixels in the library; PNG in, JSONL out, for the OCR gate |
-| `vela2-mlas` / `vela2-native-text` | Vela 2.0 | Comparison only, in `bench/vela-mlas` behind its `bench-mlas` feature |
-
-No library crate depends on Candle or MLAS; only that comparison crate does.
+| `eg2-onednn` | EmbeddingGemma 2, text tower | The bench harness's persistent JSON worker |
+| `ppocr-onednn` | PP-OCR | PNG/JPEG pages in, JSONL out, for the OCR gate |
+| `ppocr-ort` | PP-OCR on ONNX Runtime 1.28.0 | The OCR gate's reference, behind the drivers' `ort` feature |
 
 ## Layout
 
 ```
-crates/rt-*          model-independent (core, threads, assets, text, qual, backend trait)
-crates/onednn-sys    bindgen FFI for dnnl_* (oneDNN 3.13.4 C API)
-crates/rt-onednn     safe wrapper + OnednnCpu Hardware impl + packed-weight cache
-crates/rt-runtime    model-agnostic Runtime (process globals) + Model load trait
-crates/sinteric-inference  the library: Runtime + one module per model
-crates/candle-mlas   research numerical backend (not a default-member)
-bench/vela-mlas      Candle/MLAS comparison library + drivers (not a default-member)
-models/vela2-0p3b    Vela graph over the Hardware trait; `api::Vela2`; vela2-onednn driver
-models/embeddinggemma2  EmbeddingGemma 2 text + image + audio; `api::EmbeddingGemma2`; eg2-onednn driver
-models/ppocr        PP-OCR detector, Korean recognizer, UVDoc unwarper; `api::{Detector, Recognizer, Unwarper}`; ppocr-onednn driver
-tools/ppocr-import   pinned ONNX importer and ORT fixture/qualification tools
-tools/amx-tile-state the AMX tile-state fault the runtime's probe guards against
-native/onednn        shared-SDK recipe (python tests). Rust statically links libdnnl.a.
-assets/*.toml        Hub repo / revision / sha256 (bytes not in git)
-bench/harness        validate.py / benchmark.py / support.py (any N threads)
+crates/onednn-sys          bindgen FFI for dnnl_* (oneDNN 3.13.4 C API, linked statically)
+crates/sinteric-inference  the library: Runtime + one module per model; internals private
+tools/drivers              command-line drivers for the gates and benchmarks
+tools/golden               the refactor gate: every model's outputs bit for bit
+tools/ppocr-import         pinned ONNX importer and ORT fixture/qualification tools
+tools/amx-tile-state       the AMX tile-state fault the runtime's probe guards against
+assets/*.toml              Hub repo / revision / sha256 (bytes not in git)
+bench/                     the EG2 broad matrix and the harness (any N threads)
 ```
-
-`models/*` may depend on `rt-*`. `rt-*` never depends on a model.
 
 ## Toolchain
 
 **Rust 1.99.1** (`rust-toolchain.toml`). cmake, g++. `CC=gcc CXX=g++`.
 
 ```bash
-# asset-free (hosted CI path; no Candle, no MLAS)
-cargo test --lib --bins --tests
-
-# Vela on oneDNN (statically linked 3.13.4)
+# asset-free (hosted CI path); tests that need model files skip
 # cmake + g++ required. Cache: ONEDNN_STATIC_ROOT=$HOME/.cache/sinteric-sdk/onednn-static-tp
-cargo build -p vela2-0p3b --bin vela2-onednn --release
-./target/release/vela2-onednn --model "$SINTERIC_ASSETS" \
-  --threads 2 --frontend
+cargo test --workspace --lib --bins --tests
 
 # EmbeddingGemma 2 text tower (mmap embeddings; image/audio: eg2_media_bench example)
 python3 scripts/download_assets.py assets/embeddinggemma2.toml
-cargo build -p embeddinggemma2 --bin eg2-onednn --release
-./target/release/eg2-onednn --model "$SINTERIC_ASSETS" \
-  --threads 4 --frontend
+cargo build -p drivers --bin eg2-onednn --release
+./target/release/eg2-onednn --model "$EG2_MODEL" --threads 4
 # Best ISA by default (AMX on EMR). Match Turin with --pin-isa AVX512_CORE_BF16.
 
-# MLAS comparison (optional; pulls Candle)
-native/mlas/build_mlas.sh
-cargo build -p vela-mlas --features bench-mlas --bin vela2-mlas --release
+# The guard
+python3 scripts/download_assets.py assets/guard.toml
+cargo run -p sinteric-inference --release --example guard -- "$GUARD_MODEL" 4 "some text"
 
 # GNU_STACK must be RW
-scripts/check-noexecstack.sh
+scripts/check-noexecstack.sh target/release/eg2-onednn
 ```
 
 Thread budgets are any `N >= 1`. Default placement is **one logical CPU per
 physical core**, using the **lowest** SMT sibling (matching the harness;
 `1,3,5,7` on a 4-core SMT guest is rejected as over-budget). Pass
 `--cpuset 0,2,4,6` to override.
-Libraries do not read `available_parallelism` or process env. Configure
-threads, ISA, cache, and affinity through [`Runtime`](crates/rt-runtime)
-(see [`docs/library.md`](docs/library.md)). Process-owned drivers may call
-`ThreadBudget::apply_process_policy`.
+The library does not read `available_parallelism` or the process
+environment. Configure threads, ISA, cache and affinity through `Runtime`
+and each model's `Config` (see [`docs/library.md`](docs/library.md)).
 
 Weights are mmapped and packed into oneDNN blocked layouts. The packed-weight
-cache is **on by default** (`CacheOptions.enabled`; CLI `VELA_PACKED_CACHE=0` disables it). The file
+cache is **on by default** (`CacheConfig::enabled`). The file
 (`model.safetensors.onednn-3.13.4.v5.isa{hex}`) stores the *manifest* sha256,
 source size/mtime, oneDNN version, effective CPU ISA, per-tensor packed
 memory-descriptor fingerprints, packed GEMM weights, norms and biases — not
@@ -129,26 +111,22 @@ of the cache and drops those pages after each copy. The cache
 auto-invalidates if size/mtime, the manifest sha, the oneDNN version, the
 effective ISA, or a packed layout tag change. If the cache path is not writable, load packs from safetensors,
 logs one stderr warning, and continues. Full sha256 is opt-in
-(`VELA_VERIFY_WEIGHTS=1`) and is already done at download. With `--frontend`,
-tokenizer load overlaps model load. Safetensors remains the source of truth.
+(`verify_weights`) and is already done at download. Safetensors remains the
+source of truth.
 
 ## Assets
 
 ```bash
-python3 scripts/download_assets.py assets/vela2-0p3b.toml
 python3 scripts/download_assets.py assets/embeddinggemma2.toml
+python3 scripts/download_assets.py assets/guard.toml
 ```
 
-Tests that need those files skip when they are absent.
+Tests that need those files skip when they are absent. The PP-OCR assets are
+converted from the pinned ONNX exports by `tools/ppocr-import`.
 
 ## Bench / qualification
 
 ```bash
-python3 bench/harness/validate.py --requests evaluation/api-requests.jsonl \
-  --reference evaluation/api-reference.jsonl --atol 0.0001 \
-  --command '["target/release/vela2-onednn","--model","...","--threads","2","--frontend"]' \
-  --output results/api-summary.json
-
 # EG2 broad matrix (merge gate: seqs 7..8192, B1/B4/B16, mixed lengths, 1/2/4/8)
 python3 bench/matrix.py --model "$EG2_MODEL" --binary target/release/eg2-onednn \
   --output results/eg2-matrix
@@ -158,14 +136,13 @@ python3 bench/harness/benchmark.py --requests evaluation/model-requests.jsonl \
   --budgets 1,2,4,8 --rounds 3 --warmup 5 --repeat 15 --output results/new-model
 ```
 
-The 227-case corpus is **not** distributed. Hosted CI runs the portable
-`bench/tests/test_validation.py` unit tests and skips the oracle.
+Hosted CI runs the harness's own unit tests (`bench/tests`).
 
 ## Turin
 
 Hosted CI is portable. Build Turin binaries with
 `RUSTFLAGS='-C target-cpu=znver5'` on a Zen 5 host; such a binary SIGILLs
-elsewhere. See `docs/porting.md` for what the port changed on purpose.
+elsewhere.
 
 ## Contributing
 
@@ -177,11 +154,11 @@ rustfmt; CI runs it with `--check`); the compiler is the stable toolchain in
 A change is judged by the gates first, then by speed and RSS. Bit-identical
 output is not required. The gates:
 
-- **Vela:** within atol 1e-4 of the FP32 ONNX reference on 227 cases (zero
-  mismatches today); the corpus is not distributed. Asset-free primitive
-  tests (matmul, GeGLU, LayerNorm, softmax) stay within 1e-6 of the earlier
-  C++ oneDNN bridge.
 - **EmbeddingGemma 2:** its cosine gates against the PyTorch FP32 fixtures.
+- **The guard:** token ids exactly, and the logit, score and hidden states
+  against the PyTorch FP32 reference on eight English and Korean texts
+  (`crates/sinteric-inference/fixtures/guard/parity.json`), at the best ISA
+  and under an AVX2 cap; BF16 keeps every decision.
 - **PP-OCR:** the detector's and recognizer's text and polygons exact against
   ONNX Runtime 1.28.0 on the 100-page Korean document gate (60 real pages, 40
   synthetic; not distributed), which they pass today.

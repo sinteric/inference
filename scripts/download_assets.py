@@ -2,7 +2,7 @@
 """Fetch Hub files listed in assets/<model>.toml and verify sha256.
 
 Usage:
-  python3 scripts/download_assets.py assets/vela2-0p3b.toml
+  python3 scripts/download_assets.py assets/guard.toml
 Env:
   SINTERIC_ASSETS  destination root (default ~/.cache/sinteric-assets/<model>@<rev12>)
   HF_TOKEN         optional Hub token

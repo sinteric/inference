@@ -12,7 +12,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--model", default="vela2-0p3b")
+    ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="unknown")
     args = ap.parse_args()
     data = json.loads(Path(args.json).read_text())

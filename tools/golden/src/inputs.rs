@@ -1,7 +1,6 @@
 //! The fixed inputs. Changing any of them invalidates every recorded base.
 
 use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 const SENTENCES: &[&str] = &[
@@ -86,36 +85,6 @@ pub fn audio_samples(n: usize) -> Vec<f32> {
         let s = (saw.div_euclid(4) + noise.div_euclid(16)) * env;
         out.push(s.div_euclid(20) as f32 / 32768.0);
     }
-    out
-}
-
-/// Vela 2.0 SystemOne bodies over states of different lengths and every
-/// question type.
-pub fn vela_bodies() -> Vec<(String, Value)> {
-    let questions = json!({
-        "pii": {"type": "noul"},
-        "topic": {"type": "choice", "instructions": "topic?",
-                  "criteria": {"legal": "contract or law", "finance": "money", "other": null}},
-        "rating": {"type": "score", "instructions": "Rate relevance", "criteria": ["low", "medium", "high"]},
-        "people": {"type": "span", "criteria": {"person": "person name"}, "over": "request"},
-        "tags": {"type": "set", "criteria": {"person": null, "place": "place"}},
-    });
-    let mut out: Vec<(String, Value)> = [8usize, 40, 120, 400]
-        .into_iter()
-        .enumerate()
-        .map(|(i, words)| {
-            let body = json!({
-                "model": "vela-2.0",
-                "state": {"request": format!("김철수 John Smith 서울. {}", paragraph(words, i))},
-                "questions": questions,
-            });
-            (format!("v{words}"), body)
-        })
-        .collect();
-    out.push((
-        "v-short".into(),
-        json!({"model": "vela-2.0", "state": "Hello", "questions": {"q": {"type": "noul"}}}),
-    ));
     out
 }
 

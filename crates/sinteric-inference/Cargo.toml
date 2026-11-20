@@ -3,7 +3,7 @@ name = "sinteric-inference"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CPU inference for a few selected models on oneDNN: one Runtime, one API per model."
+description = "A few selected models, each tuned for the hardware it runs on: EmbeddingGemma 2, PP-OCR and a prompt-injection guard on x86-64 CPUs through oneDNN."
 repository.workspace = true
 rust-version.workspace = true
 
@@ -11,63 +11,44 @@ rust-version.workspace = true
 workspace = true
 
 [features]
-default = ["embeddinggemma2", "vela2", "ppocr"]
-embeddinggemma2 = ["dep:embeddinggemma2"]
-vela2 = ["dep:vela2-0p3b"]
-ppocr = ["dep:ppocr"]
+# Writes intermediate tensors to disk while a model runs; for debugging a
+# kernel against a reference only.
+debug-dumps = []
+# The PP-OCR steps around the networks (`ppocr::reference`), for the OCR
+# gate's ONNX Runtime runner in tools/drivers. Not a supported API.
+reference = []
 
 [dependencies]
+onednn-sys.workspace = true
+hex.workspace = true
 libc.workspace = true
+memmap2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ppocr = { path = "../../models/ppocr", default-features = false, optional = true }
-rt-core.workspace = true
-rt-runtime.workspace = true
-embeddinggemma2 = { workspace = true, optional = true }
-vela2-0p3b = { workspace = true, optional = true }
+sha2.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
-rt-assets.workspace = true
 anyhow.workspace = true
 
 [[example]]
 name = "embeddinggemma2"
 path = "examples/embeddinggemma2.rs"
-required-features = ["embeddinggemma2"]
 
 [[example]]
-name = "vela2"
-path = "examples/vela2.rs"
-required-features = ["vela2"]
+name = "guard"
+path = "examples/guard.rs"
 
 [[example]]
 name = "unload_rss"
 path = "examples/unload_rss.rs"
-required-features = ["embeddinggemma2", "vela2"]
 
 [[example]]
 name = "ocr"
 path = "examples/ocr.rs"
-required-features = ["ppocr"]
 
-[[test]]
-name = "ocr"
-path = "tests/ocr.rs"
-required-features = ["ppocr"]
-
-[[test]]
-name = "concurrent"
-path = "tests/concurrent.rs"
-required-features = ["embeddinggemma2", "vela2", "ppocr"]
-
-[[test]]
-name = "warmup"
-path = "tests/warmup.rs"
-required-features = ["embeddinggemma2"]
-
-# Its own main: the test binary is also the worker binary it starts.
-[[test]]
-name = "worker"
-path = "tests/worker.rs"
-harness = false
-required-features = ["embeddinggemma2", "vela2", "ppocr"]
+[[example]]
+name = "eg2_media_bench"
+path = "examples/eg2_media_bench.rs"

@@ -59,7 +59,7 @@ def parse_args():
     p.add_argument(
         "--binary",
         default="target/release/eg2-onednn",
-        help="eg2-onednn path (built with cargo -p embeddinggemma2 --bin eg2-onednn --release)",
+        help="eg2-onednn path (built with cargo build -p drivers --bin eg2-onednn --release)",
     )
     p.add_argument("--output", required=True, help="directory for matrix.json / table.txt")
     p.add_argument(

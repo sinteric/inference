@@ -26,22 +26,22 @@ C tile group) off by up to ~1.4 where outputs are O(10). In a 22-layer
 ModernBERT encoder that became run-to-run differences of up to 0.69 in a
 classifier logit. The AVX-512 kernels never did this.
 
-`crates/rt-runtime/tests/amx_bf16_race_repro.rs` reproduces it with no model
+`crates/sinteric-inference/src/cpu/runtime/tests/amx_bf16_race_repro.rs` reproduces it with no model
 (random BF16 weights of a QKV shape, busy threads keeping the machine
 oversubscribed), and `amx_bf16_race_sweep.rs` sweeps shapes, modes and thread
 counts. Both are ignored, because they are statistical and take minutes:
 
 ```bash
-cargo test --release -p rt-runtime --test amx_bf16_race_repro -- --ignored --nocapture
+cargo test --release -p sinteric-inference --lib amx_bf16_race_repro -- --ignored --nocapture
 AMX_REPRO_NO_PROBE=1 cargo test ...            # AMX unguarded: fails on an affected VM
 AMX_REPRO_ISA=AVX512_CORE_BF16 cargo test ...  # pinned: expected 0 differing runs
 ```
 
 The runtime guards against it: the first load in a process runs a ~40 ms tile
-probe (`rt_runtime::amx_health()`) and, on a host that fails it, resolves
+probe and, on a host that fails it, resolves
 `best_available` to `AVX512_CORE_BF16` with a warning on stderr
 ([`docs/library.md`](../../docs/library.md), "AMX tile-state probe"). The
-guarded default is bit-repeatable. `rt_runtime::set_amx_probe(false)` keeps
-AMX regardless, for a host known to be fixed. What the probe cannot see: a host
+guarded default is bit-repeatable. There is no public switch to skip the
+probe; the tests turn it off to reach AMX unguarded. What the probe cannot see: a host
 that loses tile state only under a load pattern the 40 ms probe does not
 create; it reduces the risk, it does not prove the host sound.

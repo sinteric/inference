@@ -11,19 +11,19 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use sinteric_inference::{
-    embeddinggemma2 as eg2, ppocr, vela2, BackendOverrides, CpuIsa, Precision, Runtime,
+    embeddinggemma2 as eg2, guard, ppocr, BackendOverrides, CpuIsa, Precision, Runtime,
     RuntimeOptions,
 };
 
 use crate::inputs;
 
 /// Which models one process records. One family per process, and each
-/// EmbeddingGemma 2 precision is its own family, so the peak RSS a record
-/// reports is that family's alone.
+/// precision is its own family, so the peak RSS a record reports is that
+/// family's alone.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Family {
     Eg2(Precision),
-    Vela,
+    Guard(Precision),
     Ocr,
 }
 
@@ -42,9 +42,10 @@ impl Args {
         let family = match crate::flag(args, "--model").as_deref() {
             Some("eg2-bf16") => Family::Eg2(Precision::Bf16),
             Some("eg2-fp32") => Family::Eg2(Precision::Fp32),
-            Some("vela") => Family::Vela,
+            Some("guard-bf16") => Family::Guard(Precision::Bf16),
+            Some("guard-fp32") => Family::Guard(Precision::Fp32),
             Some("ocr") => Family::Ocr,
-            _ => bail!("--model eg2-bf16|eg2-fp32|vela|ocr is required"),
+            _ => bail!("--model eg2-bf16|eg2-fp32|guard-bf16|guard-fp32|ocr is required"),
         };
         let dir = crate::flag_path(args, "--dir")?;
         let pages = match family {
@@ -173,7 +174,7 @@ pub fn run(args: Args) -> Result<()> {
     };
     match args.family {
         Family::Eg2(precision) => embeddinggemma2(&rt, &args, &mut rec, precision)?,
-        Family::Vela => vela(&rt, &args, &mut rec)?,
+        Family::Guard(precision) => guard(&rt, &args, &mut rec, precision)?,
         Family::Ocr => ocr(&rt, &args, &mut rec)?,
     }
     Ok(())
@@ -256,21 +257,43 @@ fn embeddings(e: &eg2::Embeddings) -> (Vec<u8>, Value) {
     (raw, json!({"dim": e.dim, "data": e.data}))
 }
 
-fn vela(rt: &Runtime, args: &Args, rec: &mut Recorder) -> Result<()> {
-    let mut config = vela2::Config::new(&args.dir);
+fn guard(rt: &Runtime, args: &Args, rec: &mut Recorder, precision: Precision) -> Result<()> {
+    let mut config = guard::Config::new(&args.dir).with_precision(precision);
     config.cache.enabled = false;
     let t = Instant::now();
-    let model: vela2::Vela2 = rt.load(config)?;
+    let model: guard::Guard = match rt.load(config) {
+        Ok(m) => m,
+        Err(e @ sinteric_inference::Error::Unsupported { .. }) => {
+            eprintln!("skip guard {precision}: {e}");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
     let load_ms = ms(t);
-    for (id, body) in inputs::vela_bodies() {
+    let name = format!("guard-{precision}");
+    for case in inputs::text_cases() {
         rec.case(
-            "vela2",
-            &id,
-            || Ok(model.system_one(&body)?),
-            |v: &Value| (serde_json::to_vec(v).unwrap_or_default(), v.clone()),
+            &name,
+            &case.id,
+            || Ok(model.classify(&case.texts)?),
+            injections,
         )?;
     }
-    rec.meta("vela2", load_ms)
+    rec.meta(&name, load_ms)?;
+    Ok(())
+}
+
+fn injections(v: &Vec<guard::Injection>) -> (Vec<u8>, Value) {
+    let mut raw = Vec::new();
+    let mut out = Vec::new();
+    for i in v {
+        raw.extend(i.logit.to_le_bytes());
+        raw.extend(i.score.to_le_bytes());
+        raw.extend((i.tokens as u64).to_le_bytes());
+        raw.push(u8::from(i.truncated));
+        out.push(json!([i.logit, i.score, i.tokens, i.truncated]));
+    }
+    (raw, Value::Array(out))
 }
 
 fn ocr(rt: &Runtime, args: &Args, rec: &mut Recorder) -> Result<()> {

@@ -30,7 +30,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &bytes,
         w,
         h,
-        rt_core::checked_size("image stride", &[w as usize, 3])?,
+        (w as usize)
+            .checked_mul(3)
+            .ok_or("image stride overflows")?,
         PixelFormat::Bgr8,
     )?;
     let quads = det.detect(&image)?;

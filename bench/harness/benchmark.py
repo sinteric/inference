@@ -77,9 +77,8 @@ def main():
         os.environ.update(OMP_NUM_THREADS=str(n),OMP_DYNAMIC='FALSE',OMP_WAIT_POLICY='ACTIVE',
                           GOMP_SPINCOUNT='500',OMP_PROC_BIND='close',
                           OMP_PLACES=','.join('{'+str(c)+'}' for c in cpus),
-                          RAYON_NUM_THREADS='1',CANDLE_NUM_THREADS='1',TOKENIZERS_PARALLELISM='false',
-                          OPENBLAS_NUM_THREADS=str(n),MKL_NUM_THREADS=str(n),
-                          VELA_ALIGN_GEMM_BUFFERS='1',VELA_GEMM_RESIDUAL='1',VELA_MLAS_PARTITION='auto')
+                          RAYON_NUM_THREADS='1',TOKENIZERS_PARALLELISM='false',
+                          OPENBLAS_NUM_THREADS=str(n),MKL_NUM_THREADS=str(n))
         for cohort in range(a.rounds):
             for name in names[cohort%len(names):]+names[:cohort%len(names)]:
                 command=[v.replace('{threads}',str(n)) for v in commands[name]]

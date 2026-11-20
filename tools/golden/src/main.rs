@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! golden record --model eg2-bf16 --dir EG2_DIR --threads 4 --isa best --out base-eg2-bf16.jsonl
+//! golden record --model guard-fp32 --dir GUARD_DIR --out base-guard-fp32.jsonl
 //! golden record --model ocr --dir PPOCR_DIR --pages PNG_DIR --out base-ocr.jsonl
 //! golden compare base-eg2-bf16.jsonl new-eg2-bf16.jsonl
 //! ```

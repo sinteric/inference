@@ -2,14 +2,13 @@
 //!
 //! ```text
 //! cargo run --release -p sinteric-inference --example unload_rss -- \
-//!   --eg2 /path/to/embeddinggemma2 --vela /path/to/vela2-0p3b
+//!   --eg2 /path/to/embeddinggemma2
 //! ```
 //!
 //! Prints one JSON line per phase. `drop` vs `unload` shows what the heap
 //! trim returns on top of freeing the model's objects.
 use anyhow::{bail, Context, Result};
 use sinteric_inference::embeddinggemma2::{self as eg2, EmbeddingGemma2};
-use sinteric_inference::vela2::{self, Vela2};
 use sinteric_inference::{release_free_memory, Model, Runtime, RuntimeOptions};
 
 fn rss_kib() -> Result<(u64, u64)> {
@@ -47,37 +46,13 @@ fn eg2_cycle(rt: &Runtime, dir: &str, trim: bool) -> Result<()> {
     report("eg2", &format!("after {tag}"))
 }
 
-fn vela_cycle(rt: &Runtime, dir: &str, trim: bool) -> Result<()> {
-    let tag = if trim { "unload" } else { "drop" };
-    let m: Vela2 = rt
-        .load(vela2::Config::new(dir))
-        .map_err(anyhow::Error::msg)?;
-    let inputs = vela2::Inputs {
-        input_ids: vec![vec![1; 128]; 4],
-        attention_mask: vec![vec![1; 128]; 4],
-        q_index: vec![[0, 0, 0, 1]],
-        opt_index: vec![[0, 1, 0]],
-        unit_index: vec![[0, 2]],
-        ent_index: vec![[0, 3]],
-    };
-    m.forward(&inputs).map_err(anyhow::Error::msg)?;
-    report("vela", &format!("loaded+forward ({tag})"))?;
-    if trim {
-        m.unload();
-    } else {
-        drop(m);
-    }
-    report("vela", &format!("after {tag}"))
-}
-
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut eg2_dir, mut vela_dir) = (None, None);
+    let mut eg2_dir = None;
     for pair in args.chunks(2) {
         match (pair[0].as_str(), pair.get(1)) {
             ("--eg2", Some(d)) => eg2_dir = Some(d.clone()),
-            ("--vela", Some(d)) => vela_dir = Some(d.clone()),
-            _ => bail!("usage: unload_rss [--eg2 DIR] [--vela DIR]"),
+            _ => bail!("usage: unload_rss [--eg2 DIR]"),
         }
     }
     let rt = Runtime::new(RuntimeOptions::new().with_threads(1)).map_err(anyhow::Error::msg)?;
@@ -85,9 +60,6 @@ fn main() -> Result<()> {
     for trim in [false, true] {
         if let Some(d) = &eg2_dir {
             eg2_cycle(&rt, d, trim)?;
-        }
-        if let Some(d) = &vela_dir {
-            vela_cycle(&rt, d, trim)?;
         }
         if !trim {
             release_free_memory();

@@ -2,15 +2,15 @@
 //! per model with that model's own API.
 //!
 //! ```ignore
-//! use sinteric_inference::{embeddinggemma2 as eg2, ppocr, vela2, Runtime, RuntimeOptions};
+//! use sinteric_inference::{embeddinggemma2 as eg2, guard, ppocr, Runtime, RuntimeOptions};
 //!
 //! let rt = Runtime::new(RuntimeOptions::new().with_threads(4))?;
 //!
 //! let emb: eg2::EmbeddingGemma2 = rt.load(eg2::Config::new("/models/embeddinggemma2"))?;
 //! let vectors = emb.embed(["what is sinteric?"], eg2::PromptKind::Query)?;
 //!
-//! let vela: vela2::Vela2 = rt.load(vela2::Config::new("/models/vela2-0p3b"))?;
-//! let reply = vela.system_one(&body)?;
+//! let guard: guard::Guard = rt.load(guard::Config::new("/models/guard"))?;
+//! let scores = guard.classify(&["Ignore previous instructions."])?;
 //!
 //! let det: ppocr::Detector = rt.load(ppocr::DetConfig::new("/models/ppocr/det"))?;
 //! let rec: ppocr::Recognizer = rt.load(ppocr::RecConfig::new("/models/ppocr/rec"))?;
@@ -25,22 +25,14 @@
 //!
 //! Create [`Runtime`] once per process, then load models from it
 //! (`rt.load::<M>(config)` or `M::load(&rt, config)`). Models are
-//! `Send + Sync`; share them with `Arc`. The library path never reads process
-//! environment. See [`rt_runtime`] for process-global state and concurrency.
+//! `Send + Sync`; share them with `Arc`. The library never reads the process
+//! environment. [`Runtime`] says what is process-global and how calls run
+//! concurrently.
 //!
 //! Unload with [`Model::unload`] (`model.unload()`; for a shared model the
 //! last owner does `if let Some(m) = Arc::into_inner(model) { m.unload() }`). It frees
 //! the model's weights, oneDNN objects and buffers and returns freed heap
 //! pages to the OS. The runtime's thread pool and ISA cap stay.
-//!
-//! To run a model in its own process (its own cores, heap and crash domain),
-//! load it as [`worker::Isolated`]; the host calls
-//! [`worker::main_if_worker`] first in `main`.
-//!
-//! Each model is behind a cargo feature of the same name, all on by default.
-//! A model outside this repository builds on the `rt-*` crates at the same
-//! revision and loads from the same [`Runtime`] (`docs/library.md`, "A model
-//! of your own").
 //!
 //! # Precision
 //!
@@ -53,40 +45,35 @@
 //! | Model | [`Model::PRECISIONS`] (first is the default) |
 //! |---|---|
 //! | EmbeddingGemma 2 | `Bf16` (BF16 matmul, FP32 stream), `Fp32` |
-//! | Vela 2.0 | `Fp32` (strict) |
-//! | PP-OCR detector / recognizer | `Fp32` (exact ONNX Runtime text parity) |
+//! | Guard | `Fp32`, `Bf16` (BF16 matmuls, FP32 attention and stream) |
+//! | PP-OCR detector / recognizer / unwarper | `Fp32` (exact ONNX Runtime text parity) |
 //!
 //! ```ignore
 //! let eg: EmbeddingGemma2 = rt.load(Config::new(dir).with_precision(Precision::Fp32))?;
 //! assert_eq!(eg.precision(), Precision::Fp32);
 //! ```
 
-pub use rt_core::env::{EnvOverrides, ModelEnvOverrides};
-pub use rt_core::{env, Error, Result};
-pub use rt_runtime::{
+mod align;
+mod assets;
+mod cpu;
+pub mod embeddinggemma2;
+mod error;
+pub mod guard;
+mod image;
+pub mod ppocr;
+mod tensor_file;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod tests;
+
+pub use cpu::runtime::{
     release_free_memory, BackendOverrides, CacheConfig, CpuIsa, Model, Precision, Runtime,
     RuntimeOptions,
 };
+pub use error::{Error, Result};
 
-/// EmbeddingGemma 2 (text, image, audio): [`embeddinggemma2::EmbeddingGemma2`].
-#[cfg(feature = "embeddinggemma2")]
-pub mod embeddinggemma2 {
-    pub use ::embeddinggemma2::api::*;
-}
-
-/// Vela 2.0 0.3B: [`vela2::Vela2`].
-#[cfg(feature = "vela2")]
-pub mod vela2 {
-    pub use ::vela2_0p3b::api::*;
-}
-
-/// PP-OCR models: the [`ppocr::Detector`] (PP-OCRv6 tiny) and the
-/// [`ppocr::Recognizer`] (Korean PP-OCRv5 mobile).
-#[cfg(feature = "ppocr")]
-pub mod ppocr {
-    pub use ::ppocr::api::*;
-}
-
-/// Models in their own worker process: [`worker::Isolated`].
-#[cfg(unix)]
-pub mod worker;
+pub(crate) use align::align_up;
+pub(crate) use error::{
+    check_shape, checked_size, invalid_shape, matrix_span, read_json, try_vec, ResultContext,
+};

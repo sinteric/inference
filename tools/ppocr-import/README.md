@@ -62,13 +62,13 @@ preprocessing is BGR, antialiased Triangle resize to nearest multiple-of-32
 sides, ImageNet normalization, no side cap. This Python preprocessor is a
 reference fixture producer; parity against Rust image operations is round 2.
 The linear oneDNN resampler uses half-pixel centers, so UVDoc's align-corners
-resizes run on the host in `rt-image`.
+resizes run on the host in the library's image module.
 
-Rust asset tests read `SINTERIC_OCR_ASSETS` explicitly through
-`rt_core::env::TestOverrides`. Provision `det/`, `rec/` and `uvdoc/` under that root;
+Rust asset tests read `SINTERIC_OCR_ASSETS` through the test-only
+`TestOverrides` (`crates/sinteric-inference/src/test_support/env.rs`). Provision `det/`, `rec/` and `uvdoc/` under that root;
 no HOME or temporary-path fallback is used. Graph/dictionary hashes and all
 weight names/shapes/dtypes are checked on load; payload hashing is opt-in
-(`AssetConfig.verify_weights`). `graph.json` is a pinned contract, not an
+(each config's `verify_weights`). `graph.json` is a pinned contract, not an
 executable graph interpreter. No packed disk cache is written.
 
 Round 2 corrected the reference pin to **onnxruntime==1.28.0**, matching the

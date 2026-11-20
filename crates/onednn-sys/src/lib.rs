@@ -1,12 +1,11 @@
 //! Bindgen FFI for the oneDNN 3.13.4 C API.
 //!
 //! `build.rs` statically links pinned `libdnnl.a` (CPU THREADPOOL runtime).
-//! [`rt-onednn`] calls the `dnnl_*` symbols directly.
+//! `sinteric-inference` calls the `dnnl_*` symbols directly.
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, unused)]
 #![allow(clippy::all)]
 
-pub use rt_core::{Error, Result};
 use std::ffi::c_void;
 
 include!("bindings.rs");
@@ -41,17 +40,6 @@ pub const PINNED_MINOR: i32 = 13;
 pub const PINNED_PATCH: i32 = 4;
 pub const PINNED_COMMIT: &str = "c531fe1a5cd631b7f60277cdf6675c588cadbc28";
 
-/// `DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx)` from `dnnl_types.h`.
-#[inline]
-pub fn dnnl_arg_attr_multiple_post_op(idx: i32) -> Result<i32> {
-    if idx < 0 {
-        return Err(Error::Config(format!("negative post-op index {idx}")));
-    }
-    idx.checked_add(1)
-        .and_then(|n| DNNL_ARG_ATTR_MULTIPLE_POST_OP_BASE.checked_mul(n))
-        .ok_or(Error::SizeOverflow("oneDNN post-op index"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,7 +64,6 @@ mod tests {
         assert_eq!(DNNL_ARG_WEIGHTS, 33);
         assert_eq!(DNNL_ARG_DST, 17);
         assert_eq!(DNNL_ARG_SCRATCHPAD, 80);
-        assert_eq!(dnnl_arg_attr_multiple_post_op(1).unwrap(), 65536);
         assert_eq!(DNNL_MAX_NDIMS, 12);
         assert_eq!(DNNL_RUNTIME_THREADPOOL, 8);
     }

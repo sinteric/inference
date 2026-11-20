@@ -8,7 +8,7 @@ Turin). Pin only as an explicit opt-in for Zen 5 emulation:
 
 ```bash
 # Intel host, match Turin ISA (`dnnl_set_max_cpu_isa`, not the env var)
-./target/release/eg2-onednn --pin-isa AVX512_CORE_BF16 --model ... --library ... --threads 4
+./target/release/eg2-onednn --pin-isa AVX512_CORE_BF16 --model ... --threads 4
 ```
 
 Omit `--tile` to use the measured per-ISA table (256 on AMX and
@@ -39,7 +39,7 @@ RSS are reported, not gated.
 
 ```bash
 python3 scripts/download_assets.py assets/embeddinggemma2.toml
-cargo build -p embeddinggemma2 --bin eg2-onednn --release
+cargo build -p drivers --bin eg2-onednn --release
 
 # Full gate (AMX / best ISA). Skip thread counts the host does not have.
 python3 bench/matrix.py \
@@ -69,8 +69,7 @@ python3 bench/harness/benchmark.py \
   --output results/eg2-onednn
 ```
 
-Replace `{model}` / `{library}` with the local snapshot (`--library` is
-ignored: oneDNN is statically linked). `{threads}` is replaced by the
+Replace `{model}` with the local snapshot. `{threads}` is replaced by the
 harness. Report p50/p95 from `matrix.json` (or `samples.jsonl`), worker
 `VmRSS` / `VmHWM`, `first_call_ms`, and `cold_load`. B16×8192 is dominated
 by the four global layers (head_dim 512); the matrix already drops repeats
