@@ -39,8 +39,8 @@ A host that runs these models behind a server needs these more than speed.
   nondeterministic tile-state fault the probe guards against. The pinned
   AVX-512 BF16 and FP32 passes are exact across thread counts on the same
   host. Unexplained; the suspect is a different oneDNN kernel choice per
-  thread count. The same cosine, to every digit, on PR #2's tree and on the
-  single crate (2026-11-20).
+  thread count. The same cosine, to every digit, before and after the fold
+  into one crate (a5804b4 and ca10c37, 2026-11-20).
 
 ## Speed and memory
 
