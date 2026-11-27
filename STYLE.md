@@ -83,7 +83,7 @@ well as the reviewer remembers it.
 | [Naming extension traits](https://google.github.io/styleguide/rustguide.html#naming-extension-traits) | adopted | review | |
 | [Naming initialization functions](https://google.github.io/styleguide/rustguide.html#naming-initialization-functions) | adopted | review | A constructor that returns `Result` is `try_new` (`Runtime::try_new`, `ImageView::try_new`). |
 | [Avoid abbreviations](https://google.github.io/styleguide/rustguide.html#avoid-abbreviations) | **changed** (one addition) | review | Numerics vocabulary counts as known: the ISA names oneDNN uses (`avx2`, `avx512_core_bf16`, `amx`), `fp32`/`bf16`, `gemm`, `qkv`, `rope`, `geglu`, `ln`/`rms`, `md` (a oneDNN memory descriptor), `isa`, `ort`, and the model short names `eg2` and `ppocr`. |
-| [When and how to write documentation](https://google.github.io/styleguide/rustguide.html#writing-doc) | **changed** | review | No doc comments: [§"Comments in code"](#comments-in-code). `missing_docs` is off. A caller's guide to the API is [`docs/library.md`](docs/library.md), and what a caller needs that it does not say yet is added there. ⚠ Until the tree meets the rule, CI still compiles the doc examples left (`cargo test --doc`) and builds the docs with warnings as errors. |
+| [When and how to write documentation](https://google.github.io/styleguide/rustguide.html#writing-doc) | **changed** | rustc `missing_docs`, `cargo test --doc` and `cargo doc -D warnings` (CI steps), review | Every public item has a doc comment, and nothing else does: [§"Comments in code"](#comments-in-code). A doc example is `no_run`, because running one needs model files CI does not have; CI still compiles each, so an example cannot drift from the API, and builds the docs with warnings as errors, so a link to a renamed item fails. ⚠ The lint sees that a doc exists, not that it is true. |
 | [Unsafe code](https://google.github.io/styleguide/rustguide.html#unsafe) | adopted | clippy `undocumented_unsafe_blocks`, review | Most `unsafe` here is the oneDNN FFI and SIMD intrinsics. Each block has a `// SAFETY:` comment that says what it relies on, and each `unsafe fn` a `# Safety` section that says what its caller must hold. These are the second kind [§"Comments in code"](#comments-in-code) allows. ⚠ The lint sees that the comment exists, not that it is right. |
 | [No unstable features](https://google.github.io/styleguide/rustguide.html#unstable-features) | adopted | the stable compiler | Nightly rustfmt is a formatter, not a language feature. |
 | [Getters and setters](https://google.github.io/styleguide/rustguide.html#getters-and-setters) | adopted | review | |
@@ -113,7 +113,7 @@ The workspace allows no lint. An `#[expect]` (or, where the lint may not fire
 on every build, an `#[allow]`) sits on the one item it covers and gives its
 reason (`#[expect(lint, reason = "...")]`, held by clippy
 `allow_attributes_without_reason`). The bindgen output in `onednn-sys` is the
-one module-wide allow: its names are oneDNN's.
+one module-wide allow: its names and missing docs are oneDNN's.
 
 ## What the guide leaves open
 
@@ -133,7 +133,7 @@ not. Review holds them, and a tool also holds the one that names it.
 3. **Nothing is left over.** Code no caller reaches is deleted. Code that
    exists only for a test lives in the test. No code is commented out. Why:
    leftover code is still read, maintained and believed.
-4. **No comments**, but the two kinds [§"Comments in code"](#comments-in-code)
+4. **No comments**, but the kinds [§"Comments in code"](#comments-in-code)
    allows. The rule, what counts as a comment, and why are there.
 5. **Types carry the rules.** A choice is an `enum`, and so is a knob with a
    fixed set of values (`ImageTokens`, not one method per value); an error is
@@ -153,7 +153,7 @@ not. Review holds them, and a tool also holds the one that names it.
 
 **Code carries no comments** (the owner, 2026-11-27). This binds every
 language here, not only Rust: Python, C and C++, shell, the TOML and YAML
-files and the CI workflow. A comment is written for one of two things only:
+files and the CI workflow. A comment is written for one of three things only:
 
 1. **A problem in something external.** A dependency, a compiler, an
    operating system, a CPU, or a model someone else publishes (oneDNN, ONNX
@@ -167,12 +167,18 @@ files and the CI workflow. A comment is written for one of two things only:
    changed. This repository's own code, formats, tests, gates and tools are
    all ours, so a comment that explains one of them is a sign that it should
    change instead.
+3. **The public API.** An item a caller outside this repository can name
+   keeps its doc comment, and so does each library crate's own page: what
+   `missing_docs` asks for. A caller reads the API through its rustdoc. This
+   is the owner's choice of 2026-11-27, and it may change. Such a comment says
+   what the item does and what a caller must hold, never how it got there.
 
 What a comment would have said has a home that is checked or kept current:
 what the code is, in its names and types; what it must do, in its tests; how
-a caller uses it, in [`docs/library.md`](docs/library.md); a measured number,
-in [`docs/results/`](docs/results/) (rule 6 above); how the code got here, in
-the commit message and [`docs/history.md`](docs/history.md).
+a caller uses it, in [`docs/library.md`](docs/library.md) and the public
+API's doc comments; a measured number, in [`docs/results/`](docs/results/)
+(rule 6 above); how the code got here, in the commit message and
+[`docs/history.md`](docs/history.md).
 
 Why: a comment easily goes stale, and it holds back improving the code in a
 new, bigger scope. A reader believes it, and a change that reworks the code
@@ -183,7 +189,8 @@ doc comments.
 What counts:
 
 - **A doc comment is a comment**: `///`, `//!`, a Python docstring. So is a
-  file or module header and a section banner.
+  file or module header and a section banner. Off the public API (3 above),
+  including in the drivers and harnesses, a doc comment goes.
 - **A directive a tool reads is not a comment**: a shebang, a `# noqa`,
   `#[expect(lint, reason = "…")]` ([§"Allowing a lint"](#allowing-a-lint)).
   Where the tool asks for a reason, the reason is one line on the directive.
@@ -193,8 +200,9 @@ What counts:
 - **A file a tool generates** carries what that tool writes (the bindgen
   output in `onednn-sys`). A generator we write is code under this rule.
 
-⚠ Review alone holds this rule: no tool tells a comment of the two kinds from
-any other. The tree does not meet it yet, and
+⚠ Review alone holds this rule: no tool tells a comment of the kinds above
+from any other, and `missing_docs` sees only that the public API has its doc
+comments. The tree does not meet it yet, and
 [`docs/open-work.md`](docs/open-work.md) has the sweep. Until then, a comment
 already in a file is not a precedent: new code adds none.
 

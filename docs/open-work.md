@@ -98,11 +98,10 @@ estimate that was never measured.
 
 - **Take out the comments STYLE.md no longer allows** (§"Comments in code").
   Measured 2026-11-27: about 3,500 comment lines in the Rust, most of them doc
-  comments, and about 175 in the Python. What a comment holds that a caller
-  needs moves first: each option's meaning and default is on its field's doc
-  comment, and [`library.md`](library.md) sends the reader there, so they go
-  into `library.md`; a doc example becomes a test or an example. Once no doc
-  comment is left, CI's two doc steps check nothing and go.
+  comments, and about 175 in the Python. The public API's doc comments stay;
+  the doc comments on private items, the line comments and the drivers' and
+  harnesses' comments go. What one of those holds that is still true moves
+  first, into a name, a test or [`library.md`](library.md).
 
 ## Ruled out
 
