@@ -94,6 +94,16 @@ estimate that was never measured.
 - **EmbeddingGemma 2 video.** The upstream model takes video; this port takes
   text, images and audio.
 
+## Code
+
+- **Take out the comments STYLE.md no longer allows** (§"Comments in code").
+  Measured 2026-11-27: about 3,500 comment lines in the Rust, most of them doc
+  comments, and about 175 in the Python. What a comment holds that a caller
+  needs moves first: each option's meaning and default is on its field's doc
+  comment, and [`library.md`](library.md) sends the reader there, so they go
+  into `library.md`; a doc example becomes a test or an example. Once no doc
+  comment is left, CI's two doc steps check nothing and go.
+
 ## Ruled out
 
 Tried or checked, with the reason; do not retry without new evidence.
